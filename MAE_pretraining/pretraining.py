@@ -19,7 +19,6 @@ from lightning.pytorch import Trainer
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import TQDMProgressBar
 import math
-from MAE_pretraining.dataloaders import valid_loader, train_loader
 import random
 
 channel_list = ["Fp1","Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]
