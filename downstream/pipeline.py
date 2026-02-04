@@ -96,7 +96,7 @@ class Pipeline:
     #Change in the future try to create my own dataset not the one of torchvision
     def import_data_pretraining(self):
         """Import dataloader for pretraining"""
-        dataset = torchvision.datasets.DatasetFolder(root="MAE_pretraining/data_mae", loader=self.load_fn,  extensions=['.npz'])
+        dataset = torchvision.datasets.DatasetFolder(root=self.config["pretrain_data"], loader=self.load_fn,  extensions=['.npz'])
         val_ratio = 0.1
         n = len(dataset)
         n_val = int(n * val_ratio)
