@@ -1,0 +1,6 @@
+import torch
+
+
+class Visualizer():
+    def __init__(self):
+        pass

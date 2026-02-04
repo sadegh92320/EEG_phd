@@ -1,0 +1,86 @@
+#Experiment info
+experiment_name: phd
+dataset_name: STEW
+number_of_participant: 42
+seed: 42
+
+#eeg info and experiment info
+
+num_classes: 3
+
+channel_list:
+  [
+    "Fp1",
+    "Fp2",
+    "AF3",
+    "AF4",
+    "F7",
+    "F3",
+    "Fz",
+    "F4",
+    "F8",
+    "FC5",
+    "FC1",
+    "FC2",
+    "FC6",
+    "T7",
+    "C3",
+    "Cz",
+    "C4",
+    "T8",
+    "CP5",
+    "CP1",
+    "CP2",
+    "CP6",
+    "P7",
+    "P3",
+    "Pz",
+    "P4",
+    "P8",
+    "PO7",
+    "PO3",
+    "PO4",
+    "PO8",
+    "Oz",
+  ]
+
+eog_proxies: ["AF3", "AF4", "F7", "F8", "Fp1", "Fp2"]
+
+number_channels: 32
+freq: 250
+
+#path
+model_path: model/
+output_data_path: downstream
+input_data_path: "/Volumes/Elements/TramProject/PC"
+experiment_folder: data
+output_data_file: "trial"
+result_output: "log_output"
+csv: /Users/sadeghemami/OpenMATBTimings.xlsx
+#data info
+num_slice: 6
+
+#model config
+model_name: CNNModule
+
+module:
+  cnnmodule:
+    name: CNNmodule
+    params:
+      in_channels: 14
+      num_conv: 3
+
+optimizer:
+  adam:
+    name: adam
+    params:
+      lr: 0.001
+  SGD:
+    name: SGD
+    params:
+      lr: 0.001
+
+#train parameters
+train_size: 0.9
+test_size: 0.1
+metric: accuracy

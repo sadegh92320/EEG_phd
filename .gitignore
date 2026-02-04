@@ -1,0 +1,75 @@
+# =====================
+# Virtual environments
+# =====================
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# =====================
+# Python cache / build
+# =====================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# =====================
+# Jupyter
+# =====================
+.ipynb_checkpoints/
+
+# =====================
+# PyTorch / Lightning
+# =====================
+lightning_logs/
+*.ckpt
+*.pt
+*.pth
+runs/
+
+# =====================
+# Log
+# =====================
+
+log_output
+
+# =====================
+# TorchEEG
+# =====================
+.torcheeg/
+
+# =====================
+# Data folders (anywhere)
+# =====================
+data/
+**/data/
+data_*/
+**/data_*/
+
+# =====================
+# Large / common ML artifacts
+# =====================
+*.csv
+*.tsv
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pkl
+
+# =====================
+# OS / editor noise
+# =====================
+.DS_Store
+.vscode/
+.idea/
+
+information_txt
+text_eeg.txt
+einops.ipynb
+dump.py
