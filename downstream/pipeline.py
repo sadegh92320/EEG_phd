@@ -130,16 +130,16 @@ class Pipeline:
             trainer.fit(model, val_dataloaders=valid_loader, train_dataloaders=train_loader)
            
 
-        main_folder = "lightning_logs"
-        folder = sorted(os.listdir(main_folder), key=lambda x:int(x.split("_")[1]))[-1]
-        print(folder)
-        path = os.path.join(main_folder, folder, "checkpoints")
-        check = os.listdir(path)
-        path = os.path.join(main_folder, folder, "checkpoints", check[0])
-        print(path)
-        state = torch.load(path)
-        model = EncoderDecoder()
-        model.load_state_dict(state["state_dict"])
+        #main_folder = "lightning_logs"
+        #folder = sorted(os.listdir(main_folder), key=lambda x:int(x.split("_")[1]))[-1]
+        #path = os.path.join(main_folder, folder, "checkpoints")
+        #check = os.listdir(path)
+        #path = os.path.join(main_folder, folder, "checkpoints", check[0])
+        #state = torch.load(path)
+        #model = EncoderDecoder()
+        #model.load_state_dict(state["state_dict"])
+        CKPT_PATH = "/content/drive/MyDrive/my_project/checkpoints_pretraining/best.ckpt"
+        model = EncoderDecoder.load_from_checkpoint(CKPT_PATH)
         self.encoder = model.encoder
         self.temporal_embedding = model.temporal_embedding_e
         self.channel_embedding = model.channel_embedding_e
