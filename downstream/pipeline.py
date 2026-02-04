@@ -116,6 +116,7 @@ class Pipeline:
         Load the encoder of the pretrained model and optionally pretrain the model if 
         not done before.
         """
+        
 
         #Has to change path of saving for colab and non colab in setting
         if self.pretraining == True:
@@ -143,7 +144,7 @@ class Pipeline:
         #state = torch.load(path)
         #model = EncoderDecoder()
         #model.load_state_dict(state["state_dict"])
-        CKPT_PATH = "/content/drive/MyDrive/my_project/checkpoints_pretraining/best.ckpt"
+        CKPT_PATH = "/content/drive/MyDrive/checkpoints_pretraining/best.ckpt"
         model = EncoderDecoder.load_from_checkpoint(CKPT_PATH)
         self.encoder = model.encoder
         self.temporal_embedding = model.temporal_embedding_e
