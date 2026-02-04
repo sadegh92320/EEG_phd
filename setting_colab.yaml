@@ -52,9 +52,9 @@ freq: 250
 #path
 model_path: model/
 pretrain_data: content/data/data
-output_data_path: content/data/
+output_data_path: content/data_downstream/
 input_data_path: "/Volumes/Elements/TramProject/PC"
-experiment_folder: data_downstream
+experiment_folder: data
 output_data_file: "trial"
 result_output: "log_output"
 csv: /Users/sadeghemami/OpenMATBTimings.xlsx
