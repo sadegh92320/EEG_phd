@@ -116,14 +116,19 @@ class Pipeline:
         Load the encoder of the pretrained model and optionally pretrain the model if 
         not done before.
         """
+
+        #Has to change path of saving for colab and non colab in setting
         if self.pretraining == True:
+            CKPT_DIR = "/content/drive/MyDrive/checkpoints_pretraining"
+            os.makedirs(CKPT_DIR, exist_ok=True)
             train_loader, valid_loader = self.import_data_pretraining()
             model = EncoderDecoder()
             ckpt = ModelCheckpoint(
+            dirpath=CKPT_DIR,
             monitor="val_mse",
             mode="min",
             save_top_k=1,
-            filename="mae-{epoch:02d}-{val_mse:.4f}",
+            filename="best",
         )
             early = EarlyStopping(monitor="val_mse", mode="min", patience=10)
             trainer = Trainer(callbacks=[TQDMProgressBar(refresh_rate=20), ckpt, early], log_every_n_steps=5, max_epochs=15)
