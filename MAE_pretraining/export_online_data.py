@@ -231,11 +231,12 @@ def get_SEED_dataset():
 #)
 
 if __name__ == "__main__":
-    dataset = get_physionet_dataset()
-    for i, (x,y) in enumerate(dataset):
-        x = x.squeeze(0)
-        output = "MAE_pretraining/data_mae/data"
-        os.makedirs(output, exist_ok=True)
-        filename = os.path.join(output, f"physioNET{i}.npz")
-        np.savez(filename, x=x)
+    pass
+    #dataset = get_physionet_dataset()
+    #for i, (x,y) in enumerate(dataset):
+    #    x = x.squeeze(0)
+    #    output = "MAE_pretraining/data_mae/data"
+    #    os.makedirs(output, exist_ok=True)
+    #    filename = os.path.join(output, f"physioNET{i}.npz")
+    #    np.savez(filename, x=x)
         
