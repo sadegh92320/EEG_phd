@@ -51,7 +51,7 @@ freq: 250
 
 #path
 model_path: model/
-pretrain_data: /content/data/data
+pretrain_data: /content/data
 output_data_path: /content/data_downstream/
 input_data_path: "/Volumes/Elements/TramProject/PC"
 experiment_folder: data
