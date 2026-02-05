@@ -128,7 +128,7 @@ class TrainerDownstream:
         loss_total = 0
         for x,y in tqdm(dataloader):
             x = x.float()   
-            x, y = x.to(self.device), y.to(self.device)
+            x, y = x.to(self.device), y.long().to(self.device)
             pred = model(x)
             loss = loss_fn(pred,y)
             optimizer.zero_grad()
@@ -187,7 +187,7 @@ class TrainerDownstream:
         with torch.no_grad():
             for x,y in tqdm(dataloader):
                 x = x.float()   
-                x, y = x.to(self.device), y.to(self.device)
+                x, y = x.to(self.device), y.long().to(self.device)
                 pred = model(x)
                 probs = F.softmax(pred, dim = 1)
 
