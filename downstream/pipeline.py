@@ -135,6 +135,8 @@ class Pipeline:
            
 
         CKPT_PATH = os.path.join(self.config["lighting_CKPT_DIR"], "best.ckpt")
+        print(f"path: {CKPT_PATH}")
+        print(f"config path: {self.config["lighting_CKPT_DIR"]}")
         model = EncoderDecoder.load_from_checkpoint(CKPT_PATH)
         self.encoder = model.encoder
         self.temporal_embedding = model.temporal_embedding_e
