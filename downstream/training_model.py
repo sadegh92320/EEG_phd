@@ -41,6 +41,8 @@ class EarlyStopper:
         self.count = 0
         self.best = 0
     def should_stop(self, metric):
+        #Assuming the metric is the val accuracy
+        #If the accuracy decreases then count restart
         if self.best < metric:
             self.best = metric
             self.count = 0
@@ -76,6 +78,8 @@ class TrainerDownstream:
         self.batch_size = batch_size
         self.config = config
         self.preprocess = Preprocessing
+
+        #Load train and test data
         self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(data, label, train_size=0.9, random_state=92)
 
     def build_model(self):
@@ -91,17 +95,15 @@ class TrainerDownstream:
         """Build a new optimizer instance"""
         optimizer_cfg = self.config["optimizer"][self.optimizer_name]
         optimizer_name = optimizer_cfg["name"]
-       
-
         optimizer = OPTIMIZER_REGISTRY[optimizer_name]
         return optimizer(model.parameters(),**optimizer_params)
 
-    def save_model(self, model, fold):
+    def save_model(self, model, date):
         """Save the model to the path of interest"""
         dir = os.path.join(self.config["model_path"], self.model_name)
         if not os.path.exists(dir):
             os.makedirs(dir)
-        torch.save(model.state_dict(), os.path.join(dir, f"_state_{fold}.pth"))
+        torch.save(model.state_dict(), os.path.join(dir, f"_state_{date}.pth"))
         return self
 
     def get_params(self, model):
@@ -111,9 +113,9 @@ class TrainerDownstream:
             print(param_tensor, "\t", model.state_dict()[param_tensor].size())
         return self
     
-    def load_model():
+    def load_model(self, ):
         """Load state dict of the model"""
-        pass
+        model.load_state_dict(torch.load(PATH, weights_only=True))
         
     def train_one_epoch(self, optimizer, loss_fn, model, dataloader):
         '''
@@ -134,6 +136,7 @@ class TrainerDownstream:
     
 
     def get_metrics(self):
+        """Set the evaluation metrics"""
         metrics = {"accuracy": Accuracy(task="multiclass", num_classes=self.config["num_classes"]),
         "recall": Recall(task = "multiclass", num_classes = self.config["num_classes"], average="macro"),
         "precision": Precision(task = "multiclass", num_classes = self.config["num_classes"], average="macro"),
@@ -145,6 +148,7 @@ class TrainerDownstream:
         return metrics
 
     def update_metrics(self, metrics, pred, probs, y):
+        """Update the torchmetric metrics"""
         for k,v in metrics.items():
             if k != "roc_auc":
                 v.update(pred, y)
@@ -153,9 +157,11 @@ class TrainerDownstream:
         return self
 
     def compute_metrics(self, metrics):
+        """Compute all metrics of evaluation"""
         return {k:v.compute() for k,v in metrics.items()}
 
     def print_metric(self, metrics):
+        """Print all evaluation metrics"""
         for k, v in metrics.items():
             if k == "confusion":
                 print(f"{k}:{v}")
@@ -169,16 +175,18 @@ class TrainerDownstream:
         Evaluate the model.
         """
         model.eval()
+        #Get all the evaluation metrics
         metrics = self.get_metrics()
         with torch.no_grad():
             for x,y in tqdm(dataloader):
                 x = x.float()   
                 pred = model(x)
                 probs = F.softmax(pred, dim = 1)
-                print(pred.shape)
-                print(y.shape)
+
+                #Update the metrics using the evaluation result
                 self.update_metrics(metrics, pred, probs, y)
                 
+        #Compute print all metrics
         metrics_comp = self.compute_metrics(metrics)
         self.print_metric(metrics_comp)
       
@@ -186,32 +194,44 @@ class TrainerDownstream:
 
 
     @time
-    def train_kfold(self, folds, trial):
+    def train_kfold(self, folds, trial, save = False):
         """
-        cross validation of the model with kfold.
+        Cross validation of the model with kfold.
         """
+
         kf = KFold(n_splits=folds, shuffle=True, random_state=92)
+
+        #Define the Optuna tuning parameters
         learning_rate = trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True)
         batch_size = trial.suggest_int("batch_size", 32, 128)
         opt_name = trial.suggest_categorical("optimizer", ["adam"])
-        fold_scores = []
 
+        fold_scores = []
       
-        num_epochs = 100
+        num_epochs = 50
    
         for fold, (train_idx, test_idx) in enumerate(kf.split(range(len(self.X_train)))):
+            #Define early stopper for the fold
             early_stopper = self.early_stopper(patience=20)
+
+            #Define train and val data and labels for the fold
             X_train = self.X_train[train_idx]
             y_train = self.y_train[train_idx]
             X_val = self.X_train[test_idx]
             y_val = self.y_train[test_idx]
             print("{:^100}".format(f"---Fold_{fold}---"))
+
+            #Define the best model 
             best = -float("inf")
             model = self.model
             best_model = None
+
+            #Build the optimizer and define loss function
             self.optimizer_name = opt_name
             optimizer = self.build_optimizer(model, {"lr": learning_rate})
             loss_fn = self.loss_fn
+
+            #Create dataloader and preprocessor of data
             preprocess = self.preprocess(X_train, standardize=True)
             train_data = EEGdataset(X_train, y_train, preprocess=preprocess)
             val_data = EEGdataset(X_val, y_val, preprocess=preprocess)
@@ -220,45 +240,45 @@ class TrainerDownstream:
             
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=6, factor=0.3, min_lr=1e-5)
             
+            #Loop through epochs
             for epoch in range(num_epochs):
+                #Train one epoch
                 loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn)
                 if epoch%10 == 0:
                     print(f"Epoch: {epoch} - Loss: {loss}")
                 
+                #Get the metrics for validation set
                 metrics = self.predict(model=model, dataloader=val_loader)
                 
-
+                #Retrieve the metric of interest (mostly accuracy)
                 perf = metrics[self.config["metric"]]
                 scheduler.step(perf)
                 
+                #Stop training if the val accuracy has not improved for a while
                 if early_stopper.should_stop(perf):
                     break
 
+                #If the accuaray has improved save the model
                 if perf > best:
                     best_model = deepcopy(model.state_dict())
                     best  = perf
                     all_met = metrics
                     
+            #Report results to Optuna and prune if necessary
             trial.report(best, step=fold)
             if trial.should_prune():
                     raise optuna.TrialPruned()
+            
             fold_scores.append(best)
-            if best_model is not None:
-                model.load_state_dict(best_model)
-                simple_params = {
-                    k: v for k, v in model.__dict__.items()
-                    if not k.startswith('_') and not isinstance(v, torch.nn.Module)
-                }
-                atr_opt = optimizer.defaults
-                #self.append_result(model_name=self.model_name, opt_name=self.optimizer_name, model_parameters=simple_params,
-                #                    optimizer_parameters=atr_opt, batch_size=64, fold=fold, **all_met)
-
-            self.save_model(model, fold)
+            if save == True:
+                self.save_model(model, fold)
 
         mean_score = float(np.mean(fold_scores))
+        print(f"mean fold score is {mean_score}")
         return mean_score
-    
-    def train_whole_data(self):
+   
+    def train_whole_data(self, save = False):
+        """Train the model on whole data using the best parameters from the kfold training"""
         def objective(trial):
             # you choose how many folds you want
             folds = 10
@@ -269,31 +289,35 @@ class TrainerDownstream:
         batch_size = study.best_trial.params["batch_size"]
         opt_name = study.best_trial.params["optimizer"]
         self.optimizer_name = opt_name
-        num_epochs = 50
+        num_epochs = 20
+
+        #Define model, optimizer, scheduler and loss
         best_model = None
         best = -float("inf")
         all_met = None
         model =  self.model
         optimizer = self.build_optimizer(model, {"lr": lr})
-
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=6, factor=0.3, min_lr=1e-5)
         loss_fn = self.loss_fn
+        
+        #Get train and val data
         X_train, X_val, y_train, y_val = train_test_split(self.X_train, self.y_train, train_size=0.9, random_state=92)
         preprocess = self.preprocess(X_train)
         train_d = EEGdataset(X_train, y_train, preprocess=preprocess)
         val_d = EEGdataset(X_val, y_val, preprocess=preprocess)
         train_loader = DataLoader(dataset = train_d, shuffle=True,batch_size=batch_size)
         val_loader = DataLoader(dataset = val_d, shuffle=False,batch_size=batch_size)
-            
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=6, factor=0.3, min_lr=1e-5)
+        
             
         for epoch in range(num_epochs):
+            #Train one epoch and evaluate the model
             loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn)
             print(f"Loss: {loss}")
             metrics = self.predict(model=model, dataloader=val_loader)
                 
-
             perf = metrics[self.config["metric"]]
             scheduler.step(perf)
+            #Stop training if performance does not increase
             if perf > best:
                 best_model = deepcopy(model.state_dict())
                 best  = perf
@@ -301,21 +325,29 @@ class TrainerDownstream:
 
         if best_model is not None:
             model.load_state_dict(best_model)
+
         test_data = EEGdataset(self.X_test, self.y_test, preprocess=preprocess)
         test_loader = DataLoader(dataset=test_data, batch_size=batch_size)
         metrics_test = self.predict(model = model, dataloader=test_loader)
         #acc_cross_participant = self.test_cross_participant(model)
         study = study.best_trial.params
-        self.append_result("downstream", self.optimizer_name, study, metrics_test["accuracy"], metrics_test["precision"], metrics_test["recall"], metrics_test["F1"])
+
+        if save == True:
+            self.save_model(model=model, date=date.today().strftime('%Y-%m-%d'))
+
+        #Append the final result
+        self.append_result(model, "downstream", self.optimizer_name, study, metrics_test["accuracy"], metrics_test["precision"], metrics_test["recall"], metrics_test["F1"])
 
         return model, all_met, best, metrics_test #, acc_cross_participant
-
     
 
-    def test_cross_participant(self, model):
+    def test_cross_participant(self, model = None):
         participant_folder = sorted(os.listdir(self.config["out_participant"]))
         targets = []
         outputs = []
+
+        if model == None:
+            model = self.load_model()
 
         model.eval()
         with torch.no_grad():
@@ -340,7 +372,6 @@ class TrainerDownstream:
         acc = (targets_t == outputs_t).float().mean().item()
         return acc
 
-        
     @time
     def training_skf(self, dataset):
         """
@@ -368,15 +399,13 @@ class TrainerDownstream:
             if best_model is not None:
                 model.load_state_dict(best_model)
             self.save_model(model, fold)
-                    
-
-    
 
     def append_result(self, model, model_name, opt_name, study, accuracy, precision, recall, F1):
         """Write the results in a txt file"""
         date_current = date.today().strftime('%Y-%m-%d')
         time = str(datetime.now())
        
+        #Prepare path and append the current model architecture
         dir = os.path.join(self.config["result_output"], date_current)
         if not os.path.exists(dir):
             os.makedirs(dir)

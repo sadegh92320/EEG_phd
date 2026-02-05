@@ -116,11 +116,9 @@ class Pipeline:
         Load the encoder of the pretrained model and optionally pretrain the model if 
         not done before.
         """
-        
-
         #Has to change path of saving for colab and non colab in setting
         if self.pretraining == True:
-            CKPT_DIR = "/content/drive/MyDrive/checkpoints_pretraining"
+            CKPT_DIR = self.config["lighting_CKPT_DIR"]
             os.makedirs(CKPT_DIR, exist_ok=True)
             train_loader, valid_loader = self.import_data_pretraining()
             model = EncoderDecoder()
@@ -132,19 +130,11 @@ class Pipeline:
             filename="best",
         )
             early = EarlyStopping(monitor="val_mse", mode="min", patience=10)
-            trainer = Trainer(callbacks=[TQDMProgressBar(refresh_rate=20), ckpt, early], log_every_n_steps=5, max_epochs=15)
+            trainer = Trainer(callbacks=[TQDMProgressBar(refresh_rate=20), ckpt, early], log_every_n_steps=5, max_epochs=2)
             trainer.fit(model, val_dataloaders=valid_loader, train_dataloaders=train_loader)
            
 
-        #main_folder = "lightning_logs"
-        #folder = sorted(os.listdir(main_folder), key=lambda x:int(x.split("_")[1]))[-1]
-        #path = os.path.join(main_folder, folder, "checkpoints")
-        #check = os.listdir(path)
-        #path = os.path.join(main_folder, folder, "checkpoints", check[0])
-        #state = torch.load(path)
-        #model = EncoderDecoder()
-        #model.load_state_dict(state["state_dict"])
-        CKPT_PATH = "/content/drive/MyDrive/checkpoints_pretraining/best.ckpt"
+        CKPT_PATH = os.path.join(self.config["lighting_CKPT_DIR"], "checkpoints.ckpt")
         model = EncoderDecoder.load_from_checkpoint(CKPT_PATH)
         self.encoder = model.encoder
         self.temporal_embedding = model.temporal_embedding_e

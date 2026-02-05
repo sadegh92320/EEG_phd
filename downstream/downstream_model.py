@@ -9,7 +9,7 @@ from einops import rearrange
 class Downstream(nn.Module):
     """Basic downstream model"""
     def __init__(self, encoder, temporal_embedding, channel_embedding, class_token, path_eeg,\
-                enc_dim, num_classes, aggregation = "class"):
+                enc_dim, num_classes, aggregation = "class", use_rope = True):
         super().__init__()
 
         #Define all pretrained layer 
@@ -29,6 +29,8 @@ class Downstream(nn.Module):
         self.fc = nn.Linear(enc_dim, num_classes)
         self.aggregration = aggregation
 
+        self.use_rope = use_rope
+
     def forward(self, x):
         B, C, T = x.shape
         device = x.device
@@ -39,19 +41,25 @@ class Downstream(nn.Module):
         #Add channel en temporal embedding 
         chan_embedding = self.channel_embedding(torch.arange(0,C, device=device))
         chan_embedding = rearrange(chan_embedding, "c d -> 1 1 c d")
-        temp_embedding = self.temporal_embedding(seq_length = N, num_channel = C)
-        temp_embedding = rearrange(temp_embedding, "b (n c) d -> b n c d", c = C)
-        x = x + chan_embedding + temp_embedding
+        x = x + chan_embedding 
+
+        #Add temporal embedding if rotary embedding are not used
+        if not self.use_rope:
+            temp_embedding = self.temporal_embedding(seq_length = N, num_channel = C)
+            temp_embedding = rearrange(temp_embedding, "b (n c) d -> b n c d", c = C)
+            class_token = self.class_token + self.temporal_embedding.get_class_token()
+            x += temp_embedding
 
         x = rearrange(x, "b n c d -> b (n c) d")
 
-        class_token = self.class_token + self.temporal_embedding.get_class_token()
+        #Concat the class token and pass the input through the transformer layers
         class_token = class_token.expand(B, 1, -1)
         x = torch.concat([class_token, x], dim = 1)
         with torch.no_grad():
             for transformer in self.encoder:
                 x = transformer(x)
         
+        #Extract class token pass through fully connected
         class_token, x = x[:,:1,:], x[:,1:,:]
         if self.aggregration == "class":
             out = class_token.view(B,-1)

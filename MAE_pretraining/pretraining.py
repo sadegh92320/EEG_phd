@@ -316,17 +316,18 @@ class EncoderDecoder(pl.LightningModule):
         self.class_token = nn.Parameter(torch.zeros(1,1,enc_dim))
         
 
-    def to_decoded(self, x, to_restor, keep_id):
+    def to_decoded(self, x, num_patches, keep_id):
         """Gets back the original ordering of patches"""
         B, L_keep, D = x.shape
         device = x.device
 
         #Get the total number of patches 
-        L = to_restor.shape[1]
-        #Get the number of inutially masked patches
+        L = num_patches
 
+        #Get the ids of the unmasked tokens
         keep_id = keep_id.unsqueeze(-1).expand(B, -1, x.shape[-1])
 
+        #Get full sized random patches and add the kept token in their original positions
         x_full = self.mask_token.view(1,1,-1).expand(B,L,D).clone()
         x_full.scatter_(dim = 1, index=keep_id, src = x)
         return x_full
@@ -344,30 +345,28 @@ class EncoderDecoder(pl.LightningModule):
         #Stack all patches in a 1D array
         x_flat = rearrange(x, "b n c t -> b (n c) t")
         
-
         #Compute the number of patches to keep
         L_keep = int(L * (1-self.mask_prob))
 
         #Retrieve shuffle as well as ordered indices
         noise = torch.rand(B,L, device=device)
         id_shuffle = torch.argsort(noise, dim = 1)
-        id_restore = torch.argsort(id_shuffle, dim = 1)
+        #id_restore = torch.argsort(id_shuffle, dim = 1)
 
-        #Retrieve the id that we will be kept and repeat it T times so that patches are either fully
+        #Retrieve the id that we will be kept, sort them and repeat it T times so that patches are either fully
         # visible or fully masked
         id_keep = id_shuffle[:, :L_keep].to(device=device)    
         id_sorted, _ = torch.sort(id_keep, dim=1)
-
         to_keep = repeat(id_sorted, "b l -> b l t", t = T)
-        x_return = torch.gather(x_flat, dim = 1, index=to_keep)
 
+        #Only keep the non masked indices from the original signal
+        x_return = torch.gather(x_flat, dim = 1, index=to_keep)
         
-        #Compute the mask to retrieve original ordering of data
+        #Compute the mask to remove the non masked patches for prediction
         mask = torch.ones(B,L, device=device)
         mask.scatter_(dim = 1, index=id_sorted, src=torch.zeros(B,L_keep, dtype=mask.dtype, device=device))
-        
 
-        return x_return, id_restore, mask, id_sorted
+        return x_return, mask, id_sorted
 
     def forward(self, x):
         B, C, T = x.shape
@@ -376,6 +375,7 @@ class EncoderDecoder(pl.LightningModule):
         #Return the patch eeg with shape (b, n, c, d)
         x = self.patch(x)
         N = x.shape[1]
+        L = x.shape[1] * x.shape[2]
 
         #Define the embeddings
         chan_embedding = self.channel_embedding_e(torch.arange(0,C, device=device))
@@ -391,7 +391,7 @@ class EncoderDecoder(pl.LightningModule):
             x +=  temp_embedding
 
         #Mask the eeg patches
-        x, id_restore, mask, keep_id = self.masking(x)
+        x, mask, keep_id = self.masking(x)
 
         #Concatenate the class token to the eeg
         class_token = self.class_token + self.temporal_embedding_e.get_class_token()
@@ -409,7 +409,7 @@ class EncoderDecoder(pl.LightningModule):
         x = self.encoder_decoder(x)
         
         #Get the original ordering of patches
-        x = self.to_decoded(x, id_restore, keep_id)
+        x = self.to_decoded(x, L, keep_id)
         x = rearrange(x, "b (n c) d -> b n c d", c = C)
 
         #Get embeddings for decoding
@@ -417,17 +417,21 @@ class EncoderDecoder(pl.LightningModule):
         chan_embedding = rearrange(chan_embedding, "c d -> 1 1 c d")
         x += chan_embedding
 
+        #Add the temporal embedding if the rotary embedding are not used
         if not self.use_rotary:
             temp_embedding = self.temporal_embedding_d(seq_length = N, num_channel = C)
             temp_embedding = rearrange(temp_embedding, "b (s c) d -> b s c d", c = C)
             x += temp_embedding
         x = rearrange(x, "b n c d -> b (n c) d")
+
+        #Get the eeg sample indices for rotary embeddings
         seq = torch.arange(0,N).repeat_interleave(C)
         seq = seq.expand(B, -1)
         #Pass input through decoder layers
         for transformer in self.decoder:
             x = transformer(x, seq)
         
+        #Only keep the initially masked patches
         x = x[torch.where(mask == 1)]
         x = self.fc(x)
 
@@ -436,11 +440,15 @@ class EncoderDecoder(pl.LightningModule):
     def patchify_1d(self, x, patch_size: int):
         """Segment the target eeg signal in patch and pad if necessary"""
         B, C, T = x.shape
+        #Get the padding needed
         pad = (patch_size - (T % patch_size)) % patch_size
+
+        #Pad the temporal dimension if neededs
         if pad > 0:
             x = F.pad(x, (0, pad))  
             T = T + pad
 
+        #Return the result in a patched form
         N = T // patch_size
         x = x.view(B, C, N, patch_size)       
         x = x.permute(0, 2, 1, 3).contiguous()

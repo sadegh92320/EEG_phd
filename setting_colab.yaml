@@ -56,8 +56,9 @@ output_data_path: /content/data_downstream/
 input_data_path: "/Volumes/Elements/TramProject/PC"
 experiment_folder: data
 output_data_file: "trial"
-result_output: "log_output"
+result_output: /content/drive/MyDrive/log_output
 csv: /Users/sadeghemami/OpenMATBTimings.xlsx
+lighting_CKPT_DIR: /content/drive/MyDrive/checkpoints_pretraining
 #data info
 num_slice: 6
 

@@ -57,6 +57,7 @@ experiment_folder: data
 output_data_file: "trial"
 result_output: "log_output"
 csv: /Users/sadeghemami/OpenMATBTimings.xlsx
+lighting_CKPT_DIR: pretrain_weights
 #data info
 num_slice: 6
 
