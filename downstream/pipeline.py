@@ -179,7 +179,7 @@ class Pipeline:
     def train_model(self):
         """Train the model"""
         labels = []  # all targets in the dataset
-        self.load_encoder()
+        self.load_downstream()
         for y in self.label:
             labels.append(int(y))
 
