@@ -70,6 +70,7 @@ def time(func):
 
 class TrainerDownstream:
     def __init__(self, model_name, model, optimizer, loss_fn, batch_size, config, early_stopper = EarlyStopper, data = None, label = None):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name = model_name
         self.model = model
         self.optimizer_name = optimizer
@@ -78,6 +79,7 @@ class TrainerDownstream:
         self.batch_size = batch_size
         self.config = config
         self.preprocess = Preprocessing
+        
 
         #Load train and test data
         self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(data, label, train_size=0.9, random_state=92)
@@ -115,7 +117,8 @@ class TrainerDownstream:
     
     def load_model(self, ):
         """Load state dict of the model"""
-        model.load_state_dict(torch.load(PATH, weights_only=True))
+        #model.load_state_dict(torch.load(PATH, weights_only=True))
+        pass
         
     def train_one_epoch(self, optimizer, loss_fn, model, dataloader):
         '''
@@ -125,6 +128,7 @@ class TrainerDownstream:
         loss_total = 0
         for x,y in tqdm(dataloader):
             x = x.float()   
+            x, y = x.to(self.device), y.to(self.device)
             pred = model(x)
             loss = loss_fn(pred,y)
             optimizer.zero_grad()
@@ -177,9 +181,13 @@ class TrainerDownstream:
         model.eval()
         #Get all the evaluation metrics
         metrics = self.get_metrics()
+        for m in metrics.values():
+            m.to(self.device)
+            m.reset()
         with torch.no_grad():
             for x,y in tqdm(dataloader):
                 x = x.float()   
+                x, y = x.to(self.device), y.to(self.device)
                 pred = model(x)
                 probs = F.softmax(pred, dim = 1)
 
@@ -223,7 +231,7 @@ class TrainerDownstream:
 
             #Define the best model 
             best = -float("inf")
-            model = self.model
+            model = self.model().to(self.device)
             best_model = None
 
             #Build the optimizer and define loss function
@@ -295,7 +303,7 @@ class TrainerDownstream:
         best_model = None
         best = -float("inf")
         all_met = None
-        model =  self.model
+        model =  self.model().to(self.device)
         optimizer = self.build_optimizer(model, {"lr": lr})
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=6, factor=0.3, min_lr=1e-5)
         loss_fn = self.loss_fn

@@ -46,6 +46,7 @@ class Pipeline:
         self.channel_embedding = None
         self.class_token = None
         self.patch = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
        
     #Change in the future be careful of different size samples 
     def load_data(self, data_path):
@@ -164,11 +165,21 @@ class Pipeline:
                                 channel_embedding=self.channel_embedding, class_token=self.class_token, \
                                 enc_dim=768, num_classes=3)
     
-    
+    def make_model(self):
+            return Downstream(
+                encoder=self.encoder,
+                temporal_embedding=self.temporal_embedding,
+                path_eeg=self.patch,
+                channel_embedding=self.channel_embedding,
+                class_token=self.class_token,
+                enc_dim=768,
+                num_classes=3
+            )
+
     def train_model(self):
         """Train the model"""
         labels = []  # all targets in the dataset
-        self.load_downstream()
+        self.load_encoder()
         for y in self.label:
             labels.append(int(y))
 
@@ -180,7 +191,7 @@ class Pipeline:
         print("class_counts:", class_counts)
         print("class_weights:", class_weights)
 
-        self.trainer = self.trainer("cnnmodule", self.model, "adam", torch.nn.CrossEntropyLoss(weight=class_weights), batch_size = 32, config = self.config, data = self.data, label = self.label)
+        self.trainer = self.trainer("cnnmodule", self.make_model, "adam", torch.nn.CrossEntropyLoss(weight=class_weights.to(self.device)), batch_size = 32, config = self.config, data = self.data, label = self.label)
         self.trainer.train_whole_data()
         return self
     
