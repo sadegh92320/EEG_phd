@@ -18,6 +18,7 @@ class Downstream(nn.Module):
         self.channel_embedding = channel_embedding
         self.patch = path_eeg
         self.class_token = class_token
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         #Freeze all pretrained layers
         for layer in [self.encoder, self.temporal_embedding, self.channel_embedding, self.patch]:
@@ -49,7 +50,7 @@ class Downstream(nn.Module):
         if not self.use_rope:
             temp_embedding = self.temporal_embedding(seq_length = N, num_channel = C)
             temp_embedding = rearrange(temp_embedding, "b (n c) d -> b n c d", c = C)
-            class_token += self.temporal_embedding.get_class_token()
+            class_token = class_token + self.temporal_embedding.get_class_token()
             x += temp_embedding
 
         x = rearrange(x, "b n c d -> b (n c) d")
@@ -57,9 +58,11 @@ class Downstream(nn.Module):
         #Concat the class token and pass the input through the transformer layers
         class_token = class_token.expand(B, 1, -1)
         x = torch.concat([class_token, x], dim = 1)
+        seq = torch.arange(0,N).repeat_interleave(C)
+        seq = seq.expand(B, -1).to(device=self.device)
         with torch.no_grad():
             for transformer in self.encoder:
-                x = transformer(x)
+                x = transformer(x, seq)
         
         #Extract class token pass through fully connected
         class_token, x = x[:,:1,:], x[:,1:,:]
