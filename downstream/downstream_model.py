@@ -43,11 +43,13 @@ class Downstream(nn.Module):
         chan_embedding = rearrange(chan_embedding, "c d -> 1 1 c d")
         x = x + chan_embedding 
 
+
+        class_token = self.class_token
         #Add temporal embedding if rotary embedding are not used
         if not self.use_rope:
             temp_embedding = self.temporal_embedding(seq_length = N, num_channel = C)
             temp_embedding = rearrange(temp_embedding, "b (n c) d -> b n c d", c = C)
-            class_token = self.class_token + self.temporal_embedding.get_class_token()
+            class_token += self.temporal_embedding.get_class_token()
             x += temp_embedding
 
         x = rearrange(x, "b n c d -> b (n c) d")
