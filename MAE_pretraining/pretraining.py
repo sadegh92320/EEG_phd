@@ -339,6 +339,19 @@ class EncoderDecoder(pl.LightningModule):
         B, N, C, T = x.shape
         device = x.device
 
+        while True:
+            chan_drop = [c for c in range(C) if random.random() < 0.2]
+            if len(chan_drop) < C:
+                break
+        
+        #Pick the channels to drop
+        if len(chan_drop) > 0:
+            idx_chan = torch.arange(0,N, device=device, dtype=torch.long).repeat_interleave(len(chan_drop))
+            idx_chan = idx_chan.reshape(N,(len(chan_drop))) * C + torch.tensor(chan_drop, device=device, dtype=torch.long)
+            idx_chan = idx_chan.view(-1)
+        else:
+            idx_chan = torch.empty(0, device=device, dtype=torch.long)
+
         #Compute total number of patch
         L = N*C
 
@@ -346,10 +359,13 @@ class EncoderDecoder(pl.LightningModule):
         x_flat = rearrange(x, "b n c t -> b (n c) t")
         
         #Compute the number of patches to keep
-        L_keep = int(L * (1-self.mask_prob))
+        num_drop = idx_chan.numel()
+        num_allowed = L - num_drop
+        L_keep = min(int(L * (1 - self.mask_prob)), num_allowed)
 
         #Retrieve shuffle as well as ordered indices
         noise = torch.rand(B,L, device=device)
+        noise[:,idx_chan] = 2
         id_shuffle = torch.argsort(noise, dim = 1)
         #id_restore = torch.argsort(id_shuffle, dim = 1)
 

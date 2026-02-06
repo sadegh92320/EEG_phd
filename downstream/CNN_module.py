@@ -166,19 +166,7 @@ class CNNmodule(nn.Module):
         #    graph = conv(graph.x, graph.edge_index, graph.batch)
 
 
-class SimpleEEG(nn.Module):
-    def __init__(self, C = 14, T= 784, num_classes=3):
-        super().__init__()
-        self.conv = nn.Conv1d(C, 32, kernel_size=7, padding=3)
-        self.pool = nn.AdaptiveAvgPool1d(32)
-        self.fc = nn.Linear(32 * 32, num_classes)
 
-    def forward(self, x):     # x: (B, T, C)
-        x = x.permute(0, 2, 1)  # (B, C, T)
-        x = F.relu(self.conv(x))
-        x = self.pool(x)        # (B, 32, 32)
-        x = x.flatten(1)        # (B, 32*32)
-        return self.fc(x)
     
 
 import torch

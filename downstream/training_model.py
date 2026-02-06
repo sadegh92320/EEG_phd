@@ -130,8 +130,6 @@ class TrainerDownstream:
             x = x.float()   
             x, y = x.to(self.device), y.long().to(self.device)
             pred = model(x)
-            print(f"pred: {pred.shape}")
-            print(f"y: {y.shape}")
             loss = loss_fn(pred,y)
             optimizer.zero_grad()
             loss.backward()
@@ -291,7 +289,7 @@ class TrainerDownstream:
         """Train the model on whole data using the best parameters from the kfold training"""
         def objective(trial):
             # you choose how many folds you want
-            folds = 10
+            folds = 5
             return self.train_kfold(folds=folds, trial=trial)
         study = optuna.create_study(direction="maximize")
         study.optimize(objective, n_trials=50)
