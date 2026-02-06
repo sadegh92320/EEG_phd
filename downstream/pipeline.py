@@ -163,7 +163,7 @@ class Pipeline:
         print("done loading encoder")
         self.model = Downstream(encoder=self.encoder, temporal_embedding=self.temporal_embedding, path_eeg=self.patch,\
                                 channel_embedding=self.channel_embedding, class_token=self.class_token, \
-                                enc_dim=768, num_classes=3)
+                                enc_dim=768, num_classes=self.config["num_classes"])
     
     def make_model(self):
             return Downstream(
@@ -173,7 +173,7 @@ class Pipeline:
                 channel_embedding=self.channel_embedding,
                 class_token=self.class_token,
                 enc_dim=768,
-                num_classes=3
+                num_classes=self.config["num_classes"]
             )
 
     def train_model(self):
