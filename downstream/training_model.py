@@ -1,6 +1,6 @@
 from typing import Any
 import torch
-from downstream.CNN_module import CNNmodule, SimpleEEG, EEGNet
+from downstream.CNN_module import CNNmodule, EEGNet
 from sklearn.model_selection import KFold, StratifiedKFold
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
@@ -25,7 +25,7 @@ writer = SummaryWriter()
 
 MODEL_REGISTRY = {
     "CNNmodule": CNNmodule,
-    "SimpleEEG": SimpleEEG
+    
 }
 
 OPTIMIZER_REGISTRY = {
