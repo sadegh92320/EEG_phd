@@ -130,6 +130,8 @@ class TrainerDownstream:
             x = x.float()   
             x, y = x.to(self.device), y.long().to(self.device)
             pred = model(x)
+            print(f"pred: {pred.shape}")
+            print(f"y: {y.shape}")
             loss = loss_fn(pred,y)
             optimizer.zero_grad()
             loss.backward()
