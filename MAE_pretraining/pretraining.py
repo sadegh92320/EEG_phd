@@ -283,7 +283,7 @@ class TransformerLayer(nn.Module):
     
 class EncoderDecoder(pl.LightningModule):
     """Basic encoder decoder model following the ViT model"""
-    def __init__(self, config = None, use_rotary = True,num_channels = 58, max_embedding = 2000, enc_dim = 768, dec_dim = 256, depth_e = 5, depth_d = 3, mask_prob = 0.7, patch_size = 128):
+    def __init__(self, config = None, use_rotary = True,num_channels = 64, max_embedding = 2000, enc_dim = 768, dec_dim = 256, depth_e = 5, depth_d = 3, mask_prob = 0.7, patch_size = 128):
         super().__init__()
         self.config = config
         self.use_rotary = use_rotary

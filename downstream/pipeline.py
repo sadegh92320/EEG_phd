@@ -128,14 +128,14 @@ class Pipeline:
             monitor="val_mse",
             mode="min",
             save_top_k=1,
-            filename="best",
+            filename="best_2",
         )
             early = EarlyStopping(monitor="val_mse", mode="min", patience=10)
             trainer = Trainer(callbacks=[TQDMProgressBar(refresh_rate=20), ckpt, early], log_every_n_steps=5, max_epochs=1)
             trainer.fit(model, val_dataloaders=valid_loader, train_dataloaders=train_loader)
            
 
-        CKPT_PATH = os.path.join(self.config["lighting_CKPT_DIR"], "best.ckpt")
+        CKPT_PATH = os.path.join(self.config["lighting_CKPT_DIR"], "best_2.ckpt")
         print(f"path: {CKPT_PATH}")
         print(f"config path: {self.config["lighting_CKPT_DIR"]}")
         model = EncoderDecoder.load_from_checkpoint(CKPT_PATH)
