@@ -131,7 +131,7 @@ class Pipeline:
             filename="best_test",
         )
             early = EarlyStopping(monitor="val_mse", mode="min", patience=10)
-            trainer = Trainer(callbacks=[TQDMProgressBar(refresh_rate=20), ckpt, early], log_every_n_steps=5, max_epochs=150)
+            trainer = Trainer(callbacks=[TQDMProgressBar(refresh_rate=20), ckpt], log_every_n_steps=5, max_epochs=200)
             trainer.fit(model, val_dataloaders=valid_loader, train_dataloaders=train_loader)
            
 
