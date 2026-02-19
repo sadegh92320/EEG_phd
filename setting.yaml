@@ -52,7 +52,7 @@ freq: 250
 #path
 model_path: model/
 output_data_path: downstream
-input_data_path: "/Volumes/Elements/TramProject/PC"
+input_data_path: "/Volumes/Elements/EEG_data/pretraining/EEGforSadegh/LivingLAPT_Helmond"
 experiment_folder: data
 output_data_file: "trial"
 result_output: "log_output"

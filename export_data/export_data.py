@@ -22,8 +22,53 @@ class DataImport(ABC):
         """import the specific data changes for every dataset"""
         pass
 
+    def split(self, data, label = None, segment_length=3, overlap=0, sampling_rate=250):
+        """
+        Split the eeg in several segment
+        data:  shape (C, T) after transpose
+        label: single label for this trial (scalar or 0-d/1-d)
+        """
+        # make sure it's (C, T)
+        data = data.transpose() if data.shape[0] > data.shape[1] else data
+        C, T = data.shape
+        print(f"data shape (C, T): {data.shape}")
 
+        
+        step = int(segment_length * sampling_rate * (1 - overlap))
+        data_segment = sampling_rate * segment_length 
 
+        if step <= 0:
+            raise ValueError(
+                f"step computed as {step}. Check segment_length={segment_length} and overlap={overlap}."
+            )
+
+        # handle short signals: if T < data_segment, we still create 1 segment
+        if T <= data_segment:
+            number_segment = 0
+        else:
+            number_segment = (T - data_segment) // step
+
+        segments = []
+        new_labels = []
+
+        for i in range(number_segment + 1):
+            start = i * step
+            end = start + data_segment
+
+            # safety in case of boundary issues
+            if end > T:
+                end = T
+                start = max(0, end - data_segment)
+
+            seg = data[:, start:end]    # shape (C, segment_length_in_samples)
+            segments.append(seg)
+            new_labels.append(label)    # same label for all segments of this trial
+
+        print(f"Created {len(segments)} segments")
+        if label != None:
+            return segments, new_labels
+        else:
+            return segments
 
     def partition_data(self):
         """partition each recording in several slices"""
@@ -69,7 +114,7 @@ class DataImport(ABC):
         return self
     
     
-    def save_data(self, particition = False):
+    def save_data(self):
         """save the data in the folder"""
         out_dir = os.path.join(
             self.config["output_data_path"],

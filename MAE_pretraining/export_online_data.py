@@ -16,6 +16,7 @@ from torcheeg.datasets import M3CVDataset, TSUBenckmarkDataset, DEAPDataset, SEE
 from torcheeg import transforms
 from torcheeg.datasets.constants import SEED_CHANNEL_LIST, M3CV_CHANNEL_LIST, TSUBENCHMARK_CHANNEL_LIST
 from torcheeg.datasets import CSVFolderDataset
+import braindecode
 
 
 data_root_path = "./io_root/"
@@ -223,6 +224,7 @@ def get_SEED_dataset():
                           ]))
     return dataset
 
+
 #transforms.Lambda(
 #    lambda x: (
 #        lambda y: (y - y.mean(dim=-1, keepdim=True)) /
@@ -231,7 +233,7 @@ def get_SEED_dataset():
 #)
 
 if __name__ == "__main__":
-    pass
+    participant = braindecode.datasets.HGD(12)
     #dataset = get_physionet_dataset()
     #for i, (x,y) in enumerate(dataset):
     #    x = x.squeeze(0)
