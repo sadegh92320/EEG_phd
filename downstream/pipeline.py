@@ -107,8 +107,8 @@ class Pipeline:
         train_dataset, valid_dataset = random_split(dataset, [n_train, n_val], generator=g)
 
 
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=32, num_workers=10, shuffle=True)
-        valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=32, num_workers=10, shuffle=False)
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, num_workers=10, shuffle=True)
+        valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=128, num_workers=10, shuffle=False)
 
         return train_loader, valid_loader
 

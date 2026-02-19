@@ -292,7 +292,7 @@ class TrainerDownstream:
             folds = 5
             return self.train_kfold(folds=folds, trial=trial)
         study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=50)
+        study.optimize(objective, n_trials=20)
         lr = study.best_trial.params["learning_rate"]
         batch_size = study.best_trial.params["batch_size"]
         opt_name = study.best_trial.params["optimizer"]

@@ -139,12 +139,31 @@ class RotaryEmbedding(nn.Module):
         x_real = torch.view_as_real(x_rotate)
         x_real = x_real.reshape(*x.shape)
         return x_real
+    
+class TimeSpaceMultiheadAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
 
 class MultiHeadAttention(nn.Module):
     """Multi head attention module, takes the embedding dim and number of head."""
     def __init__(self, embed_dim, num_heads = 3, dropout = 0.1, att_dropout = 0.1,
                  is_causal = False, return_att = False, 
                  use_rotary = False, has_cls = False, region_token = False):
+        """
+            embed_dim: the dimension of the embedding of K, Q and V
+            num_heads: number of attention heads in the layer
+            dropout: the probability of dropout in the manual attention
+            att_dropout: the probability of dropout in the pytorch built in attention
+            is_causal: if True then the attention does not have acces to future tokens
+            return_att: if True attention is performed manually in order to retrieve 
+                    attention matrix
+            use_rotary: if True rotary embeddings are used as temporal positional 
+                    embeddings.
+            has_cls: if True then it tells the layer that the input posseses a class
+                    concatenated
+            region_token: if True tells the layer that the input posseses brain region 
+                    token
+        """
         super().__init__()
         assert embed_dim % num_heads == 0
         self.h = num_heads
@@ -164,16 +183,19 @@ class MultiHeadAttention(nn.Module):
         self.rotary = RotaryEmbedding(model_dim=embed_dim//num_heads)
 
     def split_heads(self, X):
+        """
+            View the output with the following shape, batch size, number of head, number of patches
+            and then dimension of heads
+        """
         return X.view(X.size(0), X.size(1), 3, self.h, self.dim_head).permute(2, 0, 3, 1, 4)      
 
     def forward(self, x, position = None, mask_pad = None, len_region = None):
-        #Compute Q, K and V and seperate segments per head
         B, N, D = x.shape
        
         if mask_pad is not None:
             mask_pad = mask_pad.view(B,1,1,N)
 
-
+        #Compute Q, K and V and seperate segments per head
         #Extract the query key value vectors each with shape
         # B, num_head, num_patches, dim_head
         qkv = self.split_heads(self.qkv(x))
@@ -184,6 +206,7 @@ class MultiHeadAttention(nn.Module):
         if self.use_rotary:
             assert position is not None, "position required when use_rotary=True"
             #shape is B, num_heads, num_patches, dim_head
+            #Remove the region tokens from query and key
             if self.region_token and len_region > 0:
                     q, region_token_q = q[:,:,:-len_region,:], q[:,:,-len_region:,:]
                     k, region_token_k = k[:,:,:-len_region,:], k[:,:,-len_region:,:]
@@ -201,9 +224,6 @@ class MultiHeadAttention(nn.Module):
                 k = torch.concat([k, region_token_k], dim=2)
                 q = torch.concat([q, region_token_q], dim=2)
        
-
-
-
         #Compute the attention score
         if self.return_att:
             score = (q@k.transpose(2,3))/(self.dim_head**0.5)
