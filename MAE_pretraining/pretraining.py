@@ -19,7 +19,10 @@ from lightning.pytorch import Trainer
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import TQDMProgressBar
 import math
+from MAE_pretraining.graph_embedding import GraphDataset
+from MAE_pretraining.gnn import GATModel
 import random
+from torch_geometric.data import Batch
 
 channel_list = ["Fp1","Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]
 channel_list_2 = ["Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]
@@ -191,14 +194,16 @@ class MultiHeadAttention(nn.Module):
             #If causal we mask all date happening in the future
             if self.is_causal:
                 T = score.size(-1)
-                mask = torch.triu(torch.ones(T,T, dtype=torch.bool), diagonal=1)
+                device = score.device
+                mask = torch.triu(torch.ones(T,T, dtype=torch.bool, device=device), diagonal=1)
                 score = score.masked_fill(mask, float('-inf'))
                 
             #Compute the attnetion matrix
             score = score.softmax(dim=-1)
             
             #Apply attention to V
-            out = self.dropout(score)@v
+            attn = F.dropout(score, p=self.att_dropout, training=self.training)
+            out = attn@v
         else:
             #Compute the attention score using pytorch built in function
             out = torch.nn.functional.scaled_dot_product_attention(
@@ -283,12 +288,15 @@ class TransformerLayer(nn.Module):
     
 class EncoderDecoder(pl.LightningModule):
     """Basic encoder decoder model following the ViT model"""
-    def __init__(self, config = None, use_rotary = True,num_channels = 64, max_embedding = 2000, enc_dim = 768, dec_dim = 256, depth_e = 5, depth_d = 3, mask_prob = 0.7, patch_size = 128):
+    def __init__(self, config = None, use_rotary = True,num_channels = 64, 
+                 max_embedding = 2000, enc_dim = 768, dec_dim = 256, depth_e = 5, 
+                 depth_d = 3, mask_prob = 0.7, patch_size = 128):
         super().__init__()
         self.config = config
         self.use_rotary = use_rotary
         self.dec_dim = dec_dim
         self.enc_dim = enc_dim
+
 
         #Define the encoder and decoder layers
         self.encoder = nn.ModuleList([TransformerLayer(embed_dim=enc_dim, nhead=8, use_rotary=use_rotary, has_cls=True) for i in range(depth_e)])
@@ -387,6 +395,8 @@ class EncoderDecoder(pl.LightningModule):
     def forward(self, x):
         B, C, T = x.shape
         device = x.device
+        
+
 
         #Return the patch eeg with shape (b, n, c, d)
         x = self.patch(x)
@@ -394,6 +404,7 @@ class EncoderDecoder(pl.LightningModule):
         L = x.shape[1] * x.shape[2]
 
         #Define the embeddings
+
         chan_embedding = self.channel_embedding_e(torch.arange(0,C, device=device))
         chan_embedding = rearrange(chan_embedding, "c d -> 1 1 c d")
         temp_embedding = self.temporal_embedding_e(seq_length = N, num_channel = C)
@@ -429,9 +440,11 @@ class EncoderDecoder(pl.LightningModule):
         x = rearrange(x, "b (n c) d -> b n c d", c = C)
 
         #Get embeddings for decoding
+       
         chan_embedding = self.channel_embedding_d(torch.arange(0,C, device=device))
         chan_embedding = rearrange(chan_embedding, "c d -> 1 1 c d")
-        x += chan_embedding
+        
+        x = x + chan_embedding
 
         #Add the temporal embedding if the rotary embedding are not used
         if not self.use_rotary:
@@ -453,6 +466,15 @@ class EncoderDecoder(pl.LightningModule):
 
         return x, mask
     
+    def create_batch_graphs(self,eeg_batch):
+        graph_list = []
+        for eeg, chn_list in eeg_batch:
+            g = self.graph_gen.create_graph(chn_list)
+            graph_list.append(g)
+        graph_batch = Batch(graph_list)
+        return graph_batch
+
+
     def patchify_1d(self, x, patch_size: int):
         """Segment the target eeg signal in patch and pad if necessary"""
         B, C, T = x.shape
