@@ -6,7 +6,7 @@ seed: 42
 
 #eeg info and experiment info
 
-num_classes: 3
+num_classes: 2
 
 channel_list:
   [

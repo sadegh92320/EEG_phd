@@ -141,8 +141,83 @@ class RotaryEmbedding(nn.Module):
         return x_real
     
 class TimeSpaceMultiheadAttention(nn.Module):
-    def __init__(self):
+    def __init__(self, embed_dim, num_heads = 3, dropout = 0.1, att_drop = 0.1,
+                 is_causal = False, return_att = False, use_rotary = False, 
+                 has_cls = False, region_token = False):
         super().__init__()
+        assert embed_dim % num_heads == 0
+        self.h = num_heads
+        self.dim_head = embed_dim//num_heads
+        self.qkv_spatial = nn.Linear(embed_dim, 3*embed_dim)
+        self.qkv_temporal = nn.Linear(embed_dim, 3*embed_dim)
+        self.fc = nn.Linear(embed_dim,embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.att_drop = att_drop
+        self.is_causal = is_causal
+        self.return_att = return_att
+        self.use_rotary = use_rotary
+
+        #Used as a flag to signal if the input is expected to have the class token
+        self.has_cls = has_cls
+        self.region_token = region_token
+
+        self.rotary = RotaryEmbedding(model_dim=embed_dim//num_heads)
+
+
+    def split_head(self,x):
+        return x.view(x.size(0), x.size(1), 3, self.h, self.dim_head).permute(2, 0, 3, 1, 4)
+
+    def forward(self,x, mask_pad, position, len_region):
+        #receive the input with dimension B,C,P,D group batch and channels to focus
+        # on time only
+        x = rearrange(x, "b c p d -> (b c) p d")
+        x = self.qkv_temporal(x)
+        x = self.split_head(x)
+        q, k, v = x[0], x[1], x[2]
+        if self.use_rotary:
+            assert position is not None, "position required when use_rotary=True"
+            #shape is B, num_heads, num_patches, dim_head
+            #Remove the region tokens from query and key
+            if self.region_token and len_region > 0:
+                    q, region_token_q = q[:,:,:-len_region,:], q[:,:,-len_region:,:]
+                    k, region_token_k = k[:,:,:-len_region,:], k[:,:,-len_region:,:]
+            if self.has_cls:
+                q, class_token_q = q[:,:,1:,:], q[:,:,:1,:]
+                k, class_token_k = k[:,:,1:,:], k[:,:,:1,:]
+                q = self.rotary(q, position)
+                k = self.rotary(k, position)
+                k = torch.concat([class_token_k, k], dim=2)
+                q = torch.concat([class_token_q, q], dim=2)
+            else:
+                q = self.rotary(q, position)
+                k = self.rotary(k, position)
+            if self.region_token and len_region > 0:
+                k = torch.concat([k, region_token_k], dim=2)
+                q = torch.concat([q, region_token_q], dim=2)
+       
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=self.att_drop if self.training else 0, is_causal=self.is_causal)
+        x = x.transpose(1,2)
+        #Get initial dimention back
+        x = rearrange(x , "(b c) p h e -> b c p (h e)")
+        x = x.transpose(1, 2)
+        x = rearrange(x, "b p c d -> (b p) c d")
+        x = self.qkv_spatial(x)
+        x = self.split_head(x)
+        q, k, v = x[0], x[1], x[2]
+        mask_pad = mask_pad[:,None,None,:]
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask_pad, dropout_p=self.att_drop if self.training else 0, is_causal=self.is_causal)
+        x = x.transpose(1,2)
+        #Get initial dimention back
+        x = rearrange(x , "(b p) c h e -> b p c (h e)")
+        x = x.transpose(1,2)
+        x = self.fc(x)
+        return self.dropout(x)
+
+
+
+
 
 class MultiHeadAttention(nn.Module):
     """Multi head attention module, takes the embedding dim and number of head."""
@@ -321,16 +396,28 @@ class TransformerLayer(nn.Module):
 
         return (Z + self.drop_path(ff))
     
-
+#Note this method will be moved and sequence packing will be explored in the future
 def collate_fn(batch):
+    """Pad channels to get the same number of channels across samples"""
+
+    #Transpose EGG original shape is (C,T)
     eegs = [b[0].transpose(0,1) for b in batch]  
+
+    #Get the number of channels of each samples
     channels = [b[1] for b in batch]
 
+    #Pad the channels with zero and transpose to get shape (B,C,T)
     eeg_pad = torch.nn.utils.rnn.pad_sequence(eegs, batch_first=True, padding_value=0.0).transpose(1,2)
+
+    #Retrieve batch size and max channel and create initialize the mask
     batch_size = len(eegs)
     max_c = eeg_pad.shape[1]
     mask = torch.zeros((batch_size, max_c), dtype=torch.bool)
+
+    #Retrive each channel length across batch
     channel_len = [e.shape[1] for e in eegs]
+
+    #Replace true value with True
     for i, ch_len in enumerate(channel_len):
         mask[i, :ch_len] = True
 

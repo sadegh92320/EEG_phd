@@ -128,6 +128,7 @@ class TrainerDownstream:
         loss_total = 0
         for x,y in tqdm(dataloader):
             x = x.float()   
+
             x, y = x.to(self.device), y.long().to(self.device)
             pred = model(x)
             loss = loss_fn(pred,y)

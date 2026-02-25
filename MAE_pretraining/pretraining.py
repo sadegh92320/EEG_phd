@@ -22,6 +22,8 @@ import math
 from MAE_pretraining.graph_embedding import GraphDataset
 from MAE_pretraining.gnn import GATModel
 import random
+import torch.nn.init as init
+from timm.models.vision_transformer import PatchEmbed, Block
 from torch_geometric.data import Batch
 
 channel_list = ["Fp1","Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]
@@ -31,7 +33,7 @@ CHANNEL_DICT = dict(zip(range(len(channel_list)), channel_list))
 
 class PatchEEG(nn.Module):
     """Module that segments the eeg signal in patches and align them with encoder dimension"""
-    def __init__(self, embed_dim = 768, patch_size = 16):
+    def __init__(self, embed_dim = 768, patch_size = 32):
         super().__init__()
         self.embed_dim = embed_dim
         self.fc = nn.Linear(patch_size, embed_dim)
@@ -39,11 +41,6 @@ class PatchEEG(nn.Module):
         self.unfold = nn.Unfold(kernel_size=(1,patch_size), stride=patch_size)
     def patch_eeg(self, x):
         B, C, T = x.shape
-
-        #Pad the eeg signal so that it is aligned with the patch size
-        pad = (self.patch_size - (T%self.patch_size))%self.patch_size
-        if pad > 0:
-            x = F.pad(x, (0,pad))
 
         #Add one dimension B,C,1,T
         x = x.unsqueeze(2)
@@ -59,160 +56,16 @@ class PatchEEG(nn.Module):
         x = self.patch_eeg(x)
         return self.fc(x)
     
-class DropPath(nn.Module):
-    """Randomly drops the attention branch"""
-    def __init__(self, keep_prob):
-        super().__init__()
-        self.prob = keep_prob
+
     
-    def drop_path(self, x):
-        #Deactivate if training
-        if self.prob == 1 or self.training == False:
-            return x
-        
-        #Dim of tensor B, 1, 1,...
-        dim_tensor = (x.shape[0],) + ([1]) * (x.ndim - 1)
-
-        #Create a tensor of size B,1,1... with values between 0 and 2
-        rand_tensor = self.prob + torch.rand(dim_tensor, dtype=x.dtype, device=x.device)
-        #Convert values to binary
-        drop_tensor = rand_tensor.floor()
-        #Drop the chosen values and divide by the probability to keep the same original expectation
-        return x.div(self.prob) * drop_tensor
-    
-    def forward(self, x):
-        return self.drop_path(x)
-
-class RotaryEmbedding(nn.Module):
-    """
-        Implementation of the Rotary embedding which attributes to each token
-        pair a relative rotation.
-    """
-    def __init__(self, model_dim,theta = 10000,is_learnable = False):
-        super().__init__()
-        assert model_dim % 2 == 0
-        self.is_learnable = is_learnable
-
-        #Define the frequency of the angle
-        self.freqs = nn.Parameter(
-            1. / (theta ** (torch.arange(0, model_dim, 2)[:(model_dim // 2)].float() / model_dim)),
-            requires_grad = is_learnable)
-
-    def create_frequency(self, kept_ids, device, dtype):
-
-        #Total number of patches
-        #Shape (num_patches)
-        B, N = kept_ids.shape
-        kept_ids = kept_ids.to(self.freqs.dtype).to(self.freqs.device)
-
-        #Do the outer product between the freqs and all the kept patch indices
-        freqs = kept_ids.reshape(B,N,1) * self.freqs
-        #Convert the angle to polar coordinate
-        polar = torch.polar(torch.ones_like(freqs), freqs)
-        return polar
-
-    def forward(self, x, id_kepts):
-        #B, num_head, num_patch, dim_head
-        B, H, N, D = x.shape
-        device = x.device
-        dtype = x.dtype
-        ndim = x.ndim
-        assert D == 2 * self.freqs.numel(), "RoPE model_dim must equal x last dim"
-
-        assert id_kepts.shape == (B, N)
-    
-        polar = self.create_frequency(kept_ids=id_kepts, device=device, dtype=dtype)
-
-        #Dimension B, 1, N, D
-        polar = polar.unsqueeze(1)
-
-        #Dimension B, num_head, N, D//2, 2
-        #Segment the last dimension in individual 2D plan
-        x2 = x.view(*x.shape[:-1], D//2, 2).contiguous()
-
-        #Convert the vector is polar form to complex number
-        x_complex = torch.view_as_complex(x2)
-
-        #Multiply the vector by the angle then transform back to real number with correct shape
-        x_rotate = x_complex * polar
-        x_real = torch.view_as_real(x_rotate)
-        x_real = x_real.reshape(*x.shape)
-        return x_real
-
-class MultiHeadAttention(nn.Module):
-    """Multi head attention module, takes the embedding dim and number of head."""
-    def __init__(self, embed_dim, num_heads = 3, dropout = 0.1, att_dropout = 0.1,is_causal = False, return_att = False, use_rotary = False, has_cls = False):
-        super().__init__()
-        assert embed_dim % num_heads == 0
-        self.h = num_heads
-        self.dim_head = embed_dim//num_heads
-        self.qkv = nn.Linear(embed_dim, 3*embed_dim)
-        self.fc = nn.Linear(embed_dim,embed_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.is_causal = is_causal
-        self.return_att = return_att
-        self.att_dropout = att_dropout
-        self.use_rotary = use_rotary
-
-        #Used as a flag to signal if the input is expected to have the class token
-        self.has_cls = has_cls
-
-        self.rotary = RotaryEmbedding(model_dim=embed_dim//num_heads)
-
-    def split_heads(self, X):
-        return X.view(X.size(0), X.size(1), 3, self.h, self.dim_head).permute(2, 0, 3, 1, 4)      
-
-    def forward(self, x, position = None):
-        #Compute Q, K and V and seperate segments per head
-        B, N, D = x.shape
-
-        #Extract the query key value vectors each with shape
-        # B, num_head, num_patches, dim_head
-        qkv = self.split_heads(self.qkv(x))
-        
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        #If Rotary embeddings are used then apply it in the attention mechanism
-        if self.use_rotary:
-            assert position is not None, "position required when use_rotary=True"
-            #shape is B, num_heads, num_patches, dim_head
-            if self.has_cls:
-                q, class_token_q = q[:,:,1:,:], q[:,:,:1,:]
-                k, class_token_k = k[:,:,1:,:], k[:,:,:1,:]
-                q = self.rotary(q, position)
-                k = self.rotary(k, position)
-                k = torch.concat([class_token_k, k], dim=2)
-                q = torch.concat([class_token_q, q], dim=2)
-            else:
-                q = self.rotary(q, position)
-                k = self.rotary(k, position)
-
-        #Compute the attention score
-        if self.return_att:
-            score = (q@k.transpose(2,3))/(self.dim_head**0.5)
-
-            #If causal we mask all date happening in the future
-            if self.is_causal:
-                T = score.size(-1)
-                device = score.device
-                mask = torch.triu(torch.ones(T,T, dtype=torch.bool, device=device), diagonal=1)
-                score = score.masked_fill(mask, float('-inf'))
-                
-            #Compute the attnetion matrix
-            score = score.softmax(dim=-1)
-            
-            #Apply attention to V
-            attn = F.dropout(score, p=self.att_dropout, training=self.training)
-            out = attn@v
-        else:
-            #Compute the attention score using pytorch built in function
-            out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, dropout_p=self.att_dropout if self.training else 0, is_causal=self.is_causal)
-            score = None
-        out = out.transpose(1,2)
-        out = out.reshape(out.size(0), out.size(1), self.h*self.dim_head)
-        out = self.fc(out)
-        return self.dropout(out), score
+class ChannelPositionalEmbed(nn.Module):
+    def __init__(self, embedding_dim):
+        super(ChannelPositionalEmbed, self).__init__()
+        self.channel_transformation = nn.Embedding(145, embedding_dim)
+        init.zeros_(self.channel_transformation.weight)
+    def forward(self, channel_indices):
+        channel_embeddings = self.channel_transformation(channel_indices)
+        return channel_embeddings
 
 
 class TemporalEncoding(nn.Module):
@@ -249,49 +102,36 @@ class TemporalEncoding(nn.Module):
         #Repeat it over channels
         pe = pe.repeat_interleave(num_channel, dim=1)       # (1, Seq*C, D)
         return pe
-
-       
-
-
-
-class TransformerLayer(nn.Module):
-    """Define one transformer layer"""
-    def __init__(self, embed_dim, nhead = 3, dim_feedforward=2048, dropout=0.1, activation = "gelu", keep_prob = 1, use_rotary = False, has_cls = False):
-        super().__init__()
-        self.self_attn = MultiHeadAttention(embed_dim=embed_dim, num_heads=nhead, dropout=dropout, use_rotary=use_rotary, has_cls = has_cls)
-        self.linear1 = nn.Linear(embed_dim, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, embed_dim)
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        activations = {"gelu": nn.GELU(), "relu": nn.ReLU()}
-        self.activation = activations[activation]
-        self.drop_path = DropPath(keep_prob=keep_prob) if keep_prob < 1 else nn.Identity()
-
-    def forward(self, src, keep):
-        #Compute the multihead attention
-        z = self.norm1(src)
-        attn, _ = self.self_attn(z, position = keep)
-
-        #Apply residual connection and layer normalization
-        Z = src + self.drop_path(attn)
-
-        #Apply normalization
-        ff = self.norm2(Z)
-
-        #MLP layer
-        ff = self.dropout(self.linear2(self.dropout(self.activation(self.linear1(ff)))))
-
-        return (Z + self.drop_path(ff))
     
+
+class TemporalPositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 500):
+        super().__init__()        
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp((torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model)).float())
+        pe = torch.zeros(1, max_len, d_model)
+        pe[0,:, 0::2] = torch.sin(position.float() * div_term)
+        pe[0,:, 1::2] = torch.cos(position.float() * div_term)
+        self.register_buffer('pe', pe)
+    
+    def get_class_token(self):
+        return self.pe[0,0,:]
+    
+    def forward(self, seq_indices):
+        batch_size, seq_len = seq_indices.shape
+        pe_embeddings = self.pe[0, seq_indices.view(-1)].view(batch_size, seq_len, -1)
+        return pe_embeddings
+
+
 
     
 class EncoderDecoder(pl.LightningModule):
     """Basic encoder decoder model following the ViT model"""
-    def __init__(self, config = None, use_rotary = True,num_channels = 64, 
-                 max_embedding = 2000, enc_dim = 768, dec_dim = 256, depth_e = 5, 
-                 depth_d = 3, mask_prob = 0.7, patch_size = 128):
+    def __init__(self, config = None, use_rotary = False,num_channels = 64, 
+                 max_embedding = 2000, enc_dim = 1024, dec_dim = 512, depth_e = 24, 
+                 depth_d = 8, mask_prob = 0.7, patch_size = 16):
         super().__init__()
+
         self.config = config
         self.use_rotary = use_rotary
         self.dec_dim = dec_dim
@@ -299,8 +139,8 @@ class EncoderDecoder(pl.LightningModule):
 
 
         #Define the encoder and decoder layers
-        self.encoder = nn.ModuleList([TransformerLayer(embed_dim=enc_dim, nhead=8, use_rotary=use_rotary, has_cls=True) for i in range(depth_e)])
-        self.decoder = nn.ModuleList([TransformerLayer(embed_dim=dec_dim, nhead=4, use_rotary = use_rotary, has_cls=False) for i in range(depth_d)])
+        self.encoder = nn.ModuleList([Block(enc_dim, num_heads=16, mlp_ratio=4, qkv_bias=True, norm_layer=nn.LayerNorm) for i in range(depth_e)])
+        self.decoder = nn.ModuleList([Block(dec_dim, num_heads=16, mlp_ratio = 4, qkv_bias=True, norm_layer=nn.LayerNorm) for i in range(depth_d)])
 
         #Set the probability for a token to be masked
         self.mask_prob = mask_prob
@@ -309,19 +149,30 @@ class EncoderDecoder(pl.LightningModule):
         self.encoder_decoder = (nn.Linear(enc_dim, dec_dim) if enc_dim != dec_dim else nn.Identity())
 
         self.patch_size = patch_size
-        self.patch = PatchEEG(patch_size=patch_size)
-        self.mask_token = nn.Parameter(torch.zeros((dec_dim)))
+        self.patch = PatchEEG(patch_size=patch_size, embed_dim=enc_dim)
+        self.mask_token = nn.Parameter(torch.zeros((1, 1, dec_dim)))
         self.fc = nn.Linear(dec_dim, patch_size)
         self.num_channels = num_channels
+        self.norm_enc = nn.LayerNorm(enc_dim)
+        self.norm_dec = nn.LayerNorm(dec_dim)
         
         #Define the temporal and channel embeddings 
         self.channel_embedding_e = nn.Embedding(num_channels, enc_dim)
         self.channel_embedding_d = nn.Embedding(num_channels, dec_dim)
-        self.temporal_embedding_d = TemporalEncoding(embed_dim=dec_dim, max_len=max_embedding)
-        self.temporal_embedding_e = TemporalEncoding(embed_dim=enc_dim, max_len=max_embedding)
+        self.temporal_embedding_d = TemporalPositionalEncoding(d_model=dec_dim, max_len=max_embedding)
+        self.temporal_embedding_e = TemporalPositionalEncoding(d_model=enc_dim, max_len=max_embedding)
 
         self.criterion = nn.MSELoss()
         self.class_token = nn.Parameter(torch.zeros(1,1,enc_dim))
+
+    def restore_seq(self, x, num_patches, id_restore):
+
+        B, L_keep, D = x.shape
+        x_full = self.mask_token.repeat(B,num_patches - L_keep,1).clone()
+        x = torch.cat([x,x_full], dim=1)
+        x = torch.gather(x, dim=1, index=id_restore.unsqueeze(-1).repeat(1,1,D))
+        return x
+
         
 
     def to_decoded(self, x, num_patches, keep_id):
@@ -339,7 +190,54 @@ class EncoderDecoder(pl.LightningModule):
         x_full = self.mask_token.view(1,1,-1).expand(B,L,D).clone()
         x_full.scatter_(dim = 1, index=keep_id, src = x)
         return x_full
+    
+
+    def random_masking(self, x, mask_ratio):
+        """
+        Perform per-sample random masking by per-sample shuffling.
+        Per-sample shuffling is done by argsort random noise.
+        x: [N, L, D], sequence
+        """
+        N, L, D = x.shape  # batch, length, dim
+        len_keep = int(L * (1 - mask_ratio))
         
+        noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
+        
+        # sort noise for each sample
+        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        # keep the first subset
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+        # generate the binary mask: 0 is keep, 1 is remove
+        mask = torch.ones([N, L], device=x.device)
+        mask[:, :len_keep] = 0
+        # unshuffle to get the binary mask
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        return x_masked, mask, ids_restore
+    
+
+    def masking_vit(self, x):
+        B, L, D = x.shape
+
+        device = x.device
+        l_keep = int(L*(1-self.mask_prob))
+        noise = torch.rand(B,L, device=device)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+        id_keep = ids_shuffle[:,:l_keep]
+        id_keep = repeat(id_keep, "b n -> b n d", d = D)
+        x_masked = torch.gather(x, dim=1, index=id_keep)
+        mask = torch.ones([B,L], device=device)
+        mask[:,:l_keep] = 0
+        mask = torch.gather(mask, dim = 1, index=ids_restore)
+
+
+        return x_masked, ids_restore,mask
+
 
     def masking(self, x):
         """Mask random patch of the eeg input"""
@@ -391,34 +289,37 @@ class EncoderDecoder(pl.LightningModule):
         mask.scatter_(dim = 1, index=id_sorted, src=torch.zeros(B,L_keep, dtype=mask.dtype, device=device))
 
         return x_return, mask, id_sorted
-
-    def forward(self, x):
+    
+    def encoder_forward(self,x):
         B, C, T = x.shape
         device = x.device
-        
-
-
+    
         #Return the patch eeg with shape (b, n, c, d)
         x = self.patch(x)
+        original = x
         N = x.shape[1]
         L = x.shape[1] * x.shape[2]
+        x = x.view(B,L,-1)
 
         #Define the embeddings
-
-        chan_embedding = self.channel_embedding_e(torch.arange(0,C, device=device))
-        chan_embedding = rearrange(chan_embedding, "c d -> 1 1 c d")
+        chan_id = torch.arange(0,C, device=device)
+        chan_id = chan_id.view(1,1,-1).repeat(B,N,1).view(B, L)
+        chan_embedding = self.channel_embedding_e(chan_id)
         temp_embedding = self.temporal_embedding_e(seq_length = N, num_channel = C)
         temp_embedding = rearrange(temp_embedding, "b (s c) d -> b s c d", c = C)
         
         x += chan_embedding 
 
         if not self.use_rotary:
-            temp_embedding = self.temporal_embedding_e(seq_length = N, num_channel = C)
-            temp_embedding = rearrange(temp_embedding, "b (s c) d -> b s c d", c = C)
-            x +=  temp_embedding
+            seq_idx = torch.arange(0, N, device=device, dtype=torch.long)  # use 0..Seq-1 (or 1..Seq if your ref does)
+            eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
+
+            tp = self.temporal_embedding_e(eeg_seq_indices) if isinstance(self.temporal_embedding_e, TemporalPositionalEncoding) \
+            else self.temporal_embedding_e(seq_length=L, num_channel=C).to(device).expand(B, -1, -1)
+            x += tp
 
         #Mask the eeg patches
-        x, mask, keep_id = self.masking(x)
+        x, ids_restore, mask = self.masking_vit(x)
 
         #Concatenate the class token to the eeg
         class_token = self.class_token + self.temporal_embedding_e.get_class_token()
@@ -427,44 +328,76 @@ class EncoderDecoder(pl.LightningModule):
        
         #Pass the sequence through the encoder layers 
         for transformer in self.encoder:
-            x = transformer(x, keep_id//C)
+            x = transformer(x)
 
+        x = self.norm_enc(x)
+
+        return x, ids_restore, mask, original
+
+    def decoder_forward(self,x,ids_restore, mask, original):
+        B, N, C, D = original.shape
+        L = N*C
+        device = x.device
+        #Get decoder dimensions (B,N*C,D)
+        x = self.encoder_decoder(x)
         #Retrieve the class token which is not used for decoding
         x, class_token = x[:,1:,:], x[:,:1,:]
 
-        #Get decoder dimensions (B,N*C,D)
-        x = self.encoder_decoder(x)
         
         #Get the original ordering of patches
-        x = self.to_decoded(x, L, keep_id)
-        x = rearrange(x, "b (n c) d -> b n c d", c = C)
+        x = self.restore_seq(x = x, num_patches=L, id_restore=ids_restore)
+        
 
         #Get embeddings for decoding
        
-        chan_embedding = self.channel_embedding_d(torch.arange(0,C, device=device))
-        chan_embedding = rearrange(chan_embedding, "c d -> 1 1 c d")
+        chan_idx = torch.arange(0, C, device=device, dtype=torch.long)
+        eeg_chan_indices = chan_idx.unsqueeze(0).unsqueeze(1).repeat(B, N, 1).view(B, L)
+        chan_embedding = self.channel_embedding_d(eeg_chan_indices)
         
         x = x + chan_embedding
 
         #Add the temporal embedding if the rotary embedding are not used
         if not self.use_rotary:
-            temp_embedding = self.temporal_embedding_d(seq_length = N, num_channel = C)
-            temp_embedding = rearrange(temp_embedding, "b (s c) d -> b s c d", c = C)
-            x += temp_embedding
-        x = rearrange(x, "b n c d -> b (n c) d")
+            seq_idx = torch.arange(0, N, device=device, dtype=torch.long)  # use 0..Seq-1 (or 1..Seq if your ref does)
+            eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
+
+            tp = self.temporal_embedding_d(eeg_seq_indices) if isinstance(self.temporal_embedding_e, TemporalPositionalEncoding) \
+            else self.temporal_embedding_d(seq_length=L, num_channel=C).to(device).expand(B, -1, -1)
+
+            x = x + tp
+
+        
+        class_token = class_token + self.temporal_embedding_d.get_class_token()
+        x = torch.cat([class_token, x], dim = 1)
 
         #Get the eeg sample indices for rotary embeddings
         seq = torch.arange(0,N).repeat_interleave(C)
         seq = seq.expand(B, -1)
         #Pass input through decoder layers
         for transformer in self.decoder:
-            x = transformer(x, seq)
+            x = transformer(x)
         
         #Only keep the initially masked patches
-        x = x[torch.where(mask == 1)]
+        x = x[:,1:,:]
+        #x = x[torch.where(mask == 1)]
+
+        x = self.norm_dec(x)
         x = self.fc(x)
 
         return x, mask
+
+    def forward(self, eeg):
+        x, ids_restore, mask, original = self.encoder_forward(eeg)
+        pred, mask = self.decoder_forward(x, ids_restore, mask, original)
+        target, pad = self.patchify_1d(eeg, self.patch_size)   
+        B, Seq, Ch, P = target.shape
+        target = target.view(B, Seq * Ch, P)                 
+
+       
+        loss_per_patch = ((pred - target) ** 2).mean(dim=-1)    # (B, L)
+        loss = (loss_per_patch * mask).sum() / mask.sum().clamp_min(1.0)
+        return loss, pred, mask
+
     
     def create_batch_graphs(self,eeg_batch):
         graph_list = []
@@ -505,25 +438,18 @@ class EncoderDecoder(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         data, _ = batch
-        pred, mask = self(data)
-        target, pad = self.patchify_1d(data, self.patch_size)
-        target = target.view(target.size(0), -1, self.patch_size)
-        
-        loss = self.criterion(pred, target[torch.where(mask == 1)].float())
+        loss, pred, mask = self(data)
         self.log("train_loss", loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
         data, _ = batch
-        pred, mask = self(data)
-        target, pad = self.patchify_1d(data, self.patch_size)
-        target = target.view(target.size(0), -1, self.patch_size)
-        mse = self.criterion(pred, target[torch.where(mask == 1)].float())
-        mae = F.l1_loss(pred, target[torch.where(mask == 1)].float())
+        mse, pred, mask = self(data)
+        
         rmse = torch.sqrt(mse + 1e-8)
 
         self.log_dict(
-        {"val_mse": mse, "val_mae": mae, "val_rmse": rmse},
+        {"val_mse": mse, "val_rmse": rmse},
         prog_bar=True, on_step=False, on_epoch=True
     )
         

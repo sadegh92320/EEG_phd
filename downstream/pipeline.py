@@ -27,10 +27,11 @@ from lightning.pytorch.loggers.tensorboard import TensorBoardLogger
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks import ModelCheckpoint
 from downstream.downstream_model import Downstream
+from downstream.models.conv_model import SimpleEEG
 
 class Pipeline:
     """Experiment pipeline from pretraining to downstream task"""
-    def __init__(self, dataimporter, dataset, trainer, config,preprocess = False, is_split = False, pretraining = True):
+    def __init__(self, dataimporter, dataset, trainer, config,preprocess = False, is_split = False, pretraining = False):
         self.dataimporter = dataimporter
         self.trainer = trainer 
         self.eeg_dataset = dataset
@@ -136,7 +137,7 @@ class Pipeline:
            
 
         CKPT_PATH = os.path.join(self.config["lighting_CKPT_DIR"], "best_test.ckpt")
-        model = EncoderDecoder.load_from_checkpoint(CKPT_PATH)
+        model = EncoderDecoder()
         self.encoder = model.encoder
         self.temporal_embedding = model.temporal_embedding_e
         self.channel_embedding = model.channel_embedding_e
@@ -161,7 +162,7 @@ class Pipeline:
         print("done loading encoder")
         self.model = Downstream(encoder=self.encoder, temporal_embedding=self.temporal_embedding, path_eeg=self.patch,\
                                 channel_embedding=self.channel_embedding, class_token=self.class_token, \
-                                enc_dim=768, num_classes=self.config["num_classes"])
+                                enc_dim=1024, num_classes=self.config["num_classes"])
     
     def make_model(self):
             return Downstream(
@@ -173,6 +174,9 @@ class Pipeline:
                 enc_dim=768,
                 num_classes=self.config["num_classes"]
             )
+    
+    def make_conv_model(self):
+        return SimpleEEG()
 
     def loop_over_model(self):
         """Go through all the created models to test their performance against our own one"""
