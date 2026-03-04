@@ -25,6 +25,8 @@ import random
 import torch.nn.init as init
 from timm.models.vision_transformer import PatchEmbed, Block
 from torch_geometric.data import Batch
+from MAE_pretraining.transformer_variants import TransformerLayerViT
+
 
 channel_list = ["Fp1","Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]
 channel_list_2 = ["Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]
@@ -123,13 +125,11 @@ class TemporalPositionalEncoding(nn.Module):
         return pe_embeddings
 
 
-
-    
 class EncoderDecoder(pl.LightningModule):
     """Basic encoder decoder model following the ViT model"""
     def __init__(self, config = None, use_rotary = False,num_channels = 64, 
                  max_embedding = 2000, enc_dim = 1024, dec_dim = 512, depth_e = 24, 
-                 depth_d = 8, mask_prob = 0.7, patch_size = 16):
+                 depth_d = 8, mask_prob = 0.7, patch_size = 16, norm_pix_loss = True):
         super().__init__()
 
         self.config = config
@@ -139,8 +139,8 @@ class EncoderDecoder(pl.LightningModule):
 
 
         #Define the encoder and decoder layers
-        self.encoder = nn.ModuleList([Block(enc_dim, num_heads=16, mlp_ratio=4, qkv_bias=True, norm_layer=nn.LayerNorm) for i in range(depth_e)])
-        self.decoder = nn.ModuleList([Block(dec_dim, num_heads=16, mlp_ratio = 4, qkv_bias=True, norm_layer=nn.LayerNorm) for i in range(depth_d)])
+        self.encoder = nn.ModuleList([TransformerLayerViT(enc_dim, nhead=16, mlp_ratio=4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_e)])
+        self.decoder = nn.ModuleList([TransformerLayerViT(dec_dim, num_heads=16, mlp_ratio = 4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_d)])
 
         #Set the probability for a token to be masked
         self.mask_prob = mask_prob
@@ -157,13 +157,30 @@ class EncoderDecoder(pl.LightningModule):
         self.norm_dec = nn.LayerNorm(dec_dim)
         
         #Define the temporal and channel embeddings 
-        self.channel_embedding_e = nn.Embedding(num_channels, enc_dim)
-        self.channel_embedding_d = nn.Embedding(num_channels, dec_dim)
+        self.channel_embedding_e = ChannelPositionalEmbed(embedding_dim=enc_dim)
+        self.channel_embedding_d = ChannelPositionalEmbed(embedding_dim=dec_dim)
         self.temporal_embedding_d = TemporalPositionalEncoding(d_model=dec_dim, max_len=max_embedding)
         self.temporal_embedding_e = TemporalPositionalEncoding(d_model=enc_dim, max_len=max_embedding)
 
         self.criterion = nn.MSELoss()
         self.class_token = nn.Parameter(torch.zeros(1,1,enc_dim))
+        self.norm_pix_loss = norm_pix_loss
+        self.on_init_end()
+
+    def on_init_end(self):
+        self.apply(self._init_weights)
+        nn.init.normal_(self.class_token, std=0.02)
+        nn.init.normal_(self.mask_token, std = 0.02)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        if isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
+
 
     def restore_seq(self, x, num_patches, id_restore):
 
@@ -222,10 +239,9 @@ class EncoderDecoder(pl.LightningModule):
 
     def masking_vit(self, x):
         B, L, D = x.shape
-
         device = x.device
-        l_keep = int(L*(1-self.mask_prob))
         noise = torch.rand(B,L, device=device)
+        l_keep = int(L*(1-self.mask_prob))
         ids_shuffle = torch.argsort(noise, dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
         id_keep = ids_shuffle[:,:l_keep]
@@ -237,6 +253,7 @@ class EncoderDecoder(pl.LightningModule):
 
 
         return x_masked, ids_restore,mask
+
 
 
     def masking(self, x):
@@ -290,7 +307,7 @@ class EncoderDecoder(pl.LightningModule):
 
         return x_return, mask, id_sorted
     
-    def encoder_forward(self,x):
+    def encoder_forward(self,x, channel_list, mask_pad = None):
         B, C, T = x.shape
         device = x.device
     
@@ -302,11 +319,12 @@ class EncoderDecoder(pl.LightningModule):
         x = x.view(B,L,-1)
 
         #Define the embeddings
-        chan_id = torch.arange(0,C, device=device)
-        chan_id = chan_id.view(1,1,-1).repeat(B,N,1).view(B, L)
+        if channel_list.dim() == 1:
+            channel_list = channel_list.unsqueeze(0).expand(B, -1) # Make it (B, C)
+            
+        # (B, C) -> (B, 1, C) -> (B, N, C) -> (B, N*C)
+        chan_id = channel_list.unsqueeze(1).repeat(1, N, 1).view(B, L)
         chan_embedding = self.channel_embedding_e(chan_id)
-        temp_embedding = self.temporal_embedding_e(seq_length = N, num_channel = C)
-        temp_embedding = rearrange(temp_embedding, "b (s c) d -> b s c d", c = C)
         
         x += chan_embedding 
 
@@ -328,13 +346,13 @@ class EncoderDecoder(pl.LightningModule):
        
         #Pass the sequence through the encoder layers 
         for transformer in self.encoder:
-            x = transformer(x)
+            x = transformer(x, mask_pad)
 
         x = self.norm_enc(x)
 
         return x, ids_restore, mask, original
 
-    def decoder_forward(self,x,ids_restore, mask, original):
+    def decoder_forward(self, x, ids_restore, mask, original, channel_list, mask_pad = None):
         B, N, C, D = original.shape
         L = N*C
         device = x.device
@@ -350,9 +368,13 @@ class EncoderDecoder(pl.LightningModule):
 
         #Get embeddings for decoding
        
-        chan_idx = torch.arange(0, C, device=device, dtype=torch.long)
-        eeg_chan_indices = chan_idx.unsqueeze(0).unsqueeze(1).repeat(B, N, 1).view(B, L)
-        chan_embedding = self.channel_embedding_d(eeg_chan_indices)
+       
+        if channel_list.dim() == 1:
+            channel_list = channel_list.unsqueeze(0).expand(B, -1) # Make it (B, C)
+            
+        # (B, C) -> (B, 1, C) -> (B, N, C) -> (B, N*C)
+        chan_id = channel_list.unsqueeze(1).repeat(1, N, 1).view(B, L)
+        chan_embedding = self.channel_embedding_e(chan_id)
         
         x = x + chan_embedding
 
@@ -375,7 +397,7 @@ class EncoderDecoder(pl.LightningModule):
         seq = seq.expand(B, -1)
         #Pass input through decoder layers
         for transformer in self.decoder:
-            x = transformer(x)
+            x = transformer(x, mask_pad)
         
         #Only keep the initially masked patches
         x = x[:,1:,:]
@@ -386,14 +408,17 @@ class EncoderDecoder(pl.LightningModule):
 
         return x, mask
 
-    def forward(self, eeg):
-        x, ids_restore, mask, original = self.encoder_forward(eeg)
-        pred, mask = self.decoder_forward(x, ids_restore, mask, original)
+    def forward(self, eeg, channel_list, mask_pad):
+
+        x, ids_restore, mask, original = self.encoder_forward(eeg, channel_list, mask_pad)
+        pred, mask = self.decoder_forward(x, ids_restore, mask, original, channel_list, mask_pad)
         target, pad = self.patchify_1d(eeg, self.patch_size)   
         B, Seq, Ch, P = target.shape
-        target = target.view(B, Seq * Ch, P)                 
-
-       
+        target = target.view(B, Seq * Ch, P)
+        if self.norm_pix_loss:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1.e-6)**.5                 
         loss_per_patch = ((pred - target) ** 2).mean(dim=-1)    # (B, L)
         loss = (loss_per_patch * mask).sum() / mask.sum().clamp_min(1.0)
         return loss, pred, mask
@@ -426,25 +451,40 @@ class EncoderDecoder(pl.LightningModule):
         return x, pad 
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr = 0.0005)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer, mode="min", patience=5)
+        # 1. Use AdamW with Weight Decay
+        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, weight_decay=0.05)
+        
+        # 2. Setup Cosine Annealing with Warmup
+        # Assuming args.epochs = 500 and a standard batch schedule
+        total_steps = self.trainer.estimated_stepping_batches
+        
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=1e-3,              # Peak learning rate
+            total_steps=total_steps,  # Total batches across all epochs
+            pct_start=0.1,            # 10% of training spent warming up (e.g., 50 epochs)
+            anneal_strategy='cos',    # Cosine decay
+            div_factor=10.0,          # Start LR = max_lr / 10
+            final_div_factor=1000.0   # End LR = start_lr / 1000
+        )
+        
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_mse" 
+                "interval": "step", # Update the LR after every batch, not epoch
             }
         }
     
     def training_step(self, batch, batch_idx):
-        data, _ = batch
-        loss, pred, mask = self(data)
-        self.log("train_loss", loss)
+        data, channel_list, mask_pad = batch
+        loss, pred, mask = self(data, channel_list, mask_pad)
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        data, _ = batch
-        mse, pred, mask = self(data)
+        data, channel_list, mask_pad = batch
+        mse, pred, mask = self(data, channel_list, mask_pad)
         
         rmse = torch.sqrt(mse + 1e-8)
 

@@ -4,10 +4,11 @@ import numpy as np
 from abc import ABC, abstractmethod
 import yaml
 import mne
+from scipy.signal import resample
 
 class DataImport(ABC):
-    def __init__(self, config, mne_process):
-        self.config = config
+    def __init__(self, mne_process):
+        self.config = None
 
         self.mne_process = mne_process
 
@@ -22,53 +23,57 @@ class DataImport(ABC):
         """import the specific data changes for every dataset"""
         pass
 
-    def split(self, data, label = None, segment_length=3, overlap=0, sampling_rate=250):
+    @abstractmethod
+    def get_config(self):
+        pass
+
+
+    def split_with_hops(data, participant, label = None, window_s=6.0, hop_s=0.5, sampling_rate=128,
+                        drop_last=True, channels_expected=62):
         """
-        Split the eeg in several segment
-        data:  shape (C, T) after transpose
-        label: single label for this trial (scalar or 0-d/1-d)
+        Always returns: list of (participant, segment, label)
+        segment shape: (C, win_samples)
         """
-        # make sure it's (C, T)
-        data = data.transpose() if data.shape[0] > data.shape[1] else data
+        data = np.asarray(data)
+
+        if data.ndim != 2:
+            raise ValueError(f"Expected 2D array, got shape {data.shape}")
+
+        # Ensure (C, T)
+        if data.shape[0] != channels_expected and data.shape[1] == channels_expected:
+            data = data.T
+
         C, T = data.shape
-        print(f"data shape (C, T): {data.shape}")
+        if C != channels_expected:
+            raise ValueError(f"Expected {channels_expected} channels, got shape {data.shape}")
 
-        
-        step = int(segment_length * sampling_rate * (1 - overlap))
-        data_segment = sampling_rate * segment_length 
+        win = int(round(window_s * sampling_rate))
+        hop = int(round(hop_s * sampling_rate))
+        if win <= 0 or hop <= 0:
+            raise ValueError(f"Bad win/hop: win={win}, hop={hop}")
 
-        if step <= 0:
-            raise ValueError(
-                f"step computed as {step}. Check segment_length={segment_length} and overlap={overlap}."
-            )
+        out = []
 
-        # handle short signals: if T < data_segment, we still create 1 segment
-        if T <= data_segment:
-            number_segment = 0
-        else:
-            number_segment = (T - data_segment) // step
+        if T < win:
+            if not drop_last:
+                out.append((participant, data, label))
+            return out
 
-        segments = []
-        new_labels = []
+        last_start = T - win
+        for start in range(0, last_start + 1, hop):
+            out.append((participant, data[:, start:start + win], label))
 
-        for i in range(number_segment + 1):
-            start = i * step
-            end = start + data_segment
+        if not drop_last and (last_start % hop) != 0:
+            out.append((participant, data[:, -win:], label))
 
-            # safety in case of boundary issues
-            if end > T:
-                end = T
-                start = max(0, end - data_segment)
-
-            seg = data[:, start:end]    # shape (C, segment_length_in_samples)
-            segments.append(seg)
-            new_labels.append(label)    # same label for all segments of this trial
-
-        print(f"Created {len(segments)} segments")
-        if label != None:
-            return segments, new_labels
-        else:
-            return segments
+        return out
+    
+    def resample_eeg(eeg, previous_freq, new_freq):
+        """Resample data with new frequency"""
+        B, C, T = eeg.shape
+        new_t = int(round((new_freq*T)/previous_freq))
+        resample_data = resample(x=eeg,num=new_t,axis=2)
+        return resample_data
 
     def partition_data(self):
         """partition each recording in several slices"""
@@ -90,6 +95,24 @@ class DataImport(ABC):
             
         self.data = data_clean
         return self
+    
+    
+        
+    def apply_preprocessing_pretrain(self):
+        raw_data = []
+        for participant, array in self.data:
+            raw_mne_object = self.mne_process.create_mne_object(array, 'dataset')
+            raw_mne_object.notch_filter(freqs=np.array([50.0, 60.0]))
+            
+            raw_mne_object.filter(l_freq=0.1, h_freq=64.0, method='fir', fir_design='firwin')
+            
+            raw_mne_object.resample(sfreq=128.0)
+            
+            eeg_data = raw_mne_object.get_data()
+            raw_data.append(participant, eeg_data)
+        
+        return raw_data
+    
     
     def apply_bandpass(self, low, high):
         """apply bandpass filter to eeg recording"""
@@ -113,8 +136,51 @@ class DataImport(ABC):
         self.data = raw_data
         return self
     
+    def split_train_val(self, val_ratio=0.2):
+        self.val_data = []
+        self.train_data = []
+
+        participants = sorted({p for p, _ in self.data})
+        total_participants = len(participants)
+
+        n_val = int(round(val_ratio * total_participants))
+        n_train = total_participants - n_val
+
+        train_participants = set(participants[:n_train])
+        val_participants   = set(participants[n_train:])
+
+        for p, seg, y in self.data:
+            if p in train_participants:
+                self.train_data.append((seg, y))  
+            else:
+                self.val_data.append((seg, y))
+
+    def save_data_pretrain(self):
+        out_dir_val = os.path.join(
+            self.config["data_file"],
+            "val"
+        )
+        out_dir_train = os.path.join(
+            self.config["data_file"],
+            "train"
+        )
+        os.makedirs(out_dir_train, exist_ok=True)
+        os.makedirs(out_dir_val, exist_ok=True)
+        self.data_dir_train = out_dir_train
+        self.data_dir_val = out_dir_val
+
+        for i, (part_number, x) in enumerate(self.val_data):
+            filename = os.path.join(out_dir_val, f"{part_number}_{i}")
+            np.savez(filename, x=x)
+
+        for i, (part_number, x) in enumerate(self.train_data):
+            filename = os.path.join(out_dir_train, f"{part_number}_{i}")
+            np.savez(filename, x=x)
+
+
     
-    def save_data(self):
+    
+    def save_data_downstream(self):
         """save the data in the folder"""
         out_dir = os.path.join(
             self.config["output_data_path"],

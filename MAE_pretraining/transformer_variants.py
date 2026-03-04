@@ -1,30 +1,7 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-
-class DropPath(nn.Module):
-    """Randomly drops the attention branch"""
-    def __init__(self, keep_prob):
-        super().__init__()
-        self.prob = keep_prob
-    
-    def drop_path(self, x):
-        #Deactivate if training
-        if self.prob == 1 or self.training == False:
-            return x
-        
-        #Dim of tensor B, 1, 1,...
-        dim_tensor = (x.shape[0],) + ([1]) * (x.ndim - 1)
-
-        #Create a tensor of size B,1,1... with values between 0 and 2
-        rand_tensor = self.prob + torch.rand(dim_tensor, dtype=x.dtype, device=x.device)
-        #Convert values to binary
-        drop_tensor = rand_tensor.floor()
-        #Drop the chosen values and divide by the probability to keep the same original expectation
-        return x.div(self.prob) * drop_tensor
-    
-    def forward(self, x):
-        return self.drop_path(x)
 
 class RotaryEmbedding(nn.Module):
     """
@@ -81,6 +58,7 @@ class RotaryEmbedding(nn.Module):
         x_real = torch.view_as_real(x_rotate)
         x_real = x_real.reshape(*x.shape)
         return x_real
+
 
 class MultiHeadAttention(nn.Module):
     """Multi head attention module, takes the embedding dim and number of head."""
@@ -156,7 +134,110 @@ class MultiHeadAttention(nn.Module):
         out = out.reshape(out.size(0), out.size(1), self.h*self.dim_head)
         out = self.fc(out)
         return self.dropout(out), score
+
+class MultiHeadAttentionViT(nn.Module):
+    """Multi head attention module, takes the embedding dim and number of head."""
+    def __init__(self, embed_dim, num_heads = 3, proj_drop = 0.1, att_dropout = 0.1, qkv_bias = True):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.h = num_heads
+        self.dim_head = embed_dim//num_heads
+        self.qkv = nn.Linear(embed_dim, 3*embed_dim, bias=qkv_bias)
+        self.fc = nn.Linear(embed_dim,embed_dim)
+        self.att_dropout = att_dropout
+        self.proj_drop = nn.Dropout(proj_drop)
+
+
+    def split_heads(self, X):
+        return X.view(X.size(0), X.size(1), 3, self.h, self.dim_head).permute(2, 0, 3, 1, 4)      
+
+    def forward(self, x, mask_pad):
+        #Compute Q, K and V and seperate segments per head
+        B, N, D = x.shape
+
+        #Extract the query key value vectors each with shape
+        # B, num_head, num_patches, dim_head
+        qkv = self.split_heads(self.qkv(x))
+        
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        #Compute the attention score
+        out = torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask_pad, dropout_p=self.att_dropout if self.training else 0, is_causal=False)
+
+        out = out.transpose(1,2)
+        out = out.reshape(out.size(0), out.size(1), self.h*self.dim_head)
+        out = self.fc(out)
+        out = self.proj_drop(out)
+        return out
     
+
+
+class DropPath(nn.Module):
+    """Randomly drops the attention branch"""
+    def __init__(self, drop_prob):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+    
+    def drop_path(self, x):
+        #Deactivate if training
+        if self.drop_prob == 0.0 or self.training == False:
+            return x
+        keep_prob = 1 - self.drop_prob
+        
+        #Dim of tensor B, 1, 1,...
+        dim_tensor = (x.shape[0],) + ([1]) * (x.ndim - 1)
+
+        #Create a tensor of size B,1,1... with values between 0 and 2
+        rand_tensor = keep_prob + torch.rand(dim_tensor, dtype=x.dtype, device=x.device)
+        #Convert values to binary
+        drop_tensor = rand_tensor.floor()
+        #Drop the chosen values and divide by the probability to keep the same original expectation
+        return x.div(keep_prob) * drop_tensor
+    
+    def forward(self, x):
+        return self.drop_path(x)
+    
+
+class MLP(nn.Module):
+    def __init__(self, in_features, hidden_size, out_features = None, act = nn.GELU, drop = 0):
+        super().__init__()
+        out_features = out_features or in_features
+        self.act = act()
+        self.fc1 = nn.Linear(in_features, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, out_features)
+        self.drop1 = nn.Dropout(drop)
+        self.drop2 = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.fc2(x)
+        return self.drop2(x)
+    
+
+class TransformerLayerViT(nn.Module):
+    def __init__(self, embed_dim, nhead, mlp_ratio = 4, qkv_bias = True,drop = 0, att_drop = 0, 
+                 drop_path = 0, act = nn.GELU, norm = nn.LayerNorm):
+        super().__init__()
+        self.attn = MultiHeadAttentionViT(embed_dim=embed_dim, num_heads=nhead, proj_drop=drop,
+                                               att_dropout=att_drop, qkv_bias=qkv_bias)
+        self.drop_path = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+        self.drop_path2 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        hidden_size = int(embed_dim * mlp_ratio)
+        self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
+
+    def forward(self, x, mask_pad):
+        x = x + self.drop_path(self.attn(self.norm1(x), mask_pad))
+        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+
+        return x
+
+
+
 
 class TransformerLayer(nn.Module):
     """Define one transformer layer"""

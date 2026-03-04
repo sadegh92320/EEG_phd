@@ -1,0 +1,12 @@
+name_dataset: bci_comp_2b
+
+channel_list:
+  - C4
+  - Cz
+  - C3
+
+num_participant: 9
+
+frequency: 250
+
+data_file: MAE_pretraining/data/bci_comp_2b

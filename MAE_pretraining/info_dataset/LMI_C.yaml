@@ -1,0 +1,30 @@
+name_dataset: lmi_c
+
+channel_list:
+  - Fp1
+  - Fp2
+  - F3
+  - F4
+  - C3
+  - C4
+  - P3
+  - P4
+  - O1
+  - O2
+  - F7
+  - F8
+  - T3
+  - T4
+  - T5
+  - T6
+  - Fz
+  - Cz
+  - Pz
+  - A1
+  - A2
+
+frequency: 200
+
+num_participant: 13
+
+data_file: MAE_pretraining/data/lmi_c

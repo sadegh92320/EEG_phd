@@ -27,11 +27,14 @@ from lightning.pytorch.loggers.tensorboard import TensorBoardLogger
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks import ModelCheckpoint
 from downstream.downstream_model import Downstream
-from downstream.models.conv_model import SimpleEEG
+from downstream.models.conv_model import SimpleEEGfrom 
+from pytorch_lightning.loggers import WandbLogger
+from MAE_pretraining.load_data import get_dataloader
+
 
 class Pipeline:
     """Experiment pipeline from pretraining to downstream task"""
-    def __init__(self, dataimporter, dataset, trainer, config,preprocess = False, is_split = False, pretraining = False):
+    def __init__(self, dataimporter, dataset, trainer, config,preprocess = False, is_split = False, pretraining = True):
         self.dataimporter = dataimporter
         self.trainer = trainer 
         self.eeg_dataset = dataset
@@ -112,6 +115,13 @@ class Pipeline:
         valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=128, num_workers=10, shuffle=False)
 
         return train_loader, valid_loader
+    
+
+    def import_data_pretrain(self):
+
+        train_loader, valid_loader = get_dataloader(self.config)
+        return train_loader, valid_loader
+
 
     def load_encoder(self):
         """
@@ -122,7 +132,7 @@ class Pipeline:
         if self.pretraining == True:
             CKPT_DIR = self.config["lighting_CKPT_DIR"]
             os.makedirs(CKPT_DIR, exist_ok=True)
-            train_loader, valid_loader = self.import_data_pretraining()
+            train_loader, valid_loader = self.import_data_pretrain()
             model = EncoderDecoder()
             ckpt = ModelCheckpoint(
             dirpath=CKPT_DIR,
@@ -132,7 +142,18 @@ class Pipeline:
             filename="best_test",
         )
             early = EarlyStopping(monitor="val_mse", mode="min", patience=10)
-            trainer = Trainer(callbacks=[TQDMProgressBar(refresh_rate=20), ckpt], log_every_n_steps=5, max_epochs=200)
+            wandb_logger = WandbLogger(
+            project="eeg-foundation-model", 
+            name="mae-baseline-run1",
+            log_model="all" 
+        )
+            wandb_logger = WandbLogger(
+            project="eeg-foundation-model", 
+            name="mae-baseline-run1",
+            log_model="all" # Optional: automatically saves your model checkpoints to the cloud
+        )
+            trainer = Trainer(callbacks=[TQDMProgressBar(refresh_rate=20), ckpt],
+                               log_every_n_steps=5, logger=wandb_logger,max_epochs=400, precision="16-mixed", gradient_clip_val=1.0)
             trainer.fit(model, val_dataloaders=valid_loader, train_dataloaders=train_loader)
            
 
@@ -176,7 +197,7 @@ class Pipeline:
             )
     
     def make_conv_model(self):
-        return SimpleEEG()
+        pass
 
     def loop_over_model(self):
         """Go through all the created models to test their performance against our own one"""

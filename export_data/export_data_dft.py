@@ -22,6 +22,8 @@ class ImportDataDFT(DataImport):
 
         return data_eeg
     
+   
+
     
     
 if __name__ == "__main__":
