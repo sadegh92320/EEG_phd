@@ -5,12 +5,16 @@ from abc import ABC, abstractmethod
 import yaml
 import mne
 from scipy.signal import resample
+from process_data.mne_constructor import MNEMethods
 
 class DataImport(ABC):
-    def __init__(self, mne_process):
-        self.config = None
+    def __init__(self):
+        self.get_config()
+        with open(self.config) as f:
+            self.config = yaml.safe_load(f)
+        
 
-        self.mne_process = mne_process
+        self.mne_process = MNEMethods(self.config)
 
         self.data_dir = None
 
@@ -28,7 +32,7 @@ class DataImport(ABC):
         pass
 
 
-    def split_with_hops(data, participant, label = None, window_s=6.0, hop_s=0.5, sampling_rate=128,
+    def split_with_hops(self, data, participant, label = None, window_s=6.0, hop_s=0.5, sampling_rate=128,
                         drop_last=True, channels_expected=62):
         """
         Always returns: list of (participant, segment, label)
@@ -101,6 +105,7 @@ class DataImport(ABC):
     def apply_preprocessing_pretrain(self):
         raw_data = []
         for participant, array in self.data:
+            print(array.shape)
             raw_mne_object = self.mne_process.create_mne_object(array, 'dataset')
             raw_mne_object.notch_filter(freqs=np.array([50.0, 60.0]))
             
@@ -109,7 +114,7 @@ class DataImport(ABC):
             raw_mne_object.resample(sfreq=128.0)
             
             eeg_data = raw_mne_object.get_data()
-            raw_data.append(participant, eeg_data)
+            raw_data.append((participant, eeg_data))
         
         return raw_data
     
@@ -149,11 +154,13 @@ class DataImport(ABC):
         train_participants = set(participants[:n_train])
         val_participants   = set(participants[n_train:])
 
-        for p, seg, y in self.data:
+        for p, seg in self.data:
             if p in train_participants:
-                self.train_data.append((seg, y))  
+                self.train_data.append((p,seg))  
             else:
-                self.val_data.append((seg, y))
+                self.val_data.append((p,seg))
+
+        return self
 
     def save_data_pretrain(self):
         out_dir_val = os.path.join(

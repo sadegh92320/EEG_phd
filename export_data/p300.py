@@ -52,7 +52,7 @@ class ImportP300(DataImport):
 
         for p, d in preprocess_data:
             split_data = self.split_with_hops(data=d, participant=p,window_s=6, hop_s=0.5,
-                                                              sampling_rate=128, channels_expected=64)
+                                                              sampling_rate=128, channels_expected=32)
             zip_data = [(x[0], x[1]) for x in split_data]
             data_splitted.extend(zip_data)
         self.data = data_splitted

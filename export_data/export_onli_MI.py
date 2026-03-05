@@ -12,11 +12,11 @@ import torch
 class ImportOnlineMI(DataImport):
 
     def get_config(self):
-        self.config = "/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/online_bci_cla.yaml"
+        self.config = r"MAE_pretraining\info_dataset\online_bci_cla.yaml"
     
     def import_data(self):
         data_eeg = []
-        path = "/Volumes/Elements/EEG_data/pretraining/Online_MI_BCI_Classification"
+        path ="D:\EEG_data\pretraining\Online_MI_BCI_Classification"
 
         for file in sorted(os.listdir(path)):
             if not file.endswith(".mat") or file.startswith("._"):
@@ -62,12 +62,7 @@ class ImportOnlineMI(DataImport):
     
     
 if __name__ == "__main__":
-    with open("setting.yaml") as f:
-        config = yaml.safe_load(f)
-    #data = ImportOnlineMI(config=config, mne_process=MNEMethods(config=config))
-    #data()
-    file = "/Users/sadeghemami/Downloads/S1_Session_1.mat"
-    data =  loadmat(file, struct_as_record=False, squeeze_me=True)
-    print(data["BCI"].data.shape)
+    data_import = ImportOnlineMI()
+    data_import().preprocessing().split_train_val().save_data_pretrain()
 
     

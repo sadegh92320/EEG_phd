@@ -12,11 +12,11 @@ import torch
 class ImportSSVEP(DataImport):
 
     def get_config(self):
-        self.config = "/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/ssvep.yaml"
+        self.config = r"MAE_pretraining\info_dataset\ssvep.yaml"
     
     def import_data(self):
         data_eeg = []
-        path = "/Volumes/Elements/EEG_data/pretraining/Online_MI_BCI_Classification"
+        path = "D:\EEG_data\pretraining\SSVEP"
 
         for file in sorted(os.listdir(path)):
             s = file.split(".")[0][1:]
@@ -46,8 +46,8 @@ class ImportSSVEP(DataImport):
         data_splitted = []
 
         for p, d in preprocess_data:
-            split_data = self.split_with_hops(data=d, participant=p,window_s=6, hop_s=2.5,
-                                                              sampling_rate=128, channels_expected=62)
+            split_data = self.split_with_hops(data=d, participant=p,window_s=2, hop_s=0.125,
+                                                              sampling_rate=128, channels_expected=64)
             zip_data = [(x[0], x[1]) for x in split_data]
             data_splitted.extend(zip_data)
         self.data = data_splitted

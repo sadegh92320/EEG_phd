@@ -6,11 +6,11 @@ class MNEMethods:
     def __init__(self, config):
         self.config = config
     def create_mne_object(self, eeg,description):
-        ch_types = ["eeg"] * self.config["number_channels"]
-        info = mne.create_info(self.config["channel_list"], ch_types=ch_types, sfreq=self.config["freq"])
+        ch_types = ["eeg"] * len(self.config["channel_list"])
+        info = mne.create_info(self.config["channel_list"], ch_types=ch_types, sfreq=self.config["frequency"])
         
         info["description"] = description 
-        simulated_raw = mne.io.RawArray((eeg*10e-6).transpose(), info)
+        simulated_raw = mne.io.RawArray((eeg), info)
         return simulated_raw
     
     def clean_raw_with_ica(self, X):

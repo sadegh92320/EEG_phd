@@ -12,26 +12,26 @@ import torch
 class ImportKU(DataImport):
 
     def get_config(self):
-        self.config = "/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/auditory.yaml"
+        self.config = r"MAE_pretraining\info_dataset\auditory.yaml"
     
     
     def import_data(self):
         """Import data from matlab file and segment it according to experiment"""
         data_eeg = []
-        path = self.config["input_data_path"]
+        path = "D:\EEG_data\pretraining\KU"
         to_check = sorted(os.listdir(path))
         for file in to_check:
             participant_nb = file[4:7]
             if not file.endswith(".npy") or file.startswith("._"):
                 continue
-            path = os.path.join(path, f"{file}")
-            data = np.load(path)
+            path_data = os.path.join(path, f"{file}")
+            data = np.load(path_data)
             
-            if data.shape[0] != 32 and data.shape[1] == 32:
+            if data.shape[0] != 64 and data.shape[1] == 64:
                 data = data.T
 
-
-            data_eeg.extend([(participant_nb, data), (participant_nb, data)])
+            print(data.shape)
+            data_eeg.append((participant_nb, data))
 
 
 
@@ -51,5 +51,5 @@ class ImportKU(DataImport):
 
 
 if __name__ == "__main__":
-    data = np.load('/Volumes/Elements/EEG_data/pretraining/KU/sub-001_ses-shortstories01_task-listeningActive_run-01_desc-preproc-audio-audiobook_5_1_eeg.npy')
-    print(data.shape)
+    data_import = ImportKU()
+    data_import().preprocessing().split_train_val().save_data_pretrain()

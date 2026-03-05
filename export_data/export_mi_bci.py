@@ -12,11 +12,11 @@ import torch
 class ImportMIBCI(DataImport):
 
     def get_config(self):
-        self.config = "/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/eeg_mi_bci.yaml"
+        self.config = "MAE_pretraining\info_dataset\eeg_mi_bci.yaml"
     
     def import_data(self):
         data_eeg = []
-        path = "/Volumes/Elements/EEG_data/pretraining/Online_MI_BCI_Classification"
+        path = "D:\EEG_data\pretraining\ EEG-MI-BCI"
 
         for file in sorted(os.listdir(path)):
             if not file.endswith(".mat") or file.startswith("._"):
@@ -28,8 +28,7 @@ class ImportMIBCI(DataImport):
             participant_nb = file.split(".")[0][1:]
 
             mat = loadmat(mat_path, struct_as_record=False, squeeze_me=True)
-            if arr.shape[0] != 68 and arr.shape[1] == 68:
-                    arr = arr.T
+        
             data_eeg.append((participant_nb, np.asarray(mat["eeg"].movement_left[:64,:], dtype=np.float32)))
             data_eeg.append((participant_nb, np.asarray(mat["eeg"].movement_right[:64,:], dtype=np.float32)))
         
@@ -52,8 +51,5 @@ class ImportMIBCI(DataImport):
 
 
 if __name__ == "__main__":
-    path = "/Volumes/Elements/EEG_data/pretraining/ EEG-MI-BCI/s01.mat"
-    file = loadmat(path, struct_as_record=False, squeeze_me=True)
-    eeg = (file["eeg"])
-    print(type(eeg.movement_left))
-    print((((file["eeg"]).movement_left)[:64,:]).shape)
+    data_import = ImportMIBCI()
+    data_import().preprocessing().split_train_val().save_data_pretrain()

@@ -12,7 +12,7 @@ import torch
 class ImportLargeMI(DataImport):
 
     def get_config(self):
-        self.config = "/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/LMI_C.yaml"
+        self.config = r"MAE_pretraining\info_dataset\LMI_C.yaml"
     
     def import_data(self):
         data_eeg = []
@@ -34,9 +34,9 @@ class ImportLargeMI(DataImport):
 
             
             if data.shape[0] != 21 and data.shape[1] == 21:
-                arr = arr.T
+                data = data.T
 
-            data_eeg.append((participant_nb, arr))
+            data_eeg.append((participant_nb, data))
 
         return data_eeg
     
@@ -46,7 +46,7 @@ class ImportLargeMI(DataImport):
 
         for p, d in preprocess_data:
             split_data = self.split_with_hops(data=d, participant=p,window_s=6, hop_s=2.5,
-                                                              sampling_rate=128, channels_expected=62)
+                                                              sampling_rate=128, channels_expected=21)
             zip_data = [(x[0], x[1]) for x in split_data]
             data_splitted.extend(zip_data)
         self.data = data_splitted
