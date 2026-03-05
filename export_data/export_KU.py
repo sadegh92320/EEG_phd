@@ -7,13 +7,12 @@ import os
 from scipy.io import loadmat
 import re
 import torch
-import mne
 
 
-class ImportHGD(DataImport):
+class ImportKU(DataImport):
 
     def get_config(self):
-        self.config = "/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/hgd.yaml"
+        self.config = "/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/auditory.yaml"
     
     
     def import_data(self):
@@ -22,21 +21,13 @@ class ImportHGD(DataImport):
         path = self.config["input_data_path"]
         to_check = sorted(os.listdir(path))
         for file in to_check:
-            participant_nb = file.split("_")[0]
-            participant_nb = participant_nb.replace("sub", "")
-            participant_nb = int(participant_nb)
-            if not file.endswith(".edf") or file.startswith("._"):
+            participant_nb = file[4:7]
+            if not file.endswith(".npy") or file.startswith("._"):
                 continue
             path = os.path.join(path, f"{file}")
-            data = mne.io.read_raw_edf(path)
+            data = np.load(path)
             
-            channels_to_remove = ['EOG EOGh', 'EOG EOGv', 
-                            'EMG EMG_RH', 'EMG EMG_LH', 'EMG EMG_RF']
-
-            data.drop_channels(channels_to_remove)
-            data = (data.get_data())
-                    
-            if data.shape[0] != 128 and data.shape[1] == 128:
+            if data.shape[0] != 32 and data.shape[1] == 32:
                 data = data.T
 
 
@@ -60,14 +51,5 @@ class ImportHGD(DataImport):
 
 
 if __name__ == "__main__":
-    data = mne.io.read_raw_edf("/Volumes/Elements/EEG_data/pretraining/HGD/sub1_test.edf")
-    print(data.info['nchan'])
-    print(data.ch_names)
-    print(data.get_channel_types())
-    
-    channels_to_remove = ['EOG EOGh', 'EOG EOGv', 
-                      'EMG EMG_RH', 'EMG EMG_LH', 'EMG EMG_RF']
-
-    data.drop_channels(channels_to_remove)
-    data = (data.get_data())
+    data = np.load('/Volumes/Elements/EEG_data/pretraining/KU/sub-001_ses-shortstories01_task-listeningActive_run-01_desc-preproc-audio-audiobook_5_1_eeg.npy')
     print(data.shape)

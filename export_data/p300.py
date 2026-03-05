@@ -9,10 +9,10 @@ import re
 import torch
 
 
-class ImportMIBCI(DataImport):
+class ImportP300(DataImport):
 
     def get_config(self):
-        self.config = "/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/eeg_mi_bci.yaml"
+        self.config = "/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/p300.yaml"
     
     
     def import_data(self):

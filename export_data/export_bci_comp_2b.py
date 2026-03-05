@@ -13,7 +13,7 @@ import mne
 class ImportBCIComp2a(DataImport):
 
     def get_config(self):
-        self.config = "/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/bci_comp_2a.yaml"
+        self.config = "/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/bci_comp_2b.yaml"
     
     def import_data(self):
         data_eeg = []
@@ -29,8 +29,9 @@ class ImportBCIComp2a(DataImport):
             participant_nb = int(file[2])
 
             raw = mne.io.read_raw_gdf(gdf_path, preload=True)
-            if arr.shape[0] != 6 and arr.shape[1] == 6:
-                    arr = arr.T
+            raw = raw.get_data()
+            if raw.shape[0] != 6 and raw.shape[1] == 6:
+                    raw = raw.T
             data_eeg.append((participant_nb, raw[:3,:]))
             
         
@@ -54,3 +55,4 @@ if __name__ == "__main__":
     raw = mne.io.read_raw_gdf(path, preload=True)
     data = raw.get_data()   # shape: (n_channels, n_samples)
     print(data[:3,:].shape)
+    
