@@ -7,6 +7,7 @@ class MNEMethods:
         self.config = config
     def create_mne_object(self, eeg,description):
         ch_types = ["eeg"] * len(self.config["channel_list"])
+        print(len(ch_types))
         info = mne.create_info(self.config["channel_list"], ch_types=ch_types, sfreq=self.config["frequency"])
         
         info["description"] = description 

@@ -16,7 +16,7 @@ class ImportLargeMI(DataImport):
     
     def import_data(self):
         data_eeg = []
-        path = "/Volumes/Elements/EEG_data/pretraining/Online_MI_BCI_Classification"
+        path = "D:\EEG_data\pretraining\Experiment_CLA"
 
         for file in sorted(os.listdir(path)):
             s = file.split("-")[1][-1]
@@ -56,11 +56,9 @@ class ImportLargeMI(DataImport):
 
 
 if __name__ == "__main__":
-    path = "/Volumes/Elements/EEG_data/pretraining/Experiment-F/5F-SubjectA-160405-5St-SGLHand.mat"
-    s = "5F-SubjectA-160405-5St-SGLHand.mat"
-    s = s.split("-")[1][-1]
-    rank = ord(s.upper()) - ord('A') + 1
-    print(rank)
+    data_import = ImportLargeMI()
+    data_import().preprocessing().split_train_val().save_data_pretrain()
+    
     #data =  loadmat(path, struct_as_record=False, squeeze_me=True)
     #data = (data["o"])
     #print(data.data.shape)

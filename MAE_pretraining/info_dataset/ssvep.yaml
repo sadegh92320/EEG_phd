@@ -63,7 +63,7 @@ channel_list:
   - O1
   - Oz
   - O2
-frequency: 1000
+frequency: 250
 
 num_participant: 70
 

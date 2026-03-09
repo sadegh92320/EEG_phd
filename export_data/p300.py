@@ -12,13 +12,13 @@ import torch
 class ImportP300(DataImport):
 
     def get_config(self):
-        self.config = "/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/p300.yaml"
+        self.config = r"MAE_pretraining\info_dataset\p300.yaml"
     
     
     def import_data(self):
         """Import data from matlab file and segment it according to experiment"""
         data_eeg = []
-        path = self.config["input_data_path"]
+        path = "D:\EEG_data\pretraining\P300"
         to_check = sorted(os.listdir(path))
         for file in to_check:
             participant_nb = file[1:3]
@@ -60,14 +60,9 @@ class ImportP300(DataImport):
 
 
 if __name__ == "__main__":
-    path = "/Volumes/Elements/EEG_data/pretraining/P300/s01.mat"
+    data_import = ImportP300()
+    data_import().preprocessing().split_train_val().save_data_pretrain()
    
 
 
-    with h5py.File(path, "r") as f:
-        refs = f["test"][()].reshape(-1)
-        g0 = f[refs[0]]
-
-        
-        X = g0["data"][()]
-        print(X.shape)
+    

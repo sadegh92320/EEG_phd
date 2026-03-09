@@ -7,40 +7,34 @@ import os
 from scipy.io import loadmat
 import re
 import torch
+import sys
 
 
-class ImportOnlineMI(DataImport):
+class ImportSEED(DataImport):
 
     def get_config(self):
-        self.config = r"MAE_pretraining\info_dataset\online_bci_cla.yaml"
+        self.config = r"MAE_pretraining\info_dataset\seed2.yaml"
+    
     
     def import_data(self):
+        """Import data from matlab file and segment it according to experiment"""
         data_eeg = []
-        path ="D:\EEG_data\pretraining\Online_MI_BCI_Classification"
-
-        for file in sorted(os.listdir(path)):
+        path = "D:\EEG_data\pretraining\SEED"
+        to_check = sorted(os.listdir(path))
+        for file in to_check:
+            participant_nb = file.split("_")[0]
             if not file.endswith(".mat") or file.startswith("._"):
                 continue
-
-            mat_path = os.path.join(path, file)
-
-            # Extract subject number (S10_Session_1.mat → 10)
-            m = re.match(r"S(\d+)_Session_", file)
-            participant_nb = int(m.group(1)) if m else file.split("_")[0]
-
+            mat_path = os.path.join(path, f"{file}")
             mat = loadmat(mat_path, struct_as_record=False, squeeze_me=True)
-            BCI = mat["BCI"]
+            for keys in mat:
+                if keys.split("_")[0] == "ww":
+                    data_eeg.append((participant_nb, mat[keys]))
+           
+            
+                
 
-            for d in BCI.data:
-                arr = np.asarray(d, dtype=np.float32)
 
-                # safety: ensure (62, nTime)
-                if arr.shape[0] != 62 and arr.shape[1] == 62:
-                    arr = arr.T
-
-                data_eeg.append((participant_nb, arr))
-            print(participant_nb)
-        print("done")
 
         return data_eeg
     
@@ -49,22 +43,18 @@ class ImportOnlineMI(DataImport):
         data_splitted = []
 
         for p, d in preprocess_data:
-            split_data = self.split_with_hops(data=d, participant=p,window_s=6, hop_s=2.5,
+            split_data = self.split_with_hops(data=d, participant=p,window_s=6, hop_s=0.5,
                                                               sampling_rate=128, channels_expected=62)
             zip_data = [(x[0], x[1]) for x in split_data]
             data_splitted.extend(zip_data)
         self.data = data_splitted
         return self
-    
-
-        
 
 
-    
-    
-    
 if __name__ == "__main__":
-    data_import = ImportOnlineMI()
+    data_import = ImportSEED()
     data_import().preprocessing().split_train_val().save_data_pretrain()
+   
+
 
     

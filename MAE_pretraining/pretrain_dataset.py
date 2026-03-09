@@ -14,6 +14,11 @@ from torch.utils.data import Dataset, Sampler, DistributedSampler, BatchSampler
 
 def get_pretrain_dataset(datasetName, type):
     dataset = None
+
+    if datasetName == "im":
+        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/im_ab.yaml",
+                                  new_freq=200)
+
     if datasetName == "p300":
         dataset = PretrainDataset(dataset_name=datasetName, type=type,config="/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/p300.yaml",
                                   new_freq=200)
@@ -28,6 +33,10 @@ def get_pretrain_dataset(datasetName, type):
 
     if datasetName == "seed":
         dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/seed.yaml",
+                                  new_freq=200)
+        
+    if datasetName == "seed2":
+        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/seed2.yaml",
                                   new_freq=200)
 
     if datasetName == "eeg_mi_bci":

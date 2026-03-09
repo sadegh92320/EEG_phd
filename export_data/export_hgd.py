@@ -32,6 +32,7 @@ class ImportHGD(DataImport):
             
             
             data = mne.io.read_raw_edf(edf_path)
+            print(data.ch_names)
             
             channels_to_remove = ['EOG EOGh', 'EOG EOGv', 
                             'EMG EMG_RH', 'EMG EMG_LH', 'EMG EMG_RF']

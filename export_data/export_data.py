@@ -107,9 +107,10 @@ class DataImport(ABC):
         for participant, array in self.data:
             print(array.shape)
             raw_mne_object = self.mne_process.create_mne_object(array, 'dataset')
-            raw_mne_object.notch_filter(freqs=np.array([50.0, 60.0]))
+            raw_mne_object.notch_filter(freqs=50, method = "iir")
+            raw_mne_object.notch_filter(freqs=60, method = "iir")
             
-            raw_mne_object.filter(l_freq=0.1, h_freq=64.0, method='fir', fir_design='firwin')
+            raw_mne_object.filter(l_freq=0.1, h_freq=64.0, method='iir')
             
             raw_mne_object.resample(sfreq=128.0)
             
@@ -179,6 +180,7 @@ class DataImport(ABC):
         for i, (part_number, x) in enumerate(self.val_data):
             filename = os.path.join(out_dir_val, f"{part_number}_{i}")
             np.savez(filename, x=x)
+        print("save train")
 
         for i, (part_number, x) in enumerate(self.train_data):
             filename = os.path.join(out_dir_train, f"{part_number}_{i}")

@@ -29,8 +29,9 @@ class ImportKU(DataImport):
             
             if data.shape[0] != 64 and data.shape[1] == 64:
                 data = data.T
+            print(data.dtype)
 
-            print(data.shape)
+            
             data_eeg.append((participant_nb, data))
 
 

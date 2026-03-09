@@ -58,13 +58,5 @@ class ImportBCIComp2a(DataImport):
 
 
 if __name__ == "__main__":
-    path = "/Volumes/Elements/EEG_data/pretraining/BCICIV_2a_gdf/A01E.gdf"
-    #raw = mne.io.read_raw_gdf(path, preload=True)
-    #data = raw.get_data()   # shape: (n_channels, n_samples)
-    #print(data[:22,:].shape)
     data_import = ImportBCIComp2a()
-    #data_import().preprocessing().split_train_val().save_data_pretrain()
-    x = np.load(r"MAE_pretraining\data\bci_comp_2a\train\1_0.npz")
-    print(x["x"].shape)
-    print(torch.version.cuda)
-    print(torch.cuda.is_available())
+    data_import().preprocessing().split_train_val().save_data_pretrain()
