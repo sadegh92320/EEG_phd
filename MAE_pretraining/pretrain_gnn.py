@@ -26,6 +26,8 @@ import torch.nn.init as init
 from timm.models.vision_transformer import PatchEmbed, Block
 from torch_geometric.data import Batch
 from MAE_pretraining.transformer_variants import TransformerLayerViT
+import yaml
+from torch_geometric.data import Data
 
 
 channel_list = ["Fp1","Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]
@@ -129,13 +131,27 @@ class EncoderDecoder(pl.LightningModule):
     """Basic encoder decoder model following the ViT model"""
     def __init__(self, config = None, use_rotary = False,num_channels = 64, 
                  max_embedding = 2000, enc_dim = 1024, dec_dim = 512, depth_e = 24, 
-                 depth_d = 8, mask_prob = 0.7, patch_size = 16, norm_pix_loss = True):
+                 depth_d = 8, mask_prob = 0.7, patch_size = 16, norm_pix_loss = True, use_graph = False):
         super().__init__()
 
         self.config = config
         self.use_rotary = use_rotary
         self.dec_dim = dec_dim
         self.enc_dim = enc_dim
+
+        with open("MAE_pretraining/info_dataset/channel_info.yaml") as f:
+            config = yaml.safe_load(f)
+        ch_total = config["channels_mapping"]
+
+
+        #Def graph embeddings variable
+        gnn_data = GraphDataset()
+        g = gnn_data.create_graph(ch_names=ch_total, radius=0.4)
+        self.register_buffer("g_x", g.x)
+        self.register_buffer("g_edge_index", g.edge_index)
+        self.use_graph = use_graph
+        self.gnn_enc = GATModel(num_head=3, enc_dim=enc_dim)
+        self.gnn_dec = GATModel(num_head=3, enc_dim=dec_dim)
 
 
         #Define the encoder and decoder layers
@@ -331,9 +347,21 @@ class EncoderDecoder(pl.LightningModule):
         if channel_list.dim() == 1:
             channel_list = channel_list.unsqueeze(0).expand(B, -1) # Make it (B, C)
             
-        # (B, C) -> (B, 1, C) -> (B, N, C) -> (B, N*C)
-        chan_id = channel_list.unsqueeze(1).repeat(1, N, 1).view(B, L)
-        chan_embedding = self.channel_embedding_e(chan_id)
+
+        
+        if not self.use_graph:
+            # (B, C) -> (B, 1, C) -> (B, N, C) -> (B, N*C)
+            chan_id = channel_list.unsqueeze(1).repeat(1, N, 1).view(B, L)
+            #(B,N*C,enc_dim)
+            chan_embedding = self.channel_embedding_e(chan_id)
+        else:
+            #Output of size (B,chan_total, enc)
+            g_device = Data(x=self.g_x, edge_index=self.g_edge_index)
+            chan_total = self.gnn_enc(g_device)
+            chan_total = chan_total[channel_list]
+
+            #(B,1,C,enc)
+            chan_embedding = chan_total.unsqueeze(1).repeat(1,N,1,1).view(B,L,-1)
         
         x += chan_embedding 
 
@@ -381,9 +409,19 @@ class EncoderDecoder(pl.LightningModule):
         if channel_list.dim() == 1:
             channel_list = channel_list.unsqueeze(0).expand(B, -1) # Make it (B, C)
             
-        # (B, C) -> (B, 1, C) -> (B, N, C) -> (B, N*C)
-        chan_id = channel_list.unsqueeze(1).repeat(1, N, 1).view(B, L)
-        chan_embedding = self.channel_embedding_d(chan_id)
+        
+        if not self.use_graph:
+           # (B, C) -> (B, 1, C) -> (B, N, C) -> (B, N*C)
+            chan_id = channel_list.unsqueeze(1).repeat(1, N, 1).view(B, L)
+            chan_embedding = self.channel_embedding_d(chan_id)
+        else:
+            #Output of size (B,chan_total, enc)
+            g_device = Data(x=self.g_x, edge_index=self.g_edge_index)
+            chan_total = self.gnn_dec(g_device)
+            chan_total = chan_total[channel_list]
+
+            #(B,1,C,enc)
+            chan_embedding = chan_total.unsqueeze(1).repeat(1,N,1,1).view(B,L,-1)
         
         x = x + chan_embedding
 

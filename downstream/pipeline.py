@@ -98,7 +98,7 @@ class Pipeline:
         x = x.to(torch.float)
         return x
 
-    #Change in the future try to create my own dataset not the one of torchvision
+   #This is not used anymore keep it for archive only
     def import_data_pretraining(self):
         """Import dataloader for pretraining"""
         dataset = torchvision.datasets.DatasetFolder(root=self.config["pretrain_data"], loader=self.load_fn,  extensions=['.npz'])
@@ -118,6 +118,7 @@ class Pipeline:
     
 
     def import_data_pretrain(self):
+        """Import the validation and train dataloader"""
 
         train_loader, valid_loader = get_dataloader(self.config)
         return train_loader, valid_loader

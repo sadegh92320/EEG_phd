@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch_geometric.nn.conv import GATv2Conv
 import torch.nn.functional as F
 from MAE_pretraining.graph_embedding import GraphDataset
+import yaml
 
 
 class GATModel(nn.Module):
@@ -20,6 +21,7 @@ class GATModel(nn.Module):
 
         x, edge_index = data.x, data.edge_index
         res = self.fc(x)
+        print(res.shape)
         x = self.conv1(x, edge_index)
         x = self.bn1(x)
         x = F.elu(x)
@@ -28,8 +30,41 @@ class GATModel(nn.Module):
         x = x + res
         return self.norm(x)
     
+def get_chan_idx(channel_list, total):
+        channel_id = []
+        for ch in channel_list:
+         
+            idx = total.get(ch)
+            if idx is None:
+                raise ValueError(f"Channel '{ch}' not found in general channel_info.yaml mapping.")
+            channel_id.append(idx)
+        return channel_id
+    
 if __name__ == "__main__":
+    with open("MAE_pretraining/info_dataset/channel_info.yaml") as f:
+        config = yaml.safe_load(f)
+    ch = config["channels_mapping"]
+
+    with open("MAE_pretraining/info_dataset/auditory.yaml") as f:
+        config_2 = yaml.safe_load(f)
+    ch_get = config_2["channel_list"]
     graph = GraphDataset()
+
+    ch_id = get_chan_idx(channel_list=ch_get, total=ch)
+    print(ch_id)
+    
+    g = graph.create_graph(ch_names=ch, show_graph=False, radius=0.4)
+    print(g.x.shape)
+    
+    model = GATModel()
+    out = model(g)
+    out = out[ch_id, :]
+
+
+
+    print(out.shape)
+
+
     
 
 

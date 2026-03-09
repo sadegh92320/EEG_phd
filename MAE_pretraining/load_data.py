@@ -4,6 +4,7 @@ from MAE_pretraining.pretrain_dataset import get_pretrain_dataset, InterleavedDi
 import torch.distributed as dist
 
 def collate_fn(batch):
+    """Load data with padding"""
     # batch is a list of tensors 'x' of shape (C, T)
     channel_list = [x.shape[0] for x in batch]
     c_max = max(channel_list)
@@ -23,7 +24,7 @@ def collate_fn(batch):
 
 def get_batch_size(num_channel):
     """
-    Inverted Logic: More channels = smaller batch size 
+    More channels = smaller batch size 
     to maintain a constant VRAM footprint.
     Adjust these numbers based on your GPU's capacity (e.g., 24GB vs 80GB).
     """

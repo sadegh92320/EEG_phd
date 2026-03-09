@@ -151,7 +151,7 @@ class MultiHeadAttentionViT(nn.Module):
     def split_heads(self, X):
         return X.view(X.size(0), X.size(1), 3, self.h, self.dim_head).permute(2, 0, 3, 1, 4)      
 
-    def forward(self, x, mask_pad):
+    def forward(self, x, mask_pad = None):
         #Compute Q, K and V and seperate segments per head
         B, N, D = x.shape
 
@@ -230,7 +230,7 @@ class TransformerLayerViT(nn.Module):
         hidden_size = int(embed_dim * mlp_ratio)
         self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
 
-    def forward(self, x, mask_pad):
+    def forward(self, x, mask_pad = None):
         x = x + self.drop_path(self.attn(self.norm1(x), mask_pad))
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
 
