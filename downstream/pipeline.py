@@ -149,6 +149,14 @@ class Pipeline:
                 name="mae-baseline-run1",
                 log_model="all"
             )
+            wandb_logger.experiment.config.update({
+                "enc_dim": 1024,
+                "dec_dim": 512,
+                "depth_e": 24,
+                "depth_d": 8,
+                "mask_prob": 0.7,
+                "patch_size": 16
+            })
 
             trainer = Trainer(
                 callbacks=[TQDMProgressBar(refresh_rate=20), ckpt],
