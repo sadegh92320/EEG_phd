@@ -225,8 +225,8 @@ class TransformerLayerViT(nn.Module):
                                                att_dropout=att_drop, qkv_bias=qkv_bias)
         self.drop_path = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
         self.drop_path2 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
+        self.norm1 = norm(embed_dim)
+        self.norm2 = norm(embed_dim)
         hidden_size = int(embed_dim * mlp_ratio)
         self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
 

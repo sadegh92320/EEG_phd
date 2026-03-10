@@ -34,7 +34,7 @@ from MAE_pretraining.load_data import get_dataloader
 
 class Pipeline:
     """Experiment pipeline from pretraining to downstream task"""
-    def __init__(self, dataimporter, dataset, trainer, config,preprocess = False, is_split = False, pretraining = True):
+    def __init__(self, dataimporter = None, dataset = None, trainer = None, config,preprocess = False, is_split = False, pretraining = True):
         self.dataimporter = dataimporter
         self.trainer = trainer 
         self.eeg_dataset = dataset
@@ -119,7 +119,6 @@ class Pipeline:
 
     def import_data_pretrain(self):
         """Import the validation and train dataloader"""
-
         train_loader, valid_loader = get_dataloader(self.config)
         return train_loader, valid_loader
 
@@ -129,42 +128,47 @@ class Pipeline:
         Load the encoder of the pretrained model and optionally pretrain the model if 
         not done before.
         """
-        #Has to change path of saving for colab and non colab in setting
-        if self.pretraining == True:
-            CKPT_DIR = self.config["lighting_CKPT_DIR"]
-            os.makedirs(CKPT_DIR, exist_ok=True)
+        CKPT_DIR = self.config["lighting_CKPT_DIR"]
+        os.makedirs(CKPT_DIR, exist_ok=True)
+        CKPT_PATH = os.path.join(CKPT_DIR, "best_test.ckpt")
+
+        if self.pretraining:
             train_loader, valid_loader = self.import_data_pretrain()
             model = EncoderDecoder()
-            ckpt = ModelCheckpoint(
-            dirpath=CKPT_DIR,
-            monitor="val_mse",
-            mode="min",
-            save_top_k=1,
-            filename="best_test",
-        )
-            early = EarlyStopping(monitor="val_mse", mode="min", patience=10)
-            wandb_logger = WandbLogger(
-            project="eeg-foundation-model", 
-            name="mae-baseline-run1",
-            log_model="all" 
-        )
-            wandb_logger = WandbLogger(
-            project="eeg-foundation-model", 
-            name="mae-baseline-run1",
-            log_model="all" # Optional: automatically saves your model checkpoints to the cloud
-        )
-            trainer = Trainer(callbacks=[TQDMProgressBar(refresh_rate=20), ckpt],
-                               log_every_n_steps=5, logger=wandb_logger,max_epochs=400, precision="16-mixed", gradient_clip_val=1.0)
-            trainer.fit(model, val_dataloaders=valid_loader, train_dataloaders=train_loader)
-           
 
-        CKPT_PATH = os.path.join(self.config["lighting_CKPT_DIR"], "best_test.ckpt")
-        model = EncoderDecoder()
+            ckpt = ModelCheckpoint(
+                dirpath=CKPT_DIR,
+                monitor="val_mse",
+                mode="min",
+                save_top_k=1,
+                filename="best_test",
+            )
+
+            wandb_logger = WandbLogger(
+                project="eeg-foundation-model",
+                name="mae-baseline-run1",
+                log_model="all"
+            )
+
+            trainer = Trainer(
+                callbacks=[TQDMProgressBar(refresh_rate=20), ckpt],
+                log_every_n_steps=5,
+                logger=wandb_logger,
+                max_epochs=400,
+                precision="16-mixed",
+                gradient_clip_val=1.0,
+            )
+
+            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
+
+        # Load trained weights
+        model = EncoderDecoder.load_from_checkpoint(CKPT_PATH)
+
         self.encoder = model.encoder
         self.temporal_embedding = model.temporal_embedding_e
         self.channel_embedding = model.channel_embedding_e
         self.class_token = model.class_token
-        self.patch = model.patch
+        self.patch = model.patch.patch
     
     def import_data(self):
         """get the raw data, process them, save them and input them in the dataset"""
@@ -271,14 +275,12 @@ class Pipeline:
 
 
 if __name__ == "__main__":
-    with open("setting.yaml") as f:
+    with open("MAE_pretraining/setting_pretraining.yaml") as f:
         config = yaml.safe_load(f)
     mne_cons  = MNEMethods(config=config)
     importer = StewImport(config=config, mne_process=mne_cons)
-    pipeline = Pipeline(dataimporter = importer, dataset=EEGdataset, trainer = TrainerDownstream, config=config)
-    pipeline.import_data()
-    pipeline.train_model()
-
+    pipeline = Pipeline(config=config)
+    pipeline.load_encoder()
     
     
     

@@ -10,3 +10,5 @@ data_use:
   - online
   - mi
   - im
+
+lighting_CKPT_DIR: MAE_pretraining/weights
