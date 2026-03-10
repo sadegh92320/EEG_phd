@@ -137,12 +137,13 @@ class Pipeline:
             model = EncoderDecoder()
 
             ckpt = ModelCheckpoint(
-                dirpath=CKPT_DIR,
-                monitor="val_mse",
-                mode="min",
-                save_top_k=1,
-                filename="best_test",
-            )
+                    dirpath=CKPT_DIR,
+                    monitor="val_mse",
+                    mode="min",
+                    save_top_k=5,
+                    save_last=True,
+                    filename="epoch{epoch}-val_mse{val_mse:.4f}",
+                )
 
             wandb_logger = WandbLogger(
                 project="eeg-foundation-model",
