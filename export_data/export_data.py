@@ -65,10 +65,10 @@ class DataImport(ABC):
 
         last_start = T - win
         for start in range(0, last_start + 1, hop):
-            out.append((participant, data[:, start:start + win], label))
+            out.append((int(participant), data[:, start:start + win], label))
 
         if not drop_last and (last_start % hop) != 0:
-            out.append((participant, data[:, -win:], label))
+            out.append((int(participant), data[:, -win:], label))
 
         return out
     
