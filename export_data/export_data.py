@@ -101,11 +101,25 @@ class DataImport(ABC):
         return self
     
     
+
+    def apply_preprocessing_array(self, data):
+       
+        raw_mne_object = self.mne_process.create_mne_object(data, 'dataset')
+        raw_mne_object.notch_filter(freqs=50, method = "iir")
+        raw_mne_object.notch_filter(freqs=60, method = "iir")
+            
+        raw_mne_object.filter(l_freq=0.1, h_freq=64.0, method='iir')
+            
+        raw_mne_object.resample(sfreq=128.0)
+            
+        eeg_data = raw_mne_object.get_data()
+        
+        
+        return data
         
     def apply_preprocessing_pretrain(self):
         raw_data = []
         for participant, array in self.data:
-            print(array.shape)
             raw_mne_object = self.mne_process.create_mne_object(array, 'dataset')
             raw_mne_object.notch_filter(freqs=50, method = "iir")
             raw_mne_object.notch_filter(freqs=60, method = "iir")
