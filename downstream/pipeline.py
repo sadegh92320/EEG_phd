@@ -34,7 +34,7 @@ from MAE_pretraining.load_data import get_dataloader
 
 class Pipeline:
     """Experiment pipeline from pretraining to downstream task"""
-    def __init__(self, dataimporter = None, dataset = None, trainer = None, config,preprocess = False, is_split = False, pretraining = True):
+    def __init__(self, dataimporter = None, dataset = None, trainer = None, config = None, preprocess = False, is_split = False, pretraining = True):
         self.dataimporter = dataimporter
         self.trainer = trainer 
         self.eeg_dataset = dataset

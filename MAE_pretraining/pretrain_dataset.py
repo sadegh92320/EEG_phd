@@ -16,11 +16,11 @@ def get_pretrain_dataset(datasetName, type):
     dataset = None
 
     if datasetName == "im":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/im_ab.yaml",
+        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining\info_dataset\im_lab.yaml",
                                   new_freq=200)
 
     if datasetName == "p300":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type,config="/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/p300.yaml",
+        dataset = PretrainDataset(dataset_name=datasetName, type=type,config="MAE_pretraining\info_dataset\p300.yaml",
                                   new_freq=200)
 
     if datasetName == "ssvep":
@@ -28,43 +28,43 @@ def get_pretrain_dataset(datasetName, type):
                                   new_freq=200)
 
     if datasetName == "hgd":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/hgd.yaml",
+        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining\info_dataset\hgd.yaml",
                                   new_freq=200)
 
     if datasetName == "seed":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/seed.yaml",
+        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining\info_dataset\seed.yaml",
                                   new_freq=200)
         
     if datasetName == "seed2":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/seed2.yaml",
+        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining\info_dataset\seed2.yaml",
                                   new_freq=200)
 
     if datasetName == "eeg_mi_bci":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/eeg_mi_bci.yaml",
+        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining\info_dataset\eeg_mi_bci.yaml",
                                   new_freq=200)
 
     if datasetName == "bci_comp_iv2a":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/bci_comp_2a.yaml",
+        dataset = PretrainDataset(dataset_name=datasetName, type=type, config= r"MAE_pretraining\info_dataset\bci_comp_2a.yaml",
                                   new_freq=200)
 
     if datasetName == "bci_comp_iv2b":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="paper_1_code/MAE_pretraining/info_dataset/bci_comp_2b.yaml",
+        dataset = PretrainDataset(dataset_name=datasetName, type=type, config= r"MAE_pretraining\info_dataset\bci_comp_2b.yaml",
                                   new_freq=200)
 
     if datasetName == "auditory":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="/MAE_pretraining/info_dataset/auditory.yaml",
+        dataset = PretrainDataset(dataset_name=datasetName, type=type, config= r"MAE_pretraining\info_dataset\auditory.yaml",
                                   new_freq=200)
 
     if datasetName == "online":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/online_bci_cla.yaml",
+        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining\info_dataset\online_bci_cla.yaml",
                                   new_freq=200)
 
     if datasetName == "mi":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/LMI_C.yaml",
+        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining\info_dataset\LMI_C.yaml",
                                   new_freq=200)
 
     if datasetName == "mif":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/LMI_F.yaml",
+        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining\info_dataset\LMI_F.yaml",
                                   new_freq=200)
     if dataset == None:
         raise ValueError("Please enter a correct dataset name")
