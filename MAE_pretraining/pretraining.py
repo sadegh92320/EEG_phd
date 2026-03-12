@@ -128,8 +128,8 @@ class TemporalPositionalEncoding(nn.Module):
 class EncoderDecoder(pl.LightningModule):
     """Basic encoder decoder model following the ViT model"""
     def __init__(self, config = None, use_rotary = False,num_channels = 64, 
-                 max_embedding = 2000, enc_dim = 1024, dec_dim = 512, depth_e = 24, 
-                 depth_d = 8, mask_prob = 0.7, patch_size = 16, norm_pix_loss = True):
+                 max_embedding = 2000, enc_dim = 512, dec_dim = 384, depth_e = 8, 
+                 depth_d = 4, mask_prob = 0.75, patch_size = 16, norm_pix_loss = True):
         super().__init__()
 
         self.config = config
@@ -139,8 +139,8 @@ class EncoderDecoder(pl.LightningModule):
 
 
         #Define the encoder and decoder layers
-        self.encoder = nn.ModuleList([TransformerLayerViT(enc_dim, nhead=16, mlp_ratio=4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_e)])
-        self.decoder = nn.ModuleList([TransformerLayerViT(dec_dim, num_heads=16, mlp_ratio = 4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_d)])
+        self.encoder = nn.ModuleList([TransformerLayerViT(enc_dim, nhead=8, mlp_ratio=4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_e)])
+        self.decoder = nn.ModuleList([TransformerLayerViT(dec_dim, nhead=16, mlp_ratio = 4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_d)])
 
         #Set the probability for a token to be masked
         self.mask_prob = mask_prob
@@ -319,6 +319,7 @@ class EncoderDecoder(pl.LightningModule):
     def encoder_forward(self,x, channel_list):
         B, C, T = x.shape
         device = x.device
+        channel_list = torch.tensor(channel_list, dtype=torch.long, device=device)
     
         #Return the patch eeg with shape (b, n, c, d)
         x = self.patch(x)

@@ -27,7 +27,7 @@ from lightning.pytorch.loggers.tensorboard import TensorBoardLogger
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks import ModelCheckpoint
 from downstream.downstream_model import Downstream
-from downstream.models.conv_model import SimpleEEGfrom 
+#from downstream.models.conv_model import SimpleEEGfrom 
 from pytorch_lightning.loggers import WandbLogger
 from MAE_pretraining.load_data import get_dataloader
 
@@ -151,11 +151,11 @@ class Pipeline:
                 log_model="all"
             )
             wandb_logger.experiment.config.update({
-                "enc_dim": 1024,
-                "dec_dim": 512,
-                "depth_e": 24,
-                "depth_d": 8,
-                "mask_prob": 0.7,
+                "enc_dim": 512,
+                "dec_dim": 384,
+                "depth_e": 8,
+                "depth_d": 4,
+                "mask_prob": 0.75,
                 "patch_size": 16
             })
 
@@ -284,14 +284,10 @@ class Pipeline:
 
 
 if __name__ == "__main__":
-    with open("MAE_pretraining/setting_pretraining.yaml") as f:
+    with open("MAE_pretraining\setting_pretraining.yaml") as f:
         config = yaml.safe_load(f)
-    mne_cons  = MNEMethods(config=config)
-    importer = StewImport(config=config, mne_process=mne_cons)
+    
     pipeline = Pipeline(config=config)
     pipeline.load_encoder()
     
-    
-    
-
 
