@@ -9,6 +9,8 @@ import yaml
 import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler, DistributedSampler, BatchSampler
+from pathlib import Path
+import math
 
 
 
@@ -24,7 +26,7 @@ def get_pretrain_dataset(datasetName, type):
                                   new_freq=200)
 
     if datasetName == "ssvep":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/ssvep.yaml",
+        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining\info_dataset\ssvep.yaml",
                                   new_freq=200)
 
     if datasetName == "hgd":
@@ -343,9 +345,10 @@ class InterleavedDistributedBatchSampler(Sampler):
 
 
 class PretrainDataset(Dataset):
-    def __init__(self, dataset_name, config_path, 
+    def __init__(self, dataset_name, config, 
                  new_freq=None, resample=False, type = "train"):
         super().__init__()
+        config_path = config
         
         self.dataset_name = dataset_name
         
@@ -353,7 +356,7 @@ class PretrainDataset(Dataset):
         self.new_freq = new_freq
 
         # Load Global Channel Config
-        with open("/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/channel_info.yaml", "r") as file:
+        with open("MAE_pretraining\info_dataset\channel_info.yaml", "r") as file:
             self.channel_config = yaml.safe_load(file)
 
         # Load Dataset-Specific Config
@@ -367,8 +370,9 @@ class PretrainDataset(Dataset):
         
         self.channel_list = self.config.get("channel_list", [])
         self.channel_id = self.get_chan_idx()
-        datafolder = os.path.join(self.config["data_file"], type)
+        datafolder = Path(self.config["data_file"]) / type
         self.datafolder = datafolder
+       
 
        
         self.file_paths = self._get_file_paths(datafolder)
@@ -384,9 +388,12 @@ class PretrainDataset(Dataset):
     
     def get_chan_idx(self):
         channel_id = []
-        for ch in self.channel_list:
+        channel_list = [ch.lower() for ch in self.channel_list]
+        chan_map = {key.lower(): val for key,val in self.channel_config["channels_mapping"].items()}
+        
+        for ch in channel_list:
          
-            idx = self.channel_config["channel_mapping"].get(ch)
+            idx = chan_map.get(ch)
             if idx is None:
                 raise ValueError(f"Channel '{ch}' not found in general channel_info.yaml mapping.")
             channel_id.append(idx)
@@ -407,7 +414,7 @@ class PretrainDataset(Dataset):
        
         eeg = np.clip(eeg, -500, 500)
         
-        return torch.from_numpy(eeg).float(), self.channel_id
+        return torch.from_numpy(eeg).float(), torch.tensor(self.channel_id, dtype=torch.long)
 
     def __len__(self):
        
