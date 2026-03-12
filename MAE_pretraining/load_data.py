@@ -1,6 +1,6 @@
 import torch
 from torch.utils.data import DataLoader, ConcatDataset
-from MAE_pretraining.pretrain_dataset import get_pretrain_dataset, InterleavedDistributedBatchSampler
+from MAE_pretraining.pretrain_dataset import get_pretrain_dataset, InterleavedDistributedBatchSampler, SubInterleavedDistributedBatchSampler
 import torch.distributed as dist
 
 def collate_fn(batch):
@@ -58,23 +58,31 @@ def get_dataloader(config):
         world_size = 1
         rank = 0
 
+
+    samples_per_epoch_train = [10000] * len(train_sets)
+    samples_per_epoch_val = [10000] * len(valid_sets)
+
+
     # FIX 4: Pass the LIST of datasets (train_sets), not concat_ds_train
-    train_sampler = InterleavedDistributedBatchSampler(
+    train_sampler = SubInterleavedDistributedBatchSampler(
         datasets=train_sets, 
         batch_sizes=batch_train,
         num_replicas=world_size, 
         rank=rank,
         shuffle=True, 
-        drop_last=False
+        drop_last=False,
+        samples_per_epoch = samples_per_epoch_train
+
     )
     
-    valid_sampler = InterleavedDistributedBatchSampler(
+    valid_sampler = SubInterleavedDistributedBatchSampler(
         datasets=valid_sets, 
         batch_sizes=batch_valid,
         num_replicas=world_size, 
         rank=rank,
         shuffle=False, 
-        drop_last=False
+        drop_last=False,
+        samples_per_epoch=samples_per_epoch_val
     )
 
     data_loader_train = DataLoader(

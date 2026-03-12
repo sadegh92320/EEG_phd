@@ -72,6 +72,143 @@ def get_pretrain_dataset(datasetName, type):
     return dataset
     
 
+class SubInterleavedDistributedBatchSampler(Sampler):
+    """
+    For N sub-datasets, this sampler:
+      1. Builds one DistributedSampler per sub-dataset
+      2. Optionally samples only a random subset of local indices per epoch
+      3. Groups them into batches
+      4. Yields batches in round-robin order
+      5. Maps local indices to global ConcatDataset indices via offsets
+
+    You must call sampler.set_epoch(epoch) at the start of each epoch.
+    """
+
+    def __init__(
+        self,
+        datasets: list,
+        batch_sizes: list,
+        num_replicas: int,
+        rank: int,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        seed: int = 0,
+        samples_per_epoch: list | None = None,
+    ):
+        assert len(datasets) == len(batch_sizes), "Every dataset needs a batch size."
+        if samples_per_epoch is not None:
+            assert len(samples_per_epoch) == len(datasets), "samples_per_epoch must match datasets length."
+
+        self.datasets = datasets
+        self.batch_sizes = batch_sizes
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.samples_per_epoch = samples_per_epoch
+
+        self.epoch = 0
+
+        lengths = [len(d) for d in self.datasets]
+        self.cum_lengths = np.cumsum([0] + lengths).tolist()
+
+        self.sub_samplers = []
+        for ds in self.datasets:
+            ds_sampler = DistributedSampler(
+                ds,
+                num_replicas=self.num_replicas,
+                rank=self.rank,
+                shuffle=self.shuffle,
+                seed=self.seed,
+                drop_last=False,
+            )
+            self.sub_samplers.append(ds_sampler)
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+        for sampler in self.sub_samplers:
+            sampler.set_epoch(epoch)
+
+    def _make_batches_for_dataset(self, ds_idx: int):
+        """
+        Get this rank's local indices for one dataset, optionally subsample them,
+        then chunk into batches.
+        """
+        local_indices = list(iter(self.sub_samplers[ds_idx]))
+
+        if self.samples_per_epoch is not None:
+            target_n = self.samples_per_epoch[ds_idx]
+
+            # Never ask for more than the available local shard if sampling without replacement
+            target_n = min(target_n, len(local_indices))
+
+            if self.shuffle:
+                g = torch.Generator()
+                # Different subset each epoch, dataset, and rank
+                g.manual_seed(self.seed + 1000 * self.epoch + 100 * ds_idx + self.rank)
+                perm = torch.randperm(len(local_indices), generator=g).tolist()
+                local_indices = [local_indices[i] for i in perm[:target_n]]
+            else:
+                local_indices = local_indices[:target_n]
+
+        bs = self.batch_sizes[ds_idx]
+        batches = []
+
+        if self.drop_last:
+            usable = (len(local_indices) // bs) * bs
+            local_indices = local_indices[:usable]
+
+        for start in range(0, len(local_indices), bs):
+            batch = local_indices[start:start + bs]
+            if len(batch) < bs and self.drop_last:
+                continue
+            if len(batch) > 0:
+                batches.append(batch)
+
+        return batches
+
+    def __iter__(self):
+        offsets = torch.tensor(self.cum_lengths, dtype=torch.int64, device="cpu")
+
+        # Build per-dataset batches for this epoch
+        all_batches = [self._make_batches_for_dataset(i) for i in range(len(self.datasets))]
+        iters = [iter(batches) for batches in all_batches]
+        finished = [False] * len(iters)
+
+        while not all(finished):
+            for idx, batch_it in enumerate(iters):
+                if finished[idx]:
+                    continue
+
+                try:
+                    local_idx_list = next(batch_it)
+                except StopIteration:
+                    finished[idx] = True
+                    continue
+
+                local_idx_tensor = torch.tensor(local_idx_list, dtype=torch.int64, device="cpu")
+                global_idx_tensor = local_idx_tensor + offsets[idx]
+                yield global_idx_tensor.tolist()
+
+    def __len__(self):
+        total_batches = 0
+
+        for i, ds in enumerate(self.datasets):
+            # Local shard size for this rank from DistributedSampler
+            local_len = len(self.sub_samplers[i])
+
+            if self.samples_per_epoch is not None:
+                local_len = min(local_len, self.samples_per_epoch[i])
+
+            bs = self.batch_sizes[i]
+
+            if self.drop_last:
+                total_batches += local_len // bs
+            else:
+                total_batches += math.ceil(local_len / bs)
+
+        return total_batches
 
 class InterleavedDistributedBatchSampler(Sampler):
     """
