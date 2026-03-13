@@ -38,4 +38,4 @@ frequency: 512
 
 num_participant: 55
 
-data_file: MAE_pretraining/data/p300
+data_file: /content/eeg_data/p300
