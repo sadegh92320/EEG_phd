@@ -1,0 +1,6 @@
+data_use:
+  - p300
+  - seed2
+  - auditory
+
+lighting_CKPT_DIR: /content/drive/MyDrive/checkpoints_pretraining

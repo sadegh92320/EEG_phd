@@ -26,8 +26,8 @@ class DataSplitter:
 
     def split_data(self):
         if self.evaluation_scheme == "leave_one_participant_out":
-            self.test_data = random.sample(range(self.num_participants), 1)
-            self.train_data = [p for p in range(self.num_participants) if p not in self.test_data]
+            self.test_data = list(range(self.num_participants))
+            self.train_data = [[p for p in range(self.num_participants) if (p != i or i not in self.test_data)] for i in range(self.num_participants)]
             self.train_data, self.val_data = self.train_val_split(self.train_data)
         elif self.evaluation_scheme == "population":
             self.train_data = range(self.num_participants)
@@ -70,8 +70,8 @@ class DownstreamDataLoader:
         raw_data = []
         for filename in os.listdir(self.data_path):
             if filename.endswith(".npz"):
-                participant_number = int(filename.split("_")[0])  # Assuming filename format is "participant_segment.npz"
-                if participant_number == participant_number:
+                part_nb = int(filename.split("_")[0])  # Assuming filename format is "participant_segment.npz"
+                if part_nb == participant_number:
                     data = np.load(os.path.join(self.data_path, filename))
                     x = data["x"]
                     y = data["y"]
@@ -101,12 +101,15 @@ class DownstreamDataLoader:
         for dataset in self.datasets:
             batch_size = self.config["batch_size"]
             shuffle = True
-            loader = self.make_loader(dataset, batch_size, shuffle)
+            
             if dataset.participant_number in self.train_val_test_splitter.train_data:
+                loader = self.make_loader(dataset, batch_size, shuffle = True)
                 self.train_loaders.append(loader)
             elif dataset.participant_number in self.train_val_test_splitter.val_data:
+                loader = self.make_loader(dataset, batch_size, shuffle = False)
                 self.val_loaders.append(loader)
             elif dataset.participant_number in self.train_val_test_splitter.test_data:
+                loader = self.make_loader(dataset, batch_size, shuffle = False)
                 self.test_loaders.append(loader)
     
     def load_data_whole(self, raw_data):
@@ -128,3 +131,8 @@ class DownstreamDataLoader:
         self.whole_test_loader = self.make_loader(ConcatDataset(test), batch_size, shuffle)
 
     
+if __name__ == "__main__":
+    test_data = list(range(5))
+    train_data = [[p for p in range(5) if (p != i or i not in test_data)] for i in range(5)]
+    print(test_data)
+    print(train_data)
