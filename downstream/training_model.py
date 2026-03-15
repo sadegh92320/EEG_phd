@@ -20,8 +20,20 @@ from process_data.preprocessing import Preprocessing
 from dataset import EEGdataset
 import numpy as np
 import optuna
+from torch.utils.data import ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
-writer = SummaryWriter()
+import wandb
+
+wandb.init(
+    project="downstream_eeg", 
+    name = "population_split",
+    note = "Training the model on the whole data with the best parameters from the kfold training and evaluating on the whole test data",
+    config={
+        "architecture": "EEGMAE",
+        "epoch_pretrain": 5,
+
+    }
+)
 
 MODEL_REGISTRY = {
     "CNNmodule": CNNmodule,
@@ -69,7 +81,7 @@ def time(func):
 
 
 class TrainerDownstream:
-    def __init__(self, model_name, model, optimizer, loss_fn, batch_size, config, early_stopper = EarlyStopper, data = None, label = None):
+    def __init__(self, model_name, model, optimizer, loss_fn, batch_size, config, early_stopper = EarlyStopper, train_data = None, val_data = None, test_data = None, evaluation_scheme = "population"):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name = model_name
         self.model = model
@@ -78,11 +90,12 @@ class TrainerDownstream:
         self.early_stopper = early_stopper
         self.batch_size = batch_size
         self.config = config
-        self.preprocess = Preprocessing
-        
+        self.evaluation_scheme = evaluation_scheme
 
-        #Load train and test data
-        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(data, label, train_size=0.9, random_state=92)
+        self.train_data = train_data
+        self.val_data = val_data
+        self.test_data = test_data
+        
 
     def build_model(self):
         "Build a new model instance"
@@ -191,9 +204,10 @@ class TrainerDownstream:
                 x, y = x.to(self.device), y.long().to(self.device)
                 pred = model(x)
                 probs = F.softmax(pred, dim = 1)
+                pred_labels = pred.argmax(dim=1)
 
                 #Update the metrics using the evaluation result
-                self.update_metrics(metrics, pred, probs, y)
+                self.update_metrics(metrics, pred, pred_labels, y)
                 
         #Compute print all metrics
         metrics_comp = self.compute_metrics(metrics)
@@ -203,7 +217,7 @@ class TrainerDownstream:
 
 
     @time
-    def train_kfold(self, folds, trial, save = False):
+    def tune_params_cv(self, folds, trial, save = False, train_dataset = None):
         """
         Cross validation of the model with kfold.
         """
@@ -216,19 +230,21 @@ class TrainerDownstream:
         opt_name = trial.suggest_categorical("optimizer", ["adam"])
 
         fold_scores = []
+        fold_metrics = []
       
         num_epochs = 50
    
-        for fold, (train_idx, test_idx) in enumerate(kf.split(range(len(self.X_train)))):
+        for fold, (train_idx, val_idx) in enumerate(kf.split(train_dataset)):
             #Define early stopper for the fold
             early_stopper = self.early_stopper(patience=20)
 
-            #Define train and val data and labels for the fold
-            X_train = self.X_train[train_idx]
-            y_train = self.y_train[train_idx]
-            X_val = self.X_train[test_idx]
-            y_val = self.y_train[test_idx]
             print("{:^100}".format(f"---Fold_{fold}---"))
+            train_subs = Subset(train_dataset, train_idx)
+            val_subs = Subset(train_dataset, val_idx)
+
+            # Create DataLoaders for this specific fold
+            train_loader = DataLoader(train_subs, batch_size=batch_size, shuffle=True)
+            val_loader = DataLoader(val_subs, batch_size=batch_size, shuffle=False)
 
             #Define the best model 
             best = -float("inf")
@@ -239,13 +255,6 @@ class TrainerDownstream:
             self.optimizer_name = opt_name
             optimizer = self.build_optimizer(model, {"lr": learning_rate})
             loss_fn = self.loss_fn
-
-            #Create dataloader and preprocessor of data
-            preprocess = self.preprocess(X_train, standardize=True)
-            train_data = EEGdataset(X_train, y_train, preprocess=preprocess)
-            val_data = EEGdataset(X_val, y_val, preprocess=preprocess)
-            train_loader = DataLoader(dataset=train_data, batch_size=batch_size, shuffle=True)
-            val_loader = DataLoader(dataset=val_data, batch_size=batch_size, shuffle=False)
             
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=6, factor=0.3, min_lr=1e-5)
             
@@ -262,6 +271,7 @@ class TrainerDownstream:
                 #Retrieve the metric of interest (mostly accuracy)
                 perf = metrics[self.config["metric"]]
                 scheduler.step(perf)
+                wandb.log({"acc": perf, "epoch": epoch, "fold": fold})
                 
                 #Stop training if the val accuracy has not improved for a while
                 if early_stopper.should_stop(perf):
@@ -279,108 +289,189 @@ class TrainerDownstream:
                     raise optuna.TrialPruned()
             
             fold_scores.append(best)
+            fold_metrics.append(all_met)
+
             if save == True:
                 self.save_model(model, fold)
 
         mean_score = float(np.mean(fold_scores))
         print(f"mean fold score is {mean_score}")
+        wandb.log({"mean_fold_score": mean_score})
+        accuracy = [met["accuracy"] for met in fold_metrics]
+        recall = [met["recall"] for met in fold_metrics]
+        precision = [met["precision"] for met in fold_metrics]
+        f1 = [met["f1_score"] for met in fold_metrics]
+        roc_auc = [met["roc_auc"] for met in fold_metrics]
+        kappa = [met["kappa"] for met in fold_metrics]
+        wandb.log({"cv_accuracy": accuracy, "cv_recall": recall, "cv_precision": precision, 
+                   "cv_f1": f1, "cv_roc_auc": roc_auc, "cv_kappa": kappa})
         return mean_score
+    
+    @time
+    def tune_params(self, trial, train_dataset = None, val_dataset = None):
+       
+        #Define the Optuna tuning parameters
+        learning_rate = trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True)
+        batch_size = trial.suggest_int("batch_size", 32, 128)
+        opt_name = trial.suggest_categorical("optimizer", ["adam"])
+
+        fold_scores = []
+      
+        num_epochs = 20
    
-    def train_whole_data(self, save = False):
-        """Train the model on whole data using the best parameters from the kfold training"""
+
+        early_stopper = self.early_stopper(patience=10)        
+
+        # Create DataLoaders for this specific fold
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+        #Define the best model 
+        best = -float("inf")
+        model = self.model().to(self.device)
+
+        #Build the optimizer and define loss function
+        self.optimizer_name = opt_name
+        optimizer = self.build_optimizer(model, {"lr": learning_rate})
+        loss_fn = self.loss_fn
+            
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=6, factor=0.3, min_lr=1e-5)
+            
+            #Loop through epochs
+        for epoch in range(num_epochs):
+            #Train one epoch
+            loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn)
+            if epoch%10 == 0:
+                print(f"Epoch: {epoch} - Loss: {loss}")
+                
+            #Get the metrics for validation set
+            metrics = self.predict(model=model, dataloader=val_loader)
+                
+            #Retrieve the metric of interest (mostly accuracy)
+            perf = metrics[self.config["metric"]]
+            wandb.log({"acc": perf, "epoch": epoch})
+            scheduler.step(perf)
+                
+            #Stop training if the val accuracy has not improved for a while
+            if early_stopper.should_stop(perf):
+                break
+
+            if perf > best:
+                best  = perf
+            #Report results to Optuna and prune if necessary
+            trial.report(best, step=epoch)
+            if trial.should_prune():
+                    raise optuna.TrialPruned()
+        return best
+    @time
+    def evaluate_model(self, learning_rate, opt_name,batch_size,num_epochs,train_dataset = None, val_dataset = None, test_dataset = None):
+
+        early_stopper = self.early_stopper(patience=20)        
+
+        # Create DataLoaders for this specific fold
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+        #Define the best model 
+        best = -float("inf")
+        model = self.model().to(self.device)
+        best_model = model.state_dict()
+
+        #Build the optimizer and define loss function
+        self.optimizer_name = opt_name
+        optimizer = self.build_optimizer(model, {"lr": learning_rate})
+        loss_fn = self.loss_fn
+            
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=6, factor=0.3, min_lr=1e-5)
+            
+            #Loop through epochs
+        for epoch in range(num_epochs):
+            #Train one epoch
+            loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn)
+            if epoch%10 == 0:
+                print(f"Epoch: {epoch} - Loss: {loss}")
+                
+            #Get the metrics for validation set
+            metrics = self.predict(model=model, dataloader=val_loader)
+                
+            #Retrieve the metric of interest (mostly accuracy)
+            perf = metrics[self.config["metric"]]
+            scheduler.step(perf)
+            if perf > best:
+                best  = perf
+                best_model = deepcopy(model.state_dict())
+            wandb.log({"acc_eval": perf, "epoch": epoch})
+
+                
+            #Stop training if the val accuracy has not improved for a while
+            if early_stopper.should_stop(perf):
+                break
+            #Report results to Optuna and prune if necessary
+        model.load_state_dict(best_model)
+        test_metrics = self.predict(model=model, dataloader=test_loader)
+        return test_metrics
+    
+
+    def run_population(self, save = False):
+        wandb.log({"evaluation_scheme": "population"})
         def objective(trial):
-            # you choose how many folds you want
-            folds = 5
-            return self.train_kfold(folds=folds, trial=trial)
+            train_dataset = ConcatDataset([self.train_data, self.val_data, self.test_data])
+            return self.tune_params_cv(folds=5, trial=trial, save=save, train_dataset=train_dataset)
+        study = optuna.create_study(direction="maximize")
+        study.optimize(objective, n_trials=20)
+        
+       
+        
+        
+    def run_per_subject(self, participant_number, train_data_sub, val_data_sub, test_data_pop, test_data_sub, save = False):
+        wandb.log({"evaluation_scheme": "per_subject"})
+        def objective(trial):
+            train_dataset = ConcatDataset([train_data_sub, val_data_sub])
+            return self.tune_params_cv(folds=5, trial=trial, save=save, train_dataset=train_dataset)
         study = optuna.create_study(direction="maximize")
         study.optimize(objective, n_trials=20)
         lr = study.best_trial.params["learning_rate"]
         batch_size = study.best_trial.params["batch_size"]
         opt_name = study.best_trial.params["optimizer"]
         self.optimizer_name = opt_name
-        num_epochs = 20
+        num_epochs = 50
 
-        #Define model, optimizer, scheduler and loss
-        best_model = None
-        best = -float("inf")
-        all_met = None
-        model =  self.model().to(self.device)
-        optimizer = self.build_optimizer(model, {"lr": lr})
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=6, factor=0.3, min_lr=1e-5)
-        loss_fn = self.loss_fn
+        metrics_pop = self.evaluate_model(learning_rate=lr, opt_name=opt_name, batch_size=batch_size, num_epochs=num_epochs, train_dataset=train_data_sub, val_dataset=val_data_sub, test_dataset=test_data_pop)
+        wandb.log({"participant_number": participant_number})
+        wandb.log({"test_acc_pop": metrics_pop["accuracy"], "test_recall_pop": metrics_pop["recall"], 
+                   "test_precision_pop": metrics_pop["precision"], "test_f1_pop": metrics_pop["f1_score"], 
+                   "test_roc_auc_pop": metrics_pop["roc_auc"], "test_kappa_pop": metrics_pop["kappa"]})
         
-        #Get train and val data
-        X_train, X_val, y_train, y_val = train_test_split(self.X_train, self.y_train, train_size=0.9, random_state=92)
-        preprocess = self.preprocess(X_train)
-        train_d = EEGdataset(X_train, y_train, preprocess=preprocess)
-        val_d = EEGdataset(X_val, y_val, preprocess=preprocess)
-        train_loader = DataLoader(dataset = train_d, shuffle=True,batch_size=batch_size)
-        val_loader = DataLoader(dataset = val_d, shuffle=False,batch_size=batch_size)
+        metrics_sub = self.evaluate_model(learning_rate=lr, opt_name=opt_name, batch_size=batch_size, num_epochs=num_epochs, train_dataset=train_data_sub, val_dataset=val_data_sub, test_dataset=test_data_sub)
+       
+        wandb.log({"test_acc_sub": metrics_sub["accuracy"], "test_recall_sub": metrics_sub["recall"], 
+                   "test_precision_sub": metrics_sub["precision"], "test_f1_sub": metrics_sub["f1_score"], 
+                   "test_roc_auc_sub": metrics_sub["roc_auc"], "test_kappa_sub": metrics_sub["kappa"]})
         
-            
-        for epoch in range(num_epochs):
-            #Train one epoch and evaluate the model
-            loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn)
-            print(f"Loss: {loss}")
-            metrics = self.predict(model=model, dataloader=val_loader)
-                
-            perf = metrics[self.config["metric"]]
-            scheduler.step(perf)
-            #Stop training if performance does not increase
-            if perf > best:
-                best_model = deepcopy(model.state_dict())
-                best  = perf
-                all_met = metrics
+    def run_LOSO(self, participant_number, train_data_pop, val_data_pop, test_data_sub, save = False):
+        wandb.log({"evaluation_scheme": "LOSO"})
+        def objective(trial):
+            return self.tune_params(trial, train_dataset=train_data_pop, val_dataset=val_data_pop)
+        study = optuna.create_study(direction="maximize")
+        study.optimize(objective, n_trials=20)
+        lr = study.best_trial.params["learning_rate"]
+        batch_size = study.best_trial.params["batch_size"]
+        opt_name = study.best_trial.params["optimizer"]
+        self.optimizer_name = opt_name
+        num_epochs = 50
 
-        if best_model is not None:
-            model.load_state_dict(best_model)
+        metrics_sub = self.evaluate_model(learning_rate=lr, opt_name=opt_name, batch_size=batch_size, num_epochs=num_epochs, train_dataset=train_data_pop, val_dataset=val_data_pop, test_dataset=test_data_sub)
+       
+        wandb.log({"participant_number": participant_number})
+        wandb.log({"test_acc_sub": metrics_sub["accuracy"], "test_recall_sub": metrics_sub["recall"], 
+                   "test_precision_sub": metrics_sub["precision"], "test_f1_sub": metrics_sub["f1_score"], 
+                   "test_roc_auc_sub": metrics_sub["roc_auc"], "test_kappa_sub": metrics_sub["kappa"]})
 
-        test_data = EEGdataset(self.X_test, self.y_test, preprocess=preprocess)
-        test_loader = DataLoader(dataset=test_data, batch_size=batch_size)
-        metrics_test = self.predict(model = model, dataloader=test_loader)
-        #acc_cross_participant = self.test_cross_participant(model)
-        study = study.best_trial.params
 
-        if save == True:
-            self.save_model(model=model, date=date.today().strftime('%Y-%m-%d'))
+        
 
-        #Append the final result
-        self.append_result(model, "downstream", self.optimizer_name, study, metrics_test["accuracy"], metrics_test["precision"], metrics_test["recall"], metrics_test["F1"])
-
-        return model, all_met, best, metrics_test #, acc_cross_participant
-    
-
-    def test_cross_participant(self, model = None):
-        participant_folder = sorted(os.listdir(self.config["out_participant"]))
-        targets = []
-        outputs = []
-
-        if model == None:
-            model = self.load_model()
-
-        model.eval()
-        with torch.no_grad():
-            for file in participant_folder:
-                if not file.lower().endswith(".npz"):
-                    continue
-
-                file_path = os.path.join(self.config["out_participant"], file)
-                npz = np.load(file_path)
-                x = npz["x"]
-                y = npz["y"]
-
-                x_t = torch.tensor(x, dtype=torch.float32).unsqueeze(0) 
-                out = model(x_t) 
-
-                pred = out.argmax(dim=1).item()  
-                targets.append(int(y))
-                outputs.append(int(pred))
-
-        targets_t = torch.tensor(targets)
-        outputs_t = torch.tensor(outputs)
-        acc = (targets_t == outputs_t).float().mean().item()
-        return acc
-
+        
     @time
     def training_skf(self, dataset):
         """

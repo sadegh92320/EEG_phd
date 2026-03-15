@@ -30,6 +30,7 @@ from downstream.downstream_model import Downstream
 #from downstream.models.conv_model import SimpleEEGfrom 
 from pytorch_lightning.loggers import WandbLogger
 from MAE_pretraining.load_data import get_dataloader
+from downstream.split_data_downstream import DownstreamDataLoader
 
 
 class Pipeline:
@@ -41,6 +42,7 @@ class Pipeline:
         self.config = config
         self.preprocess = preprocess
         self.is_split = is_split
+        self.downtream_loader = DownstreamDataLoader(data_path=self.config["output_data_path"], config=self.config)
         self.data = None
         self.label = None
         self.pretraining = pretraining
@@ -197,7 +199,17 @@ class Pipeline:
         print("done loading encoder")
         self.model = Downstream(encoder=self.encoder, temporal_embedding=self.temporal_embedding, path_eeg=self.patch,\
                                 channel_embedding=self.channel_embedding, class_token=self.class_token, \
-                                enc_dim=1024, num_classes=self.config["num_classes"])
+                                 enc_dim=1024, num_classes=self.config["num_classes"])
+        
+    def get_data_downstream(self, evaluation_scheme):
+        if evaluation_scheme == "population":
+            data = self.downtream_loader.get_data_for_population()
+        elif evaluation_scheme == "LOSO":
+            data = self.downtream_loader.get_data_for_leave_one_participant_out()
+        elif evaluation_scheme == "per_subject_transfer":
+            data = self.downtream_loader.get_per_subject_transfer()
+        else:
+            raise ValueError(f"Unknown evaluation scheme: {evaluation_scheme}")
     
     def make_model(self):
             return Downstream(
@@ -217,7 +229,7 @@ class Pipeline:
         """Go through all the created models to test their performance against our own one"""
         pass
 
-    def train_model(self):
+    def get_model_performance(self, evaluation_scheme):
         """Train the model"""
         labels = []  # all targets in the dataset
         self.load_downstream()
@@ -231,6 +243,10 @@ class Pipeline:
 
         print("class_counts:", class_counts)
         print("class_weights:", class_weights)
+
+        
+
+
 
         self.trainer = self.trainer("cnnmodule", self.make_model, "adam", torch.nn.CrossEntropyLoss(weight=class_weights.to(self.device)), batch_size = 32, config = self.config, data = self.data, label = self.label)
         self.trainer.train_whole_data()

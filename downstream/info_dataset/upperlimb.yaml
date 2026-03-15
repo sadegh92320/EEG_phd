@@ -1,0 +1,70 @@
+name_dataset: upperlimb
+
+channel_list:
+  - F3
+  - F1
+  - Fz
+  - F2
+  - F4
+  - FFC5H
+  - FFC3h
+  - FFC1h
+  - FFC2h
+  - FFC4h
+  - FFC6h
+  - FC5
+  - FC3
+  - FC1
+  - FCz
+  - FC2
+  - FC4
+  - FC6
+  - FTT7h
+  - FCC5h
+  - FCC3h
+  - FCC6h
+  - FTT8h
+  - C5
+  - C3
+  - C1
+  - Cz
+  - C2
+  - C4
+  - C6
+  - TPP7h
+  - CCP5h
+  - CCP3h
+  - CCP1h
+  - CCP2h
+  - CCP4h
+  - CCP6h
+  - TPP8h
+  - CP5
+  - CP3
+  - CP1
+  - CPz
+  - CPP5h
+  - CPP3h
+  - CPP1h
+  - CPP2h
+  - CPP4h
+  - CPP6h
+  - P3
+  - P1
+  - Pz
+  - P2
+  - P4
+  - PPO1h
+  - PPO2h
+  - FFC1h
+  - FFC2h
+  - FFC4h
+  - CP2
+  - CP4
+  - CP6
+
+frequency: 512
+
+num_participant: 15
+
+data_file: downstream/data/upperlimb
