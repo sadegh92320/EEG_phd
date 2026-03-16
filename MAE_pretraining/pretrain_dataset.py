@@ -403,8 +403,12 @@ class PretrainDataset(Dataset):
     def __getitem__(self, index):
         
         path = self.file_paths[index]
-        with np.load(path) as npz:
-            eeg = npz["x"]
+        try:
+            with np.load(path) as npz:
+                eeg = npz["x"]
+        except Exception as e:
+            print(f"\nCORRUPTED FILE FOUND: {path}")
+            raise e
         
        
         if self.resample and (self.new_freq != self.old_freq):
