@@ -13,6 +13,79 @@ class ImportBCIComp2a(ImportDataDownstream):
     def get_config(self):
         self.config = "MAE_pretraining/info_dataset/bci_comp_2a.yaml"
 
+    def import_data(
+        self,
+        input_dir,
+        output_dir,
+        val_ratio=0.2,
+        random_seed=92,
+        use_float16=False,
+        compression=None,
+    ):
+        input_dir = Path(input_dir)
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        train_h5_path = output_dir / "train.h5"
+        val_h5_path = output_dir / "val.h5"
+
+        rng = np.random.default_rng(random_seed)
+
+        # 1. group files by participant
+        subject_to_files = {}
+
+        for file in sorted(input_dir.iterdir()):
+            if not self.condition(file):
+                continue
+
+            participant_nb = self.get_participant_number(file)
+            subject_to_files.setdefault(participant_nb, []).append(file)
+
+        if len(subject_to_files) == 0:
+            raise FileNotFoundError(f"No valid files found in {input_dir}")
+
+        # 2. split participants into train / val
+        participant_ids = sorted(subject_to_files.keys())
+        n_participants = len(participant_ids)
+        n_val = max(1, int(round(n_participants * val_ratio)))
+
+        perm = rng.permutation(n_participants)
+        val_idx = set(perm[:n_val])
+
+        train_files = []
+        val_files = []
+
+        for i, participant_nb in enumerate(participant_ids):
+            files = subject_to_files[participant_nb]
+            for file in files:
+                if file.name.split(".")[0][-1] == "E":
+                    val_files.append((participant_nb, file))
+                elif file.name.split(".")[0][-1] == "T":
+                    train_files.append((participant_nb, file))
+                else:
+                    raise Exception("pas le bon nom")
+
+        # 3. write HDF5
+        self._write_split_hdf5(
+            file_tuples=train_files,
+            h5_path=train_h5_path,
+            split_name="train",
+            use_float16=use_float16,
+            compression=compression,
+        )
+
+        self._write_split_hdf5(
+            file_tuples=val_files,
+            h5_path=val_h5_path,
+            split_name="val",
+            use_float16=use_float16,
+            compression=compression,
+        )
+
+        print(f"Saved train HDF5: {train_h5_path}")
+        print(f"Saved val HDF5:   {val_h5_path}")
+
+
     def _write_split_hdf5(
         self,
         file_tuples,
@@ -39,7 +112,7 @@ class ImportBCIComp2a(ImportDataDownstream):
             )
 
             count = 0
-
+            print(file_tuples)
             for participant_nb, file_path in file_tuples:
                 print(f"[{split_name}] processing subject={participant_nb}, file={file_path.name}")
 
@@ -227,14 +300,7 @@ class ImportBCIComp2a(ImportDataDownstream):
         return trial_label_pairs
     
 if __name__ == "__main__":
-    with h5py.File("/Users/sadeghemami/paper_1_code/downstream/data/bci_comp_2a/train.h5", "r") as f:
-         print(f["x"][:].shape)
-         print(np.unique(f["participant"][:]))
-    data = mne.io.read_raw_gdf("/Users/sadeghemami/Downloads/BCICIV_2a_gdf/A02E.gdf")
-    l = loadmat("/Users/sadeghemami/Downloads/BCICIV_2a_gdf/A02T.mat")
-    
-    events, _ = mne.events_from_annotations(data, verbose="ERROR")
-    print(events)
-    print(_)
+    dataimport = ImportBCIComp2a()
+    dataimport.import_data(input_dir="/Users/sadeghemami/Downloads/BCICIV_2a_gdf", output_dir="downstream/data/bci_comp_2a")
 
    

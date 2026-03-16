@@ -129,7 +129,7 @@ class EncoderDecoder(pl.LightningModule):
     """Basic encoder decoder model following the ViT model"""
     def __init__(self, config = None, use_rotary = False,num_channels = 64, 
                  max_embedding = 2000, enc_dim = 512, dec_dim = 384, depth_e = 8, 
-                 depth_d = 4, mask_prob = 0.75, patch_size = 16, norm_pix_loss = True):
+                 depth_d = 4, mask_prob = 0.7, patch_size = 16, norm_pix_loss = False):
         super().__init__()
 
         self.config = config
@@ -187,8 +187,8 @@ class EncoderDecoder(pl.LightningModule):
         nn.init.normal_(self.class_token, std=0.02)
         nn.init.normal_(self.mask_token, std=0.02)
 
-        nn.init.zeros_(self.channel_embedding_e.channel_transformation.weight)
-        nn.init.zeros_(self.channel_embedding_d.channel_transformation.weight)
+        nn.init.normal_(self.channel_embedding_e.channel_transformation.weight, std=0.02)
+        nn.init.normal_(self.channel_embedding_d.channel_transformation.weight, std=0.02)
 
 
     def restore_seq(self, x, num_patches, id_restore):
@@ -470,9 +470,9 @@ class EncoderDecoder(pl.LightningModule):
         
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=1e-3,              # Peak learning rate
+            max_lr=5e-4,              # Peak learning rate
             total_steps=total_steps,  # Total batches across all epochs
-            pct_start=0.1,            # 10% of training spent warming up (e.g., 50 epochs)
+            pct_start=0.15,            # 10% of training spent warming up (e.g., 50 epochs)
             anneal_strategy='cos',    # Cosine decay
             div_factor=10.0,          # Start LR = max_lr / 10
             final_div_factor=1000.0   # End LR = start_lr / 1000
@@ -499,9 +499,10 @@ class EncoderDecoder(pl.LightningModule):
         mse, pred, mask = self(data, channel_list)
         
         rmse = torch.sqrt(mse + 1e-8)
+        pred_std = pred.std()
 
         self.log_dict(
-        {"val_mse": mse, "val_rmse": rmse},
+        {"val_mse": mse, "val_rmse": rmse, "val_pred_std": pred_std},
         prog_bar=True, on_step=False, on_epoch=True
     )
         
