@@ -334,7 +334,7 @@ class EncoderDecoder(pl.LightningModule):
     def restore_seq_chan(self, x, keep, num_patches):
         #keep has dim (B, C_keep)
         B, L_keep, D = x.shape
-        seq = self.mask_token.repeat(B,num_patches,1).clone()
+        seq = self.mask_token.repeat(B, num_patches, 1).to(dtype=x.dtype, device=x.device).clone()
         x = rearrange(x, "b (n c) d -> b n c d", c = keep.shape[1])
         N = x.shape[1]
         seq = rearrange(seq, "b (n c) d -> b n c d", n = N)
@@ -348,7 +348,7 @@ class EncoderDecoder(pl.LightningModule):
     def restore_seq_time(self, x, keep, num_patches):
         
         B, L_keep, D = x.shape
-        seq = self.mask_token.repeat(B, num_patches, 1).clone()
+        seq = self.mask_token.repeat(B, num_patches, 1).to(dtype=x.dtype, device=x.device).clone()
         x = rearrange(x, "b (n c) d -> b n c d", n = keep.shape[1])
         C = x.shape[2]
         seq = rearrange(seq, "b (n c) d -> b n c d", c = C)
