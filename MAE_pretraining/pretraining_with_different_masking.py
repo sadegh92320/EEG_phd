@@ -390,8 +390,7 @@ class EncoderDecoder(pl.LightningModule):
             x += tp
 
         #Mask the eeg patches
-        num_masking = range(3)
-        choice_m = random.choice(num_masking)
+        choice_m = random.choices([0, 1, 2], weights=[0.5, 0.25, 0.25], k=1)[0]
         if choice_m == 0:
             x, ids_restore, mask = self.masking_vit(x)
         if choice_m == 1:
