@@ -2,7 +2,7 @@ data_use:
   - p300
   - seed2
   - auditory
-  - bci_comp_2b
+  - bci_comp_iv2b
   - ssvep
   - mi
 
