@@ -5,14 +5,14 @@ import torch
 from torch.utils.data import Dataset
 
 
-class UpperLimbDataset(Dataset):
+class Downstream_Dataset(Dataset):
     def __init__(
         self,
         X,
         y,
         fold=0,
         config_path=None,
-        classification_task="motorimagination",
+        classification_task=None,
         data_length=None,
         normalize=True,
     ):
@@ -23,7 +23,7 @@ class UpperLimbDataset(Dataset):
         self.normalize = normalize
         self.fold = fold
 
-        with open(Path("MAE_pretraining/info_dataset/channel_info_rred.yaml"), "r") as file:
+        with open(Path("MAE_pretraining/info_dataset/channel_info_red.yaml"), "r") as file:
             self.channel_config = yaml.safe_load(file)
 
         if config_path is None:

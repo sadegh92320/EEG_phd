@@ -8,40 +8,46 @@ from scipy.io import loadmat
 import re
 import torch
 import sys
-
-
 import os
-from pathlib import Path
-import h5py
+from typing import Any
 import numpy as np
+from abc import ABC, abstractmethod
+import yaml
 import mne
-from export_data.export_data import DataImport
-
+from scipy.signal import resample
+from process_data.mne_constructor import MNEMethods
 from pathlib import Path
-import h5py
-import numpy as np
-import mne
 
 
-from pathlib import Path
-import h5py
-import numpy as np
-from scipy.io import loadmat
 
+class ImportSEED(ABC):
+    def __init__(self):
+        self.get_config()
+        with open(self.config) as f:
+            self.config = yaml.safe_load(f)
+        
 
-class ImportSEED(DataImport):
+        self.mne_process = MNEMethods(self.config)
 
+        self.data_dir = None
+
+    @abstractmethod
     def get_config(self):
-        self.config = "MAE_pretraining/info_dataset/seed2.yaml"
+        pass
 
+
+    @abstractmethod
     def get_participant_number(self, file: Path):
-        participant_nb = file.stem.split("_")[0]
-        return int(participant_nb)
+        pass
+
+    @abstractmethod
+    def condition_file_name(self, file_name):
+        pass
 
     def import_data(
         self,
-        input_dir="/Volumes/Elements/EEG_data/pretraining/SEED",
-        output_dir="downstream/data/seed",
+        input_dir,
+        output_dir,
         val_ratio=0.2,
         random_seed=92,
         use_float16=False,
@@ -68,13 +74,7 @@ class ImportSEED(DataImport):
         subject_to_files = {}
 
         for file in sorted(input_dir.iterdir()):
-            if file.name.startswith("._"):
-                continue
-
-            if file.name.startswith("label"):
-                continue
-
-            if file.suffix.lower() != ".mat":
+            if self.condition_file_name(file):
                 continue
 
             participant_nb = self.get_participant_number(file)
@@ -192,38 +192,52 @@ class ImportSEED(DataImport):
             f.attrs["window_s"] = 6.0
             f.attrs["hop_s"] = 0.5
 
-    def _extract_trials(self, file_path):
+    @abstractmethod
+    def _extract_trials(self):
+        pass
+
+
+    def split_with_hops(self, data, label = None, window_s=6.0, hop_s=0.5, sampling_rate=128,
+                        drop_last=True, channels_expected=62):
         """
-        Read one .mat file, preprocess each trial, return list of arrays (C, T).
+        Always returns: list of (participant, segment, label)
+        segment shape: (C, win_samples)
         """
-        mat = loadmat(file_path, struct_as_record=False, squeeze_me=True)
-        trials = []
+        data = np.asarray(data)
 
-        for key, value in mat.items():
-            # skip matlab metadata
-            if key.startswith("__"):
-                continue
+        if data.ndim != 2:
+            raise ValueError(f"Expected 2D array, got shape {data.shape}")
 
-            # adjust this condition depending on actual SEED key names
-            
-            data = value
+        # Ensure (C, T)
+        if data.shape[0] != channels_expected and data.shape[1] == channels_expected:
+            data = data.T
 
-            if not isinstance(data, np.ndarray):
-                continue
+        C, T = data.shape
+        if C != channels_expected:
+            raise ValueError(f"Expected {channels_expected} channels, got shape {data.shape}")
 
-            if data.ndim != 2:
-                continue
+        win = int(round(window_s * sampling_rate))
+        hop = int(round(hop_s * sampling_rate))
+        if win <= 0 or hop <= 0:
+            raise ValueError(f"Bad win/hop: win={win}, hop={hop}")
 
-            if data.shape[0] != 62 and data.shape[1] == 62:
-                data = data.T
+        out = []
 
-            if data.shape[0] != 62:
-                continue
+        if T < win:
+            if not drop_last:
+                out.append((data, label))
+            return out
 
-            data = self.apply_preprocessing_pretrain(data)
-            trials.append(data)
+        last_start = T - win
+        for start in range(0, last_start + 1, hop):
+            out.append((data[:, start:start + win], label))
 
-        return trials
+        if not drop_last and (last_start % hop) != 0:
+            out.append((data[:, -win:], label))
+
+        return out
+
+    
 
     def apply_preprocessing_pretrain(self, array):
         raw_mne_object = self.mne_process.create_mne_object(array, "dataset")

@@ -15,7 +15,8 @@ import numpy as np
 import optuna
 from process_data.preprocessing import Preprocessing
 from sklearn.model_selection import train_test_split
-from MAE_pretraining.pretraining import EncoderDecoder
+#from MAE_pretraining.pretraining import EncoderDecoder
+from MAE_pretraining.pretrain_gnn import EncoderDecoder
 import random
 import torchvision
 from torch.utils.data import random_split
@@ -31,6 +32,7 @@ from downstream.downstream_model import Downstream
 from pytorch_lightning.loggers import WandbLogger
 from MAE_pretraining.load_data import get_dataloader
 from downstream.split_data_downstream import DownstreamDataLoader
+
 
 
 class Pipeline:
@@ -148,8 +150,8 @@ class Pipeline:
                 )
 
             wandb_logger = WandbLogger(
-                project="eeg-foundation-model",
-                name="mae-baseline-run1",
+                project="eeg_foundation_model",
+                name="mae_gnn",
                 log_model="all"
             )
             wandb_logger.experiment.config.update({
@@ -157,7 +159,7 @@ class Pipeline:
                 "dec_dim": 384,
                 "depth_e": 8,
                 "depth_d": 4,
-                "mask_prob": 0.75,
+                "mask_prob": 0.7,
                 "patch_size": 16
             })
 

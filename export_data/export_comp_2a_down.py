@@ -301,6 +301,8 @@ class ImportBCIComp2a(ImportDataDownstream):
     
 if __name__ == "__main__":
     dataimport = ImportBCIComp2a()
-    dataimport.import_data(input_dir="/Users/sadeghemami/Downloads/BCICIV_2a_gdf", output_dir="downstream/data/bci_comp_2a")
+    #dataimport.import_data(input_dir="/Users/sadeghemami/Downloads/BCICIV_2a_gdf", output_dir="downstream/data/bci_comp_2a")
+    with h5py.File("/Users/sadeghemami/paper_1_code/downstream/data/bci_comp_2a/train.h5", "r") as f:
+        print(np.unique(f["participant"][:]))
 
    

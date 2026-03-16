@@ -32,7 +32,7 @@ class Downstream(nn.Module):
 
         self.use_rope = use_rope
 
-    def forward(self, x):
+    def forward(self, x, channel_list):
         B, C, T = x.shape
         device = x.device
         
@@ -41,33 +41,33 @@ class Downstream(nn.Module):
         x = rearrange(x, "b n c d -> b (n c) d")
         L = x.shape[1]
 
-        #Add channel en temporal embedding 
-        chan_id = torch.arange(0,C, device=device)
-        chan_id = chan_id.repeat(B,N,1).view(B,L)
+        # Correct Channel Embedding
+        if channel_list.dim() == 1:
+            channel_list = channel_list.unsqueeze(0).expand(B, -1)
+        chan_id = channel_list.unsqueeze(1).repeat(1, N, 1).view(B, L)
         chan_embedding = self.channel_embedding(chan_id)
         x = x + chan_embedding 
 
-
-        
-        #Add temporal embedding if rotary embedding are not used
+        # Temporal Embedding
         if not self.use_rope:
             seq_idx  = torch.arange(0, N, device=device).unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
             x = x + self.temporal_embedding(seq_idx)
 
+        # Correct Class Token Expansion
         class_token = self.class_token + self.temporal_embedding.get_class_token().view(1,1,-1).to(device)
-
-        #Concat the class token and pass the input through the transformer layers
-        x = torch.concat([class_token, x], dim = 1)
-        seq = torch.arange(0,N).repeat_interleave(C)
-        seq = seq.expand(B, -1).to(device=self.device)
-        with torch.no_grad():
-            for transformer in self.encoder:
-                x = transformer(x)
+        class_token = class_token.expand(B, 1, -1) # Fixed Crash Here
         
-        #Extract class token pass through fully connected
+        x = torch.concat([class_token, x], dim = 1)
+        
+        # Removed no_grad block for fine-tuning flexibility
+        for transformer in self.encoder:
+            x = transformer(x)
+        
         class_token, x = x[:,:1,:], x[:,1:,:]
+        
         if self.aggregration == "class":
-            out = class_token.view(B,-1)
-        if self.aggregration == "mean":
+            out = class_token.squeeze(1) # Slightly cleaner than view(B, -1)
+        elif self.aggregration == "mean":
             out = x.mean(dim = 1)
+            
         return self.fc(out)

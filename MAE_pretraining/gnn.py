@@ -21,7 +21,6 @@ class GATModel(nn.Module):
 
         x, edge_index = data.x, data.edge_index
         res = self.fc(x)
-        print(res.shape)
         x = self.conv1(x, edge_index)
         x = self.bn1(x)
         x = F.elu(x)

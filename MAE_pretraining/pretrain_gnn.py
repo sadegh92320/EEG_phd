@@ -130,8 +130,8 @@ class TemporalPositionalEncoding(nn.Module):
 class EncoderDecoder(pl.LightningModule):
     """Basic encoder decoder model following the ViT model"""
     def __init__(self, config = None, use_rotary = False,num_channels = 64, 
-                 max_embedding = 2000, enc_dim = 1024, dec_dim = 512, depth_e = 24, 
-                 depth_d = 8, mask_prob = 0.7, patch_size = 16, norm_pix_loss = True, use_graph = False):
+                 max_embedding = 2000, enc_dim = 512, dec_dim = 384, depth_e = 8, 
+                 depth_d = 4, mask_prob = 0.7, patch_size = 16, norm_pix_loss = False, use_graph = True):
         super().__init__()
 
         self.config = config
@@ -143,10 +143,11 @@ class EncoderDecoder(pl.LightningModule):
             config = yaml.safe_load(f)
         ch_total = config["channels_mapping"]
 
+        ordered_channels = [k for k, v in sorted(ch_total.items(), key=lambda item: item[1])]
 
         #Def graph embeddings variable
         gnn_data = GraphDataset()
-        g = gnn_data.create_graph(ch_names=ch_total, radius=0.4)
+        g = gnn_data.create_graph(ch_names=ordered_channels, radius=0.4)
         self.register_buffer("g_x", g.x)
         self.register_buffer("g_edge_index", g.edge_index)
         self.use_graph = use_graph
@@ -155,7 +156,7 @@ class EncoderDecoder(pl.LightningModule):
 
 
         #Define the encoder and decoder layers
-        self.encoder = nn.ModuleList([TransformerLayerViT(enc_dim, nhead=16, mlp_ratio=4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_e)])
+        self.encoder = nn.ModuleList([TransformerLayerViT(enc_dim, nhead=18, mlp_ratio=4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_e)])
         self.decoder = nn.ModuleList([TransformerLayerViT(dec_dim, num_heads=16, mlp_ratio = 4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_d)])
 
         #Set the probability for a token to be masked
@@ -203,8 +204,8 @@ class EncoderDecoder(pl.LightningModule):
         nn.init.normal_(self.class_token, std=0.02)
         nn.init.normal_(self.mask_token, std=0.02)
 
-        nn.init.zeros_(self.channel_embedding_e.channel_transformation.weight)
-        nn.init.zeros_(self.channel_embedding_d.channel_transformation.weight)
+        nn.init.normal_(self.channel_embedding_e.channel_transformation.weight, std=0.02)
+        nn.init.normal_(self.channel_embedding_d.channel_transformation.weight, std=0.02)
 
 
     def restore_seq(self, x, num_patches, id_restore):
@@ -507,9 +508,9 @@ class EncoderDecoder(pl.LightningModule):
         
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=1e-3,              # Peak learning rate
+            max_lr=5e-4,              # Peak learning rate
             total_steps=total_steps,  # Total batches across all epochs
-            pct_start=0.1,            # 10% of training spent warming up (e.g., 50 epochs)
+            pct_start=0.15,            # 10% of training spent warming up (e.g., 50 epochs)
             anneal_strategy='cos',    # Cosine decay
             div_factor=10.0,          # Start LR = max_lr / 10
             final_div_factor=1000.0   # End LR = start_lr / 1000
