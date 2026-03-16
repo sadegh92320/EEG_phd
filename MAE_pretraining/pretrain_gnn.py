@@ -65,7 +65,7 @@ class PatchEEG(nn.Module):
 class ChannelPositionalEmbed(nn.Module):
     def __init__(self, embedding_dim):
         super(ChannelPositionalEmbed, self).__init__()
-        self.channel_transformation = nn.Embedding(145, embedding_dim)
+        self.channel_transformation = nn.Embedding(76, embedding_dim)
         init.zeros_(self.channel_transformation.weight)
     def forward(self, channel_indices):
         channel_embeddings = self.channel_transformation(channel_indices)
@@ -156,8 +156,8 @@ class EncoderDecoder(pl.LightningModule):
 
 
         #Define the encoder and decoder layers
-        self.encoder = nn.ModuleList([TransformerLayerViT(enc_dim, nhead=18, mlp_ratio=4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_e)])
-        self.decoder = nn.ModuleList([TransformerLayerViT(dec_dim, num_heads=16, mlp_ratio = 4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_d)])
+        self.encoder = nn.ModuleList([TransformerLayerViT(enc_dim, nhead=8, mlp_ratio=4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_e)])
+        self.decoder = nn.ModuleList([TransformerLayerViT(dec_dim, nhead=16, mlp_ratio = 4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_d)])
 
         #Set the probability for a token to be masked
         self.mask_prob = mask_prob
