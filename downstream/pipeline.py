@@ -165,7 +165,7 @@ class Pipeline:
                 callbacks=[TQDMProgressBar(refresh_rate=20), ckpt],
                 log_every_n_steps=5,
                 logger=wandb_logger,
-                max_epochs=400,
+                max_epochs=10,
                 precision="16-mixed",
                 gradient_clip_val=1.0,
             )
