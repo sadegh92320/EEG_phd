@@ -60,7 +60,7 @@ def get_dataloader(config):
         rank = 0
 
 
-    samples_per_epoch_train = [20000] * len(train_sets)
+    samples_per_epoch_train = [25000] * len(train_sets)
     samples_per_epoch_val = len(valid_sets)
 
 
