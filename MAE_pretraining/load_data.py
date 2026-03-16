@@ -83,7 +83,7 @@ def get_dataloader(config):
         rank=rank,
         shuffle=False, 
         drop_last=False,
-        samples_per_epoch=samples_per_epoch_val
+        samples_per_epoch=None
     )
 
     data_loader_train = DataLoader(
