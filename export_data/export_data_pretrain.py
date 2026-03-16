@@ -20,7 +20,7 @@ from pathlib import Path
 
 
 
-class ImportSEED(ABC):
+class ImportDataPre(ABC):
     def __init__(self):
         self.get_config()
         with open(self.config) as f:
@@ -51,7 +51,7 @@ class ImportSEED(ABC):
         val_ratio=0.2,
         random_seed=92,
         use_float16=False,
-        compression=None,
+        compression="gzip",
     ):
         """
         Convert raw .mat files into:
@@ -127,7 +127,7 @@ class ImportSEED(ABC):
         h5_path,
         split_name,
         use_float16=False,
-        compression=None,
+        compression="gzip",
     ):
         dtype_x = np.float16 if use_float16 else np.float32
 
@@ -153,7 +153,7 @@ class ImportSEED(ABC):
                         window_s=6,
                         hop_s=0.5,
                         sampling_rate=128,
-                        channels_expected=62,
+                        channels_expected=32,
                     )
 
                     if len(split_data) == 0:
@@ -188,7 +188,7 @@ class ImportSEED(ABC):
             f.attrs["split"] = split_name
             f.attrs["n_samples"] = count
             f.attrs["sampling_rate"] = 128.0
-            f.attrs["n_channels"] = 62
+            f.attrs["n_channels"] = 32
             f.attrs["window_s"] = 6.0
             f.attrs["hop_s"] = 0.5
 

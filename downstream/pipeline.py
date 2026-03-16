@@ -16,7 +16,8 @@ import optuna
 from process_data.preprocessing import Preprocessing
 from sklearn.model_selection import train_test_split
 #from MAE_pretraining.pretraining import EncoderDecoder
-from MAE_pretraining.pretrain_gnn import EncoderDecoder
+#from MAE_pretraining.pretrain_gnn import EncoderDecoder
+from MAE_pretraining.pretraining_with_different_masking import EncoderDecoder
 import random
 import torchvision
 from torch.utils.data import random_split
@@ -146,12 +147,12 @@ class Pipeline:
                     mode="min",
                     save_top_k=5,
                     save_last=True,
-                    filename="epoch{epoch}-val_mse_graph{val_mse:.4f}",
+                    filename="epoch{epoch}-val_mse_multi_mask{val_mse:.4f}",
                 )
 
             wandb_logger = WandbLogger(
                 project="eeg_foundation_model",
-                name="mae_gnn",
+                name="mae_different_mask",
                 log_model="all"
             )
             wandb_logger.experiment.config.update({

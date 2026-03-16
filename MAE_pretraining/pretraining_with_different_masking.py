@@ -63,7 +63,7 @@ class PatchEEG(nn.Module):
 class ChannelPositionalEmbed(nn.Module):
     def __init__(self, embedding_dim):
         super(ChannelPositionalEmbed, self).__init__()
-        self.channel_transformation = nn.Embedding(136, embedding_dim)
+        self.channel_transformation = nn.Embedding(76, embedding_dim)
         init.zeros_(self.channel_transformation.weight)
     def forward(self, channel_indices):
         channel_embeddings = self.channel_transformation(channel_indices)
@@ -128,8 +128,8 @@ class TemporalPositionalEncoding(nn.Module):
 class EncoderDecoder(pl.LightningModule):
     """Basic encoder decoder model following the ViT model"""
     def __init__(self, config = None, use_rotary = False,num_channels = 64, 
-                 max_embedding = 2000, enc_dim = 1024, dec_dim = 512, depth_e = 24, 
-                 depth_d = 8, mask_prob = 0.7, patch_size = 16, norm_pix_loss = True):
+                 max_embedding = 2000, enc_dim = 512, dec_dim = 384, depth_e = 8, 
+                 depth_d = 4, mask_prob = 0.7, patch_size = 16, norm_pix_loss = False):
         super().__init__()
 
         self.config = config
@@ -139,7 +139,7 @@ class EncoderDecoder(pl.LightningModule):
 
 
         #Define the encoder and decoder layers
-        self.encoder = nn.ModuleList([TransformerLayerViT(enc_dim, nhead=16, mlp_ratio=4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_e)])
+        self.encoder = nn.ModuleList([TransformerLayerViT(enc_dim, nhead=8, mlp_ratio=4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_e)])
         self.decoder = nn.ModuleList([TransformerLayerViT(dec_dim, nhead=16, mlp_ratio = 4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_d)])
 
         #Set the probability for a token to be masked
@@ -187,8 +187,8 @@ class EncoderDecoder(pl.LightningModule):
         nn.init.normal_(self.class_token, std=0.02)
         nn.init.normal_(self.mask_token, std=0.02)
 
-        nn.init.zeros_(self.channel_embedding_e.channel_transformation.weight)
-        nn.init.zeros_(self.channel_embedding_d.channel_transformation.weight)
+        nn.init.normal_(self.channel_embedding_e.channel_transformation.weight, std=0.02)
+        nn.init.normal_(self.channel_embedding_d.channel_transformation.weight, std=0.02)
 
 
     def restore_seq(self, x, num_patches, id_restore):
@@ -395,9 +395,9 @@ class EncoderDecoder(pl.LightningModule):
         if choice_m == 0:
             x, ids_restore, mask = self.masking_vit(x)
         if choice_m == 1:
-            x, ids_restore, mask = self.mask_chan(x)
+            x, ids_restore, mask = self.mask_chan(x, num_chan=C, drop_prob=0.7)
         if choice_m == 2:
-            x, ids_restore, mask = self.mask_temp(x)
+            x, ids_restore, mask = self.mask_temp(x, num_chan=C, drop_prob=0.7)
 
 
         #Concatenate the class token to the eeg
@@ -479,8 +479,8 @@ class EncoderDecoder(pl.LightningModule):
 
     def forward(self, eeg, channel_list):
 
-        x, ids_restore, mask, original = self.encoder_forward(eeg, channel_list)
-        pred, mask = self.decoder_forward(x, ids_restore, mask, original, channel_list)
+        x, ids_restore, mask, original, choice_m = self.encoder_forward(eeg, channel_list)
+        pred, mask = self.decoder_forward(x, ids_restore, mask, original, channel_list, choice_m)
         target, pad = self.patchify_1d(eeg, self.patch_size)   
         B, Seq, Ch, P = target.shape
         target = target.view(B, Seq * Ch, P)
@@ -529,9 +529,9 @@ class EncoderDecoder(pl.LightningModule):
         
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=1e-3,              # Peak learning rate
+            max_lr=5e-4,              # Peak learning rate
             total_steps=total_steps,  # Total batches across all epochs
-            pct_start=0.1,            # 10% of training spent warming up (e.g., 50 epochs)
+            pct_start=0.15,            # 10% of training spent warming up (e.g., 50 epochs)
             anneal_strategy='cos',    # Cosine decay
             div_factor=10.0,          # Start LR = max_lr / 10
             final_div_factor=1000.0   # End LR = start_lr / 1000
@@ -558,9 +558,10 @@ class EncoderDecoder(pl.LightningModule):
         mse, pred, mask = self(data, channel_list)
         
         rmse = torch.sqrt(mse + 1e-8)
+        pred_std = pred.std()
 
         self.log_dict(
-        {"val_mse": mse, "val_rmse": rmse},
+        {"val_mse": mse, "val_rmse": rmse, "val_std": pred_std},
         prog_bar=True, on_step=False, on_epoch=True
     )
         
