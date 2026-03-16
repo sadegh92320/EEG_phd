@@ -60,8 +60,8 @@ def get_dataloader(config):
         rank = 0
 
 
-    samples_per_epoch_train = [10000] * len(train_sets)
-    samples_per_epoch_val = [10000] * len(valid_sets)
+    samples_per_epoch_train = [15000] * len(train_sets)
+    samples_per_epoch_val = len(valid_sets)
 
 
     # FIX 4: Pass the LIST of datasets (train_sets), not concat_ds_train

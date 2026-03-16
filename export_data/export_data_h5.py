@@ -40,11 +40,11 @@ class ImportDataPretrain(ABC):
 
     
     
-    @abstractmethod
+  
     def get_config(self):
-        pass
+        self.config = "MAE_pretraining/info_dataset/bci_comp_2a.yaml"
 
-    @abstractmethod
+   
     def condition(self):
         pass
 
@@ -203,6 +203,9 @@ class ImportDataPretrain(ABC):
             f.attrs["n_channels"] = 62
             f.attrs["window_s"] = 6.0
             f.attrs["hop_s"] = 0.5
+    
+    def condition_2(self):
+        pass
 
     def _extract_trials(self, file_path):
         """
@@ -218,7 +221,7 @@ class ImportDataPretrain(ABC):
 
             # adjust this condition depending on actual SEED key names
             # common case: eeg1, eeg2, ...
-            if not key.lower().startswith("djc"):
+            if not self.condition_2():
                 continue
 
             data = value

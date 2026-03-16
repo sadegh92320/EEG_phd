@@ -1,5 +1,5 @@
 import mne
-
+from scipy.io import loadmat
 
 if __name__ == "__main__":
     file = "/Users/sadeghemami/Downloads/BCICIV_2a_gdf/A01T.gdf"
@@ -27,5 +27,7 @@ if __name__ == "__main__":
     # X contains your training data: (trials, 22 channels, 1001 samples)
     X = epochs.get_data()
     y = epochs.events[:, -1] # These will be your labels 7, 8, 9, 10
-    print(X.shape)
+    path = "/Users/sadeghemami/Downloads/true_labels/A01E.mat"
+    mat = loadmat( path, struct_as_record=False, squeeze_me=True)
+    print(print(len(mat["classlabel"])))
     
