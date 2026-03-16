@@ -69,6 +69,7 @@ def get_pretrain_dataset(datasetName, type):
         dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/LMI_F.yaml",
                                   new_freq=200)
     if dataset == None:
+        print(datasetName)
         raise ValueError("Please enter a correct dataset name")
     
     return dataset
