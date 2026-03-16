@@ -27,7 +27,7 @@ import wandb
 wandb.init(
     project="downstream_eeg", 
     name = "population_split",
-    note = "Training the model on the whole data with the best parameters from the kfold training and evaluating on the whole test data",
+    
     config={
         "architecture": "EEGMAE",
         "epoch_pretrain": 5,
@@ -81,21 +81,21 @@ def time(func):
 
 
 class TrainerDownstream:
-    def __init__(self, model_name, model, optimizer, loss_fn, batch_size, config, early_stopper = EarlyStopper, train_data = None, val_data = None, test_data = None, evaluation_scheme = "population"):
+    def __init__(self, model_name, model, optimizer, loss_fn, batch_size, config, early_stopper = EarlyStopper, train_data = None, val_data = None, test_data = None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name = model_name
         self.model = model
+        self.initial_state = deepcopy(model.state_dict())
         self.optimizer_name = optimizer
         self.loss_fn = loss_fn
         self.early_stopper = early_stopper
         self.batch_size = batch_size
         self.config = config
-        self.evaluation_scheme = evaluation_scheme
-
         self.train_data = train_data
         self.val_data = val_data
         self.test_data = test_data
-        
+
+    
 
     def build_model(self):
         "Build a new model instance"
@@ -249,6 +249,7 @@ class TrainerDownstream:
             #Define the best model 
             best = -float("inf")
             model = self.model().to(self.device)
+            model = model.load_state_dict((self.initial_state))
             best_model = None
 
             #Build the optimizer and define loss function
@@ -329,6 +330,7 @@ class TrainerDownstream:
         #Define the best model 
         best = -float("inf")
         model = self.model().to(self.device)
+        model = model.load_state_dict((self.initial_state))
 
         #Build the optimizer and define loss function
         self.optimizer_name = opt_name
@@ -376,6 +378,7 @@ class TrainerDownstream:
         #Define the best model 
         best = -float("inf")
         model = self.model().to(self.device)
+        model = model.load_state_dict((self.initial_state))
         best_model = model.state_dict()
 
         #Build the optimizer and define loss function

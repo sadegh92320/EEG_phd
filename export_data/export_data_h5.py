@@ -21,7 +21,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import mne
-
+from abc import ABC, abstractmethod
 
 from pathlib import Path
 import h5py
@@ -29,19 +29,34 @@ import numpy as np
 from scipy.io import loadmat
 
 
-class ImportSEED(DataImport):
+class ImportDataPretrain(ABC):
+    def __init__(self):
+        self.get_config()
+        with open(self.config) as f:
+            self.config = yaml.safe_load(f)
+        
 
+        self.mne_process = MNEMethods(self.config)
+
+    
+    
+    @abstractmethod
     def get_config(self):
-        self.config = "MAE_pretraining/info_dataset/seed2.yaml"
+        pass
 
+    @abstractmethod
+    def condition(self):
+        pass
+
+   
     def get_participant_number(self, file: Path):
         participant_nb = file.stem.split("_")[0]
         return int(participant_nb)
 
     def import_data(
         self,
-        input_dir="/Volumes/Elements/EEG_data/pretraining/SEED",
-        output_dir="downstream/data/seed",
+        input_dir,
+        output_dir,
         val_ratio=0.2,
         random_seed=92,
         use_float16=False,
@@ -68,20 +83,16 @@ class ImportSEED(DataImport):
         subject_to_files = {}
 
         for file in sorted(input_dir.iterdir()):
-            if file.name.startswith("._"):
-                continue
-
-            if file.name.startswith("label"):
-                continue
-
-            if file.suffix.lower() != ".mat":
-                continue
 
             participant_nb = self.get_participant_number(file)
+
+            if not self.condition():
+                continue
+
             subject_to_files.setdefault(participant_nb, []).append(file)
 
         if len(subject_to_files) == 0:
-            raise FileNotFoundError(f"No valid .mat files found in {input_dir}")
+            raise FileNotFoundError(f"No valid files found in {input_dir}")
 
         # 2. Split participants into train / val
         participant_ids = sorted(subject_to_files.keys())
@@ -150,6 +161,7 @@ class ImportSEED(DataImport):
                 for data in trials:
                     split_data = self.split_with_hops(
                         data=data,
+                        participant=participant_nb,
                         window_s=6,
                         hop_s=0.5,
                         sampling_rate=128,
@@ -205,7 +217,10 @@ class ImportSEED(DataImport):
                 continue
 
             # adjust this condition depending on actual SEED key names
-            
+            # common case: eeg1, eeg2, ...
+            if not key.lower().startswith("djc"):
+                continue
+
             data = value
 
             if not isinstance(data, np.ndarray):
@@ -234,12 +249,6 @@ class ImportSEED(DataImport):
         eeg_data = raw_mne_object.get_data()
         return eeg_data
 
-if __name__ == "__main__":
-    #data_import = ImportSEED()
-    #data_import()
-    file_path = "/Volumes/Elements/EEG_data/pretraining/SEED/5_20140411.mat"
-    mat = loadmat(file_path, struct_as_record=False, squeeze_me=True)
-    print(mat.keys())
     
    
 

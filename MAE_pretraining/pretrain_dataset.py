@@ -356,7 +356,7 @@ class PretrainDataset(Dataset):
         self.new_freq = new_freq
 
         # Load Global Channel Config
-        with open(Path("MAE_pretraining/info_dataset/channel_info.yaml"), "r") as file:
+        with open(Path("MAE_pretraining/info_dataset/channel_info_red.yaml"), "r") as file:
             self.channel_config = yaml.safe_load(file)
 
         # Load Dataset-Specific Config

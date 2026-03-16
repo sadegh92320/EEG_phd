@@ -32,7 +32,7 @@ class DataImport(ABC):
         pass
 
 
-    def split_with_hops(self, data, participant, label = None, window_s=6.0, hop_s=0.5, sampling_rate=128,
+    def split_with_hops(self, data, label = None, window_s=6.0, hop_s=0.5, sampling_rate=128,
                         drop_last=True, channels_expected=62):
         """
         Always returns: list of (participant, segment, label)
@@ -60,15 +60,15 @@ class DataImport(ABC):
 
         if T < win:
             if not drop_last:
-                out.append((participant, data, label))
+                out.append((data, label))
             return out
 
         last_start = T - win
         for start in range(0, last_start + 1, hop):
-            out.append((int(participant), data[:, start:start + win], label))
+            out.append((data[:, start:start + win], label))
 
         if not drop_last and (last_start % hop) != 0:
-            out.append((int(participant), data[:, -win:], label))
+            out.append((data[:, -win:], label))
 
         return out
     

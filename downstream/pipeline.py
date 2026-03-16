@@ -125,7 +125,7 @@ class Pipeline:
         return train_loader, valid_loader
 
 
-    def load_encoder(self):
+    def load_encoder(self, pretrain=True):
         """
         Load the encoder of the pretrained model and optionally pretrain the model if 
         not done before.
@@ -134,7 +134,7 @@ class Pipeline:
         os.makedirs(CKPT_DIR, exist_ok=True)
         CKPT_PATH = os.path.join(CKPT_DIR, "best_test.ckpt")
 
-        if self.pretraining:
+        if pretrain:
             train_loader, valid_loader = self.import_data_pretrain()
             model = EncoderDecoder()
 
@@ -173,7 +173,10 @@ class Pipeline:
             trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
 
         # Load trained weights
-        model = EncoderDecoder.load_from_checkpoint(CKPT_PATH)
+        if pretrain or os.path.exists(CKPT_PATH):
+            model = EncoderDecoder.load_from_checkpoint(CKPT_PATH)
+        else:
+            model = EncoderDecoder()  # untrained model if no checkpoint available
 
         self.encoder = model.encoder
         self.temporal_embedding = model.temporal_embedding_e
@@ -193,9 +196,9 @@ class Pipeline:
         self.label = label           
         return self
     
-    def load_downstream(self):
+    def load_downstream(self, pretrain=True):
         """Load the downstream model using the encoder"""
-        self.load_encoder()
+        self.load_encoder(pretrain=pretrain)
         print("done loading encoder")
         self.model = Downstream(encoder=self.encoder, temporal_embedding=self.temporal_embedding, path_eeg=self.patch,\
                                 channel_embedding=self.channel_embedding, class_token=self.class_token, \
@@ -229,6 +232,29 @@ class Pipeline:
         """Go through all the created models to test their performance against our own one"""
         pass
 
+    def get_random_baseline_performance(self, evaluation_scheme):
+        """Get the performance of a random baseline for the given evaluation scheme"""
+        self.load_downstream(pretrain=False)  # we don't need the pretrained encoder for a random baseline
+        if evaluation_scheme == "population":
+            data = self.downtream_loader.get_data_for_population()
+            self.trainer = self.trainer("cnnmodule", self.make_model, "adam", torch.nn.CrossEntropyLoss(), batch_size = 32, config = self.config, data = self.data, label = self.label)
+        elif evaluation_scheme == "LOSO":
+            data = self.downtream_loader.get_data_for_leave_one_participant_out()
+        elif evaluation_scheme == "per_subject_transfer":
+            data = self.downtream_loader.get_per_subject_transfer()
+        else:
+            raise ValueError(f"Unknown evaluation scheme: {evaluation_scheme}")
+        
+        y_true = []
+        y_pred = []
+        for x, y in data:
+            y_true.append(y)
+            y_pred.append(random.randint(0, self.config["num_classes"]-1))
+        
+        accuracy = np.mean(np.array(y_true) == np.array(y_pred))
+        print(f"Random baseline accuracy for {evaluation_scheme}: {accuracy:.4f}")
+        return accuracy
+
     def get_model_performance(self, evaluation_scheme):
         """Train the model"""
         labels = []  # all targets in the dataset
@@ -243,11 +269,6 @@ class Pipeline:
 
         print("class_counts:", class_counts)
         print("class_weights:", class_weights)
-
-        
-
-
-
         self.trainer = self.trainer("cnnmodule", self.make_model, "adam", torch.nn.CrossEntropyLoss(weight=class_weights.to(self.device)), batch_size = 32, config = self.config, data = self.data, label = self.label)
         self.trainer.train_whole_data()
         return self

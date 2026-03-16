@@ -73,3 +73,5 @@ information_txt
 text_eeg.txt
 einops.ipynb
 dump.py
+
+wandb/
