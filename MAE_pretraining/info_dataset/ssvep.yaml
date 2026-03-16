@@ -67,4 +67,4 @@ frequency: 250
 
 num_participant: 70
 
-data_file: MAE_pretraining/data/ssvep
+data_file: /content/eeg_data/ssvep

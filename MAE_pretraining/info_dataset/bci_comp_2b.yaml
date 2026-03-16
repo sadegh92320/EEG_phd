@@ -9,4 +9,4 @@ num_participant: 9
 
 frequency: 250
 
-data_file: MAE_pretraining/data/bci_comp_2b
+data_file: /content/eeg_data/bci_comp_2b
