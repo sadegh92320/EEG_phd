@@ -29,12 +29,7 @@ if __name__ == "__main__":
         seed = yaml.safe_load(f)
     for ch in seed["channel_list"]:
         chs.add(ch.lower()) 
-    with open("MAE_pretraining/info_dataset/ssvep.yaml") as f:
-        ssvep = yaml.safe_load(f)
-
-    for ch in ssvep["channel_list"]:
-        chs.add(ch.lower()) 
-
+    
     print(len(chs))
 
     with open("/Users/sadeghemami/paper_1_code/MAE_pretraining/info_dataset/channel_info_red.yaml") as f:
@@ -49,8 +44,8 @@ if __name__ == "__main__":
     mapping = info["channels_mapping"]
     ch_map = [val.lower() for val,key in mapping.items()]
     print(len(mapping))
-    for ch in chs_comp:
-       if ch not in ch_map:
+    for ch in ch_map:
+       if ch not in chs:
            print(ch)
 
 """"T9": 134,
