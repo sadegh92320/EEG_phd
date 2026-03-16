@@ -1,33 +1,240 @@
+import re
+from pathlib import Path
+import numpy as np
 import mne
 from scipy.io import loadmat
+from export_data.export_data_h5 import ImportDataDownstream
+import h5py
+import sys
 
-if __name__ == "__main__":
-    file = "/Users/sadeghemami/Downloads/BCICIV_2a_gdf/A01T.gdf"
-    raw = mne.io.read_raw_gdf(file, preload=True)
-    print(raw)
-    events, e = mne.events_from_annotations(raw, verbose="ERROR")
 
-    # Define labels based on your provided dictionary
-    event_id = {
-        'left': 7,    # Code 769
-        'right': 8,   # Code 770
-        'foot': 9,    # Code 771
-        'tongue': 10  # Code 772
-    }
 
-    # The imagery window is 4 seconds long [cite: 43]
-    # tmin=0.0 starts exactly at the cue (769-772)
-    epochs = mne.Epochs(raw, events, event_id=event_id, 
-                        tmin=0.0, tmax=4.0, 
-                        baseline=None, preload=True)
+class ImportBCIComp2a(ImportDataDownstream):
+    def get_config(self):
+        self.config = "MAE_pretraining/info_dataset/bci_comp_2a.yaml"
 
-    # Remove EOG channels (23, 24, 25) before classification [cite: 61, 82]
-    epochs.pick_types(eeg=True) 
+    def _write_split_hdf5(
+        self,
+        file_tuples,
+        h5_path,
+        split_name,
+        use_float16=False,
+        compression=None,
+    ):
+        dtype_x = np.float16 if use_float16 else np.float32
 
-    # X contains your training data: (trials, 22 channels, 1001 samples)
-    X = epochs.get_data()
-    y = epochs.events[:, -1] # These will be your labels 7, 8, 9, 10
-    path = "/Users/sadeghemami/Downloads/true_labels/A01E.mat"
-    mat = loadmat( path, struct_as_record=False, squeeze_me=True)
-    print(print(len(mat["classlabel"])))
+        with h5py.File(h5_path, "w") as f:
+            x_ds = None
+            y_ds = f.create_dataset(
+                "y",
+                shape=(0,),
+                maxshape=(None,),
+                dtype="i8",
+            )
+            participant_ds = f.create_dataset(
+                "participant",
+                shape=(0,),
+                maxshape=(None,),
+                dtype="i8",
+            )
+
+            count = 0
+
+            for participant_nb, file_path in file_tuples:
+                print(f"[{split_name}] processing subject={participant_nb}, file={file_path.name}")
+
+                trial_label_pairs = self._extract_trials(file_path)
+
+                for eeg, label in trial_label_pairs:
+                    eeg = eeg.astype(dtype_x, copy=False)
+
+                    if x_ds is None:
+                        x_shape = eeg.shape  # (C, T)
+                        x_dtype = "f2" if use_float16 else "f4"
+
+                        create_kwargs = dict(
+                            shape=(0, *x_shape),
+                            maxshape=(None, *x_shape),
+                            dtype=x_dtype,
+                            chunks=(1, *x_shape),
+                        )
+                        if compression is not None:
+                            create_kwargs["compression"] = compression
+
+                        x_ds = f.create_dataset("x", **create_kwargs)
+
+                    x_ds.resize(count + 1, axis=0)
+                    y_ds.resize(count + 1, axis=0)
+                    participant_ds.resize(count + 1, axis=0)
+
+                    x_ds[count] = eeg
+                    y_ds[count] = int(label)
+                    participant_ds[count] = int(participant_nb)
+
+                    count += 1
+
+            f.attrs["split"] = split_name
+            f.attrs["n_samples"] = count
+            if x_ds is not None:
+                f.attrs["n_channels"] = x_ds.shape[1]
+                f.attrs["time_samples"] = x_ds.shape[2]
+
+    def condition(self, file: Path):
+        if file.name.startswith("._"):
+            return False
+        return file.suffix.lower() == ".gdf" and re.match(r"A\d{2}[TE]\.gdf$", file.name) is not None
+
+    def get_participant_number(self, file: Path):
+        # A01T.gdf -> 1
+        m = re.match(r"A(\d{2})[TE]\.gdf$", file.name)
+        if m is None:
+            raise ValueError(f"Unexpected file name format: {file.name}")
+        return int(m.group(1))
+
+    def _find_label_file(self, gdf_path: Path):
+        """
+        Assumption:
+        matching label file has the same stem, e.g.
+            A01T.gdf -> A01T.mat
+            A01E.gdf -> A01E.mat
+        """
+        mat_path = gdf_path.with_suffix(".mat")
+        if not mat_path.exists():
+            raise FileNotFoundError(f"Matching label file not found for {gdf_path.name}: {mat_path}")
+        return mat_path
+
+    def _read_labels_from_mat(self, mat_path: Path):
+        """
+        Assumption:
+        the .mat file contains a 1D vector of trial labels in trial order.
+
+        This function tries a few common key names.
+        """
+        mat = loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+
+        candidate_keys = ["classlabel", "labels", "y", "true_y", "label"]
+
+        for key in candidate_keys:
+            if key in mat:
+                labels = np.asarray(mat[key]).squeeze()
+                if labels.ndim == 1:
+                    return labels.astype(int)
+
+        # fallback: try to find a plausible 1D integer-like vector
+        for key, value in mat.items():
+            if key.startswith("__"):
+                continue
+            arr = np.asarray(value).squeeze()
+            if arr.ndim == 1 and arr.size > 0 and np.issubdtype(arr.dtype, np.number):
+                unique_vals = np.unique(arr)
+                # likely MI labels 1..4 or 0..3
+                if len(unique_vals) <= 10:
+                    return arr.astype(int)
+
+        raise KeyError(f"Could not find label vector in {mat_path}")
+
+    def _extract_trials(self, file_path):
+        """
+        Returns:
+            list of (trial_array, label)
+
+        Assumptions:
+        1. EEG is in the GDF file.
+        2. Labels are in the matching MAT file, in the same trial order.
+        3. We extract one trial per cue event (769,770,771,772).
+        4. We use the common MI window [2s, 6s] after cue onset.
+        5. We keep the first 22 EEG channels only.
+        """
+
+        # ----- load EEG + events from GDF -----
+        raw = mne.io.read_raw_gdf(str(file_path), preload=True, verbose="ERROR")
+        events, _ = mne.events_from_annotations(raw, verbose="ERROR")
+
+        data = raw.get_data()          # shape (C, T)
+        sfreq = raw.info["sfreq"]
+
+        # keep EEG channels only
+        data = data[:22, :]
+
+        # ----- get cue onsets from GDF -----
+        # Official 2a cue codes: 769,770,771,772
+       
+        reject_code = 1
+
+        if file_path.name.split(".")[0][-1] == "E":
+            cue_codes = {7}
+
+        if file_path.name.split(".")[0][-1] == "T":
+            print(events)
+            cue_codes = {7,8,9,10}
+
+        cue_positions = []
+        rejected_positions = set()
+
+        for event in events:
+            print(event)
+            pos = int(event[0])
+            code = int(event[2])
+
+            if code == reject_code:
+                rejected_positions.add(pos)
+
+            if code in cue_codes:
+                cue_positions.append((pos, code))
+
+        # ----- load labels from matching MAT -----
+        mat_path = self._find_label_file(file_path)
+        labels = self._read_labels_from_mat(mat_path)
+     
+
+        if len(labels) < len(cue_positions):
+            raise RuntimeError(
+                f"Label count smaller than cue count for {file_path.name}: "
+                f"{len(labels)} labels vs {len(cue_positions)} cues"
+            )
+
+        trial_label_pairs = []
+
+        # window [2s, 6s] after cue onset
+        start_offset = int(round(2.0 * sfreq))
+        end_offset = int(round(6.0 * sfreq))
+
+        label_idx = 0
+        T = data.shape[1]
+       
+
+        for pos, cue_code in cue_positions:
+            start = pos + start_offset
+            end = pos + end_offset
+
+            if end > T:
+                label_idx += 1
+                continue
+
+            eeg = data[:, start:end]
+            print("shape")
+            print(eeg.shape)
+            eeg = self.apply_preprocessing(eeg)
+
+            # Convert labels to 0..3 if they are 1..4
+            label = int(labels[label_idx])
+            if label in [1, 2, 3, 4]:
+                label = label - 1
+
+            trial_label_pairs.append((eeg, label))
+            label_idx += 1
+
+        return trial_label_pairs
     
+if __name__ == "__main__":
+    with h5py.File("/Users/sadeghemami/paper_1_code/downstream/data/bci_comp_2a/train.h5", "r") as f:
+         print(f["x"][:].shape)
+         print(np.unique(f["participant"][:]))
+    data = mne.io.read_raw_gdf("/Users/sadeghemami/Downloads/BCICIV_2a_gdf/A02E.gdf")
+    l = loadmat("/Users/sadeghemami/Downloads/BCICIV_2a_gdf/A02T.mat")
+    
+    events, _ = mne.events_from_annotations(data, verbose="ERROR")
+    print(events)
+    print(_)
+
+   

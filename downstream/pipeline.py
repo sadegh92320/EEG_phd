@@ -42,7 +42,7 @@ class Pipeline:
         self.config = config
         self.preprocess = preprocess
         self.is_split = is_split
-        self.downtream_loader = DownstreamDataLoader(data_path=self.config["output_data_path"], config=self.config)
+        self.downtream_loader = None
         self.data = None
         self.label = None
         self.pretraining = pretraining

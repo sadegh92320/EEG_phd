@@ -1,57 +1,39 @@
-from export_data.export_data import DataImport
-from process_data.mne_constructor import MNEMethods
-import yaml
-import h5py
-import numpy as np
-import os
-from scipy.io import loadmat
-import re
-import torch
-import sys
-
-
-import os
-from pathlib import Path
-import h5py
-import numpy as np
-import mne
-from export_data.export_data import DataImport
-
-from pathlib import Path
-import h5py
-import numpy as np
-import mne
 from abc import ABC, abstractmethod
-
 from pathlib import Path
 import h5py
 import numpy as np
-from scipy.io import loadmat
+import yaml
+from process_data.mne_constructor import MNEMethods
 
 
-class ImportDataPretrain(ABC):
+class ImportDataDownstream(ABC):
     def __init__(self):
         self.get_config()
         with open(self.config) as f:
             self.config = yaml.safe_load(f)
-        
 
         self.mne_process = MNEMethods(self.config)
-
     
-    
-  
+    @abstractmethod
     def get_config(self):
-        self.config = "MAE_pretraining/info_dataset/bci_comp_2a.yaml"
-
-   
-    def condition(self):
+        pass
+    
+    @abstractmethod
+    def condition(self, file: Path):
         pass
 
-   
+    @abstractmethod
     def get_participant_number(self, file: Path):
-        participant_nb = file.stem.split("_")[0]
-        return int(participant_nb)
+        pass
+
+    @abstractmethod
+    def _extract_trials(self, file_path):
+        """
+        Must return:
+            list of (trial_array, label)
+        where trial_array has shape (C, T)
+        """
+        pass
 
     def import_data(
         self,
@@ -62,14 +44,6 @@ class ImportDataPretrain(ABC):
         use_float16=False,
         compression=None,
     ):
-        """
-        Convert raw .mat files into:
-            - train.h5
-            - val.h5
-
-        Split is done by participant.
-        """
-
         input_dir = Path(input_dir)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -79,22 +53,20 @@ class ImportDataPretrain(ABC):
 
         rng = np.random.default_rng(random_seed)
 
-        # 1. Group files by participant
+        # 1. group files by participant
         subject_to_files = {}
 
         for file in sorted(input_dir.iterdir()):
-
-            participant_nb = self.get_participant_number(file)
-
-            if not self.condition():
+            if not self.condition(file):
                 continue
 
+            participant_nb = self.get_participant_number(file)
             subject_to_files.setdefault(participant_nb, []).append(file)
 
         if len(subject_to_files) == 0:
             raise FileNotFoundError(f"No valid files found in {input_dir}")
 
-        # 2. Split participants into train / val
+        # 2. split participants into train / val
         participant_ids = sorted(subject_to_files.keys())
         n_participants = len(participant_ids)
         n_val = max(1, int(round(n_participants * val_ratio)))
@@ -112,7 +84,7 @@ class ImportDataPretrain(ABC):
             else:
                 train_files.extend((participant_nb, f) for f in files)
 
-        # 3. Write HDF5
+        # 3. write HDF5
         self._write_split_hdf5(
             file_tuples=train_files,
             h5_path=train_h5_path,
@@ -144,6 +116,12 @@ class ImportDataPretrain(ABC):
 
         with h5py.File(h5_path, "w") as f:
             x_ds = None
+            y_ds = f.create_dataset(
+                "y",
+                shape=(0,),
+                maxshape=(None,),
+                dtype="i8",
+            )
             participant_ds = f.create_dataset(
                 "participant",
                 shape=(0,),
@@ -156,94 +134,43 @@ class ImportDataPretrain(ABC):
             for participant_nb, file_path in file_tuples:
                 print(f"[{split_name}] processing subject={participant_nb}, file={file_path.name}")
 
-                trials = self._extract_trials(file_path)   # list of arrays (C, T)
+                trial_label_pairs = self._extract_trials(file_path)
 
-                for data in trials:
-                    split_data = self.split_with_hops(
-                        data=data,
-                        participant=participant_nb,
-                        window_s=6,
-                        hop_s=0.5,
-                        sampling_rate=128,
-                        channels_expected=62,
-                    )
+                for eeg, label in trial_label_pairs:
+                    eeg = eeg.astype(dtype_x, copy=False)
 
-                    if len(split_data) == 0:
-                        continue
+                    if x_ds is None:
+                        x_shape = eeg.shape  # (C, T)
+                        x_dtype = "f2" if use_float16 else "f4"
 
-                    for eeg, _ in split_data:
-                        eeg = eeg.astype(dtype_x, copy=False)
+                        create_kwargs = dict(
+                            shape=(0, *x_shape),
+                            maxshape=(None, *x_shape),
+                            dtype=x_dtype,
+                            chunks=(1, *x_shape),
+                        )
+                        if compression is not None:
+                            create_kwargs["compression"] = compression
 
-                        if x_ds is None:
-                            x_shape = eeg.shape  # (C, T)
-                            x_dtype = "f2" if use_float16 else "f4"
+                        x_ds = f.create_dataset("x", **create_kwargs)
 
-                            create_kwargs = dict(
-                                shape=(0, *x_shape),
-                                maxshape=(None, *x_shape),
-                                dtype=x_dtype,
-                                chunks=(1, *x_shape),
-                            )
-                            if compression is not None:
-                                create_kwargs["compression"] = compression
+                    x_ds.resize(count + 1, axis=0)
+                    y_ds.resize(count + 1, axis=0)
+                    participant_ds.resize(count + 1, axis=0)
 
-                            x_ds = f.create_dataset("x", **create_kwargs)
+                    x_ds[count] = eeg
+                    y_ds[count] = int(label)
+                    participant_ds[count] = int(participant_nb)
 
-                        x_ds.resize(count + 1, axis=0)
-                        participant_ds.resize(count + 1, axis=0)
-
-                        x_ds[count] = eeg
-                        participant_ds[count] = participant_nb
-
-                        count += 1
+                    count += 1
 
             f.attrs["split"] = split_name
             f.attrs["n_samples"] = count
-            f.attrs["sampling_rate"] = 128.0
-            f.attrs["n_channels"] = 62
-            f.attrs["window_s"] = 6.0
-            f.attrs["hop_s"] = 0.5
-    
-    def condition_2(self):
-        pass
+            if x_ds is not None:
+                f.attrs["n_channels"] = x_ds.shape[1]
+                f.attrs["time_samples"] = x_ds.shape[2]
 
-    def _extract_trials(self, file_path):
-        """
-        Read one .mat file, preprocess each trial, return list of arrays (C, T).
-        """
-        mat = loadmat(file_path, struct_as_record=False, squeeze_me=True)
-        trials = []
-
-        for key, value in mat.items():
-            # skip matlab metadata
-            if key.startswith("__"):
-                continue
-
-            # adjust this condition depending on actual SEED key names
-            # common case: eeg1, eeg2, ...
-            if not self.condition_2():
-                continue
-
-            data = value
-
-            if not isinstance(data, np.ndarray):
-                continue
-
-            if data.ndim != 2:
-                continue
-
-            if data.shape[0] != 62 and data.shape[1] == 62:
-                data = data.T
-
-            if data.shape[0] != 62:
-                continue
-
-            data = self.apply_preprocessing_pretrain(data)
-            trials.append(data)
-
-        return trials
-
-    def apply_preprocessing_pretrain(self, array):
+    def apply_preprocessing(self, array):
         raw_mne_object = self.mne_process.create_mne_object(array, "dataset")
         raw_mne_object.notch_filter(freqs=50, method="iir")
         raw_mne_object.notch_filter(freqs=60, method="iir")
@@ -251,9 +178,3 @@ class ImportDataPretrain(ABC):
         raw_mne_object.resample(sfreq=128.0)
         eeg_data = raw_mne_object.get_data()
         return eeg_data
-
-    
-   
-
-
-    
