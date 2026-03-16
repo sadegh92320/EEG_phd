@@ -146,7 +146,7 @@ class Pipeline:
                     mode="min",
                     save_top_k=5,
                     save_last=True,
-                    filename="epoch{epoch}-val_mse{val_mse:.4f}",
+                    filename="epoch{epoch}-val_mse_graph{val_mse:.4f}",
                 )
 
             wandb_logger = WandbLogger(
