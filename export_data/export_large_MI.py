@@ -63,7 +63,8 @@ class ImportLargeMI(ImportDataPre):
 
 
 if __name__ == "__main__":
-    pass
+    data_import = ImportLargeMI(num_chan=21)
+    data_import.import_data(input_dir="/Volumes/Elements/EEG_data/pretraining/Experiment_CLA", output_dir="MAE_pretraining/data/lmi")
     
 
 

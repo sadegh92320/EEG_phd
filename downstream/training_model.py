@@ -24,6 +24,7 @@ from torch.utils.data import ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 import wandb
 from optuna.samplers import TPESampler
+import random
 
 
 
@@ -36,6 +37,11 @@ OPTIMIZER_REGISTRY = {
     "adam": Adam,
     "SGD": SGD
 }
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 class EarlyStopper:
@@ -250,8 +256,8 @@ class TrainerDownstream:
             train_subs = Subset(train_dataset, train_idx)
             val_subs = Subset(train_dataset, val_idx)
 
-            train_loader = DataLoader(train_subs, batch_size=batch_size, shuffle=True, generator = g)
-            val_loader = DataLoader(val_subs, batch_size=batch_size, shuffle=False)
+            train_loader = DataLoader(train_subs, batch_size=batch_size, shuffle=True, generator = g, worker_init_fn=seed_worker)
+            val_loader = DataLoader(val_subs, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
 
             best = -float("inf")
             model = deepcopy(self.model).to(self.device)
@@ -336,8 +342,8 @@ class TrainerDownstream:
         num_epochs = 20
         early_stopper = self.early_stopper(patience=10)        
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g, worker_init_fn=seed_worker)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
 
         best = -float("inf")
         model = deepcopy(self.model).to(self.device)
@@ -382,9 +388,9 @@ class TrainerDownstream:
         early_stopper = self.early_stopper(patience=20)        
 
         # Create DataLoaders for this specific fold
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g, worker_init_fn=seed_worker)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
 
         #Define the best model 
         best = -float("inf")
@@ -550,7 +556,7 @@ class TrainerDownstream:
             model = self.build_model()
             optimizer = self.build_optimizer(model)
             loss_fn = self.loss_fn
-            train_loader = DataLoader(dataset=dataset, batch_size=64, sampler=torch.utils.data.SubsetRandomSampler(train_idx))
+            train_loader = DataLoader(dataset=dataset, batch_size=64, sampler=torch.utils.data.SubsetRandomSampler(train_idx), worker_init_fn=worker_init_fn)
             val_loader = DataLoader(dataset=dataset, batch_size=64, sampler=torch.utils.data.SubsetRandomSampler(test_idx))
             
             for epoch in range(10):

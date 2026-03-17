@@ -171,6 +171,7 @@ class Pipeline:
                 max_epochs=10,
                 precision="16-mixed",
                 gradient_clip_val=1.0,
+                deterministic=True
             )
 
             trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
