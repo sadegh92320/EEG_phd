@@ -21,12 +21,12 @@ from pathlib import Path
 
 
 class ImportDataPre(ABC):
-    def __init__(self):
+    def __init__(self, num_chan):
         self.get_config()
         with open(self.config) as f:
             self.config = yaml.safe_load(f)
         
-
+        self.num_chan = num_chan
         self.mne_process = MNEMethods(self.config)
 
         self.data_dir = None
@@ -153,7 +153,7 @@ class ImportDataPre(ABC):
                         window_s=6,
                         hop_s=0.5,
                         sampling_rate=128,
-                        channels_expected=32,
+                        channels_expected=self.num_chan,
                     )
 
                     if len(split_data) == 0:
@@ -188,7 +188,7 @@ class ImportDataPre(ABC):
             f.attrs["split"] = split_name
             f.attrs["n_samples"] = count
             f.attrs["sampling_rate"] = 128.0
-            f.attrs["n_channels"] = 32
+            f.attrs["n_channels"] = self.num_chan
             f.attrs["window_s"] = 6.0
             f.attrs["hop_s"] = 0.5
 

@@ -6,50 +6,58 @@ import numpy as np
 import os
 from scipy.io import loadmat
 import re
+from export_data.export_data_pretrain import ImportDataPre
+from pathlib import Path
 import torch
+import mne
 
 
-class ImportMIBCI(DataImport):
 
+
+class ImportMIBCI(ImportDataPre):
+
+    def get_participant_number(self, file: Path):
+        participant_nb = int(file.name.split(".")[0][1:])
+        return participant_nb
+    
+    def condition_file_name(self, file):
+        if file.name.startswith("._"):
+            return True
+
+        if file.suffix.lower() != ".mat":
+            return True
+        
+        return False
+        
     def get_config(self):
-        self.config = "MAE_pretraining\info_dataset\eeg_mi_bci.yaml"
-    
-    def import_data(self):
-        data_eeg = []
-        path = "D:\EEG_data\pretraining\ EEG-MI-BCI"
+        self.config = "MAE_pretraining/info_dataset/eeg_mi_bci.yaml"
 
-        for file in sorted(os.listdir(path)):
-            if not file.endswith(".mat") or file.startswith("._"):
-                continue
-
-            mat_path = os.path.join(path, file)
-
-            # Extract subject number (S10_Session_1.mat → 10)
-            participant_nb = file.split(".")[0][1:]
-
-            mat = loadmat(mat_path, struct_as_record=False, squeeze_me=True)
+    def _extract_trials(self, file_path):
+        """
+        Read one .mat file, preprocess each trial, return list of arrays (C, T).
+        """
         
-            data_eeg.append((participant_nb, np.asarray(mat["eeg"].movement_left[:64,:], dtype=np.float32)))
-            data_eeg.append((participant_nb, np.asarray(mat["eeg"].movement_right[:64,:], dtype=np.float32)))
+        trials = []
+        mat = loadmat(file_path, struct_as_record=False, squeeze_me=True)
         
-        return data_eeg
-    
-    def preprocessing(self):
-        preprocess_data = self.apply_preprocessing_pretrain()
-        data_splitted = []
+        data = np.asarray(mat["eeg"].movement_left[:64,:], dtype=np.float32)
+        trials.append(data)
+        data = np.asarray(mat["eeg"].movement_right[:64,:], dtype=np.float32)
+        trials.append(data)
 
-        for p, d in preprocess_data:
-            split_data = self.split_with_hops(data=d, participant=p,window_s=6, hop_s=0.5,
-                                                              sampling_rate=128, channels_expected=64)
-            zip_data = [(x[0], x[1]) for x in split_data]
-            data_splitted.extend(zip_data)
-        self.data = data_splitted
-        return self
-
+        return trials
 
 
 
 
 if __name__ == "__main__":
-    data_import = ImportMIBCI()
-    data_import().preprocessing().split_train_val().save_data_pretrain()
+    pass
+    
+
+
+
+
+    
+
+
+

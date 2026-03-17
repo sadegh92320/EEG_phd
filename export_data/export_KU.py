@@ -6,51 +6,48 @@ import numpy as np
 import os
 from scipy.io import loadmat
 import re
+from export_data.export_data_pretrain import ImportDataPre
+from pathlib import Path
 import torch
+import mne
 
 
-class ImportKU(DataImport):
 
+class ImportKU(ImportDataPre):
+
+    def get_participant_number(self, file: Path):
+        participant_nb = int(file.name[4:7])
+        return participant_nb
+    
+    def condition_file_name(self, file):
+        if file.name.startswith("._"):
+            return True
+
+        if file.suffix.lower() != ".npy":
+            return True
+        
+        return False
+        
     def get_config(self):
-        self.config = r"MAE_pretraining\info_dataset\auditory.yaml"
-    
-    
-    def import_data(self):
-        """Import data from matlab file and segment it according to experiment"""
-        data_eeg = []
-        path = "D:\EEG_data\pretraining\KU"
-        to_check = sorted(os.listdir(path))
-        for file in to_check:
-            participant_nb = file[4:7]
-            if not file.endswith(".npy") or file.startswith("._"):
-                continue
-            path_data = os.path.join(path, f"{file}")
-            data = np.load(path_data)
-            
-            if data.shape[0] != 64 and data.shape[1] == 64:
-                data = data.T
-            print(data.dtype)
+        self.config = "MAE_pretraining/info_dataset/auditory.yaml"
 
-            
-            data_eeg.append((participant_nb, data))
+    def _extract_trials(self, file_path):
+        """
+        Read one .mat file, preprocess each trial, return list of arrays (C, T).
+        """
+        
+        trials = []
+        data = np.load(file_path)
+        if data.shape[0] != 64 and data.shape[1] == 64:
+            data = data.T
+        trials.append(data)
 
-
-
-        return data_eeg
-    
-    def preprocessing(self):
-        preprocess_data = self.apply_preprocessing_pretrain()
-        data_splitted = []
-
-        for p, d in preprocess_data:
-            split_data = self.split_with_hops(data=d, participant=p,window_s=6, hop_s=0.5,
-                                                              sampling_rate=128, channels_expected=64)
-            zip_data = [(x[0], x[1]) for x in split_data]
-            data_splitted.extend(zip_data)
-        self.data = data_splitted
-        return self
+        return trials
 
 
 if __name__ == "__main__":
-    data_import = ImportKU()
-    data_import().preprocessing().split_train_val().save_data_pretrain()
+    pass
+    
+
+
+

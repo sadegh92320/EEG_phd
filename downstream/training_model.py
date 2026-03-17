@@ -23,6 +23,7 @@ import optuna
 from torch.utils.data import ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 import wandb
+from optuna.samplers import TPESampler
 
 
 
@@ -128,7 +129,8 @@ class TrainerDownstream:
         '''
         One epoch iteration of training.
         '''
-        model.train()
+        model.eval()
+        model.fc.train()
         loss_total = 0
         
         for x,y, channel_list in tqdm(dataloader):
@@ -211,10 +213,11 @@ class TrainerDownstream:
 
 
     @time
-    def tune_params_cv(self, folds, trial, name_project,save = False, train_dataset = None):
+    def tune_params_cv(self, folds, trial, eval_scheme,name_project,save = False, train_dataset = None):
         """Cross validation of the model with kfold."""
         kf = KFold(n_splits=folds, shuffle=True, random_state=92)
-
+        g = torch.Generator()
+        g.manual_seed(42)
         # 1. Define the Optuna tuning parameters
         # 1. Tighter Learning Rate for Linear Probing
         learning_rate = trial.suggest_float("learning_rate", 5e-4, 2e-3, log=True)
@@ -225,8 +228,8 @@ class TrainerDownstream:
 
         # 2. START WANDB RUN FOR THIS TRIAL
         wandb.init(
-            project=name_project,
-            name=f"cv_trial_{trial.number}",
+            project=eval_scheme,
+            name=f"cv_{name_project}_{trial.number}",
             reinit=True,
             config={
                 "learning_rate": learning_rate,
@@ -247,7 +250,7 @@ class TrainerDownstream:
             train_subs = Subset(train_dataset, train_idx)
             val_subs = Subset(train_dataset, val_idx)
 
-            train_loader = DataLoader(train_subs, batch_size=batch_size, shuffle=True)
+            train_loader = DataLoader(train_subs, batch_size=batch_size, shuffle=True, generator = g)
             val_loader = DataLoader(val_subs, batch_size=batch_size, shuffle=False)
 
             best = -float("inf")
@@ -311,15 +314,17 @@ class TrainerDownstream:
 
 
     @time
-    def tune_params(self, trial, name_project,train_dataset = None, val_dataset = None):
+    def tune_params(self, trial, eval_scheme,name_project,train_dataset = None, val_dataset = None):
+        g = torch.Generator()
+        g.manual_seed(42)
         learning_rate = trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True)
         batch_size = trial.suggest_int("batch_size", 32, 128)
         opt_name = trial.suggest_categorical("optimizer", ["adam"])
 
         # START WANDB RUN FOR THIS TRIAL
         wandb.init(
-            project=name_project,
-            name=f"tune_trial_{trial.number}",
+            project=eval_scheme,
+            name=f"{name_project}_{trial.number}",
             reinit=True,
             config={
                 "learning_rate": learning_rate,
@@ -331,7 +336,7 @@ class TrainerDownstream:
         num_epochs = 20
         early_stopper = self.early_stopper(patience=10)        
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
         best = -float("inf")
@@ -371,11 +376,13 @@ class TrainerDownstream:
     
     @time
     def evaluate_model(self, learning_rate, opt_name,batch_size,num_epochs,train_dataset = None, val_dataset = None, test_dataset = None):
+        g = torch.Generator()
+        g.manual_seed(42)
 
         early_stopper = self.early_stopper(patience=20)        
 
         # Create DataLoaders for this specific fold
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
@@ -426,15 +433,15 @@ class TrainerDownstream:
         def objective(trial):
             # Only combine train and val for K-Fold CV
             train_val_dataset = ConcatDataset([self.train_data, self.val_data])
-            return self.tune_params_cv(folds=5, name_project=name_project,trial=trial, save=save, train_dataset=train_val_dataset)
-        
+            return self.tune_params_cv(folds=5, eval_scheme = "popularion_cv",name_project=name_project,trial=trial, save=save, train_dataset=train_val_dataset)
+        sampler = TPESampler(seed=42)
         study = optuna.create_study(direction="maximize")
         study.optimize(objective, n_trials=5)
         
         # --- FINAL TEST EVALUATION RUN ---
         wandb.init(
-            project=name_project,
-            name="population_BEST_TEST",
+            project="population_eval",
+            name=name_project,
             reinit=True,
             config=study.best_trial.params
         )
@@ -461,15 +468,15 @@ class TrainerDownstream:
     def run_per_subject(self, name_project,participant_number, train_data_sub, val_data_sub, test_data_pop, test_data_sub, save = False):
         def objective(trial):
             train_dataset = ConcatDataset([train_data_sub, val_data_sub])
-            return self.tune_params_cv(folds=5, name_project=name_project,trial=trial, save=save, train_dataset=train_dataset)
-            
+            return self.tune_params_cv(folds=5, eval_scheme = "per_subject_cv" ,name_project=name_project,trial=trial, save=save, train_dataset=train_dataset)
+        sampler = TPESampler(seed=42)
         study = optuna.create_study(direction="maximize")
         study.optimize(objective, n_trials=20)
         
         # --- FINAL TEST EVALUATION RUN ---
         wandb.init(
-            project=name_project,
-            name=f"per_subject_{participant_number}_BEST_TEST",
+            project="per_subject_eval",
+            name=f"per_subject_{participant_number}_{name_project}",
             reinit=True,
             config=study.best_trial.params
         )
@@ -500,15 +507,15 @@ class TrainerDownstream:
         
     def run_LOSO(self, participant_number, name_project, train_data_pop, val_data_pop, test_data_sub, save = False):
         def objective(trial):
-            return self.tune_params(trial, name_project=name_project,train_dataset=train_data_pop, val_dataset=val_data_pop)
-            
+            return self.tune_params(trial, eval_scheme="LOSO",name_project=name_project,train_dataset=train_data_pop, val_dataset=val_data_pop)
+        sampler = TPESampler(seed=42)
         study = optuna.create_study(direction="maximize")
         study.optimize(objective, n_trials=20)
         
         # --- FINAL TEST EVALUATION RUN ---
         wandb.init(
-            project=name_project,
-            name=f"LOSO_{participant_number}_BEST_TEST",
+            project="LOSO",
+            name=f"LOSO_{participant_number}_{name_project}",
             reinit=True,
             config=study.best_trial.params
         )
