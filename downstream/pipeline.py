@@ -162,7 +162,7 @@ class Pipeline:
 
             wandb_logger = WandbLogger(
                 project="eeg_foundation_model",
-                name="mae_different_mask",
+                name="baseline",
                 log_model="all"
             )
             wandb_logger.experiment.config.update({
