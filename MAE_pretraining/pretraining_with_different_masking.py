@@ -5,8 +5,6 @@ from einops import rearrange, reduce, repeat
 from typing import Any
 from pytorch_lightning.utilities.types import STEP_OUTPUT, OptimizerLRScheduler
 from lightning.pytorch.callbacks import ModelCheckpoint
-import torch.nn as nn
-import torch
 import lightning.pytorch as pl
 from torchmetrics import Accuracy
 from lightning.pytorch.loggers.tensorboard import TensorBoardLogger
@@ -22,10 +20,22 @@ import math
 from MAE_pretraining.graph_embedding import GraphDataset
 from MAE_pretraining.gnn import GATModel
 import random
+import os
 import torch.nn.init as init
 from timm.models.vision_transformer import PatchEmbed, Block
 from torch_geometric.data import Batch
 from MAE_pretraining.transformer_variants import TransformerLayerViT
+
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 channel_list = ["Fp1","Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]
@@ -63,7 +73,7 @@ class PatchEEG(nn.Module):
 class ChannelPositionalEmbed(nn.Module):
     def __init__(self, embedding_dim):
         super(ChannelPositionalEmbed, self).__init__()
-        self.channel_transformation = nn.Embedding(76, embedding_dim)
+        self.channel_transformation = nn.Embedding(144, embedding_dim)
         init.zeros_(self.channel_transformation.weight)
     def forward(self, channel_indices):
         channel_embeddings = self.channel_transformation(channel_indices)
@@ -579,11 +589,9 @@ class EncoderDecoder(pl.LightningModule):
 
 
 if __name__ == "__main__":
-    #data = np.load("data/PCTram/21/trial_60_0.npz")
-    #x = data["x"]
-    #x = torch.tensor(x, dtype=torch.float32)
-    #x = x.unsqueeze(0)
-    
+    seed_everything(42)
+    L.seed_everything(42, workers=True)
+
     model = EncoderDecoder()
     #data = EEGData(data_dir="MAE_pretraining/data_bis")
     ckpt = ModelCheckpoint(

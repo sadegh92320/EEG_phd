@@ -40,13 +40,15 @@ class ImportKU(ImportDataPre):
         data = np.load(file_path)
         if data.shape[0] != 64 and data.shape[1] == 64:
             data = data.T
+        data = self.apply_preprocessing_pretrain(data)
         trials.append(data)
 
         return trials
 
 
 if __name__ == "__main__":
-    pass
+    data_import = ImportKU(num_chan=64)
+    data_import.import_data(input_dir="/Volumes/Elements/EEG_data/pretraining/KU", output_dir="MAE_pretraining/data/KU")
     
 
 

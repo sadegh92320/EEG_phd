@@ -16,7 +16,7 @@ import mne
 class ImportBCIComp2b(ImportDataPre):
 
     def get_participant_number(self, file: Path):
-        participant_nb = int(file[2])
+        participant_nb = int(file.name[2])
         return participant_nb
     
     def condition_file_name(self, file):
@@ -42,13 +42,15 @@ class ImportBCIComp2b(ImportDataPre):
         if raw.shape[0] != 6 and raw.shape[1] == 6:
                 raw = raw.T
         data = raw[:3,:]
+        data = self.apply_preprocessing_pretrain(data)
         trials.append(data)
 
         return trials
 
 
 if __name__ == "__main__":
-    pass
+    data_import = ImportBCIComp2b(num_chan=3)
+    data_import.import_data(input_dir="/Volumes/Elements/EEG_data/pretraining/BCICIV_2b_gdf", output_dir="MAE_pretraining/data/bci_comp_2b")
     
 
 

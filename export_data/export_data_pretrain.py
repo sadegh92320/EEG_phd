@@ -151,7 +151,7 @@ class ImportDataPre(ABC):
                     split_data = self.split_with_hops(
                         data=data,
                         window_s=6,
-                        hop_s=0.5,
+                        hop_s=2.5,
                         sampling_rate=128,
                         channels_expected=self.num_chan,
                     )
@@ -249,8 +249,7 @@ class ImportDataPre(ABC):
         return eeg_data
 
 if __name__ == "__main__":
-    data_import = ImportSEED()
-    data_import()
+    pass
     #file_path = "/Volumes/Elements/EEG_data/pretraining/SEED/5_20140411.mat"
     #mat = loadmat(file_path, struct_as_record=False, squeeze_me=True)
     #print(mat.keys())

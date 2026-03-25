@@ -1,0 +1,29 @@
+name_dataset: mumtaz
+
+channel_list:
+  - Fp1
+  - Fp2
+  - F7
+  - F3
+  - Fz
+  - F4
+  - F8
+  - T3
+  - C3
+  - Cz
+  - C4
+  - T4
+  - T5
+  - P3
+  - Pz
+  - P4
+  - T6
+  - O1
+  - O2
+
+frequency: 256
+num_classes: 2
+
+class_labels:
+  0: Healthy
+  1: MDD

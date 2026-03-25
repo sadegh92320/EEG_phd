@@ -1,7 +1,5 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data import Subset
 from torch.utils.data import Subset
 from export_data.export_stew import StewImport
 from dataset import EEGdataset
@@ -29,10 +27,27 @@ from lightning.pytorch.loggers.tensorboard import TensorBoardLogger
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks import ModelCheckpoint
 from downstream.downstream_model import Downstream
-#from downstream.models.conv_model import SimpleEEGfrom 
+#from downstream.models.conv_model import SimpleEEGfrom
 from pytorch_lightning.loggers import WandbLogger
 from MAE_pretraining.load_data import get_dataloader
 from downstream.split_data_downstream import DownstreamDataLoader
+
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 
@@ -115,9 +130,9 @@ class Pipeline:
         g = torch.Generator().manual_seed(42)
         train_dataset, valid_dataset = random_split(dataset, [n_train, n_val], generator=g)
 
-
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, num_workers=10, shuffle=True)
-        valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=128, num_workers=10, shuffle=False)
+        g_train = torch.Generator().manual_seed(42)
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, num_workers=10, shuffle=True, generator=g_train, worker_init_fn=seed_worker)
+        valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=128, num_workers=10, shuffle=False, worker_init_fn=seed_worker)
 
         return train_loader, valid_loader
     
@@ -325,9 +340,12 @@ class Pipeline:
 
 
 if __name__ == "__main__":
-    with open("MAE_pretraining\setting_pretraining.yaml") as f:
+    seed_everything(42)
+    L.seed_everything(42, workers=True)
+
+    with open("MAE_pretraining/setting_pretraining.yaml") as f:
         config = yaml.safe_load(f)
-    
+
     pipeline = Pipeline(config=config)
     pipeline.load_encoder()
     

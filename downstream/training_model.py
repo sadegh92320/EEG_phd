@@ -1,6 +1,10 @@
 from typing import Any
+import inspect
 import torch
-from downstream.CNN_module import CNNmodule, EEGNet
+from downstream.models.deep_learning_model.eeg_net import EEGNet as EEGNetBaseline
+from downstream.models.deep_learning_model.conformer import Conformer
+from downstream.models.deep_learning_model.ctnet import EEGTransformer
+from downstream.models.deep_learning_model.deepconvnet import DeepConvNet
 from sklearn.model_selection import KFold, StratifiedKFold
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
@@ -9,7 +13,7 @@ import timeit
 from copy import deepcopy
 import torch.nn.functional as F
 import os
-from torch.optim import SGD, Adam
+from torch.optim import SGD, Adam, AdamW
 from torchmetrics import Accuracy, Recall, Precision, F1Score, ConfusionMatrix, AUROC
 from torchmetrics.classification import CohenKappa
 import sys
@@ -29,13 +33,61 @@ import random
 
 
 MODEL_REGISTRY = {
-    "CNNmodule": CNNmodule,
-    
+    "EEGNetBaseline": EEGNetBaseline,
+    "Conformer": Conformer,
+    "EEGTransformer": EEGTransformer,
+    "DeepConvNet": DeepConvNet,
 }
 
 OPTIMIZER_REGISTRY = {
     "adam": Adam,
+    "adamw": AdamW,
     "SGD": SGD
+}
+
+
+# Following ST-EEGFormer paper (Tables F.2, F.4, F.5, F.10)
+FIXED_HP = {
+    "linear_probe": {  # Foundation model: frozen encoder, only train head
+        "learning_rate": 5e-3,       # Table F.2(b): 0.005
+        "batch_size": 64,
+        "optimizer": "adamw",
+        "weight_decay": 0.05,        # Table F.2(b): 0.05
+        "num_epochs_cv": 2,        # Table F.2(b): 100
+        "num_epochs_eval": 50,
+        "warmup_epochs": 10,         # Table F.2(b): 10
+        "label_smoothing": 0.1,      # Table F.2(b): 0.1
+    },
+    "full": {  # Foundation model fine-tuning or baseline NN training from scratch
+        "learning_rate": 5e-4,       # Table F.2(a)/F.5(a): 5e-4
+        "batch_size": 64,
+        "optimizer": "adamw",
+        "weight_decay": 0.05,        # Table F.2(a): 0.05
+        "num_epochs_cv": 100,        # Table F.2(a): 100
+        "num_epochs_eval": 100,
+        "warmup_epochs": 10,         # Table F.2(a): 10
+        "label_smoothing": 0.1,      # Table F.2(a): 0.1
+    },
+    "classic_nn": {  # Classic NN models (EEGNet, Conformer, CTNet, DeepConvNet)
+        "learning_rate": 3e-3,       # Table F.10(a): 3e-3
+        "batch_size": 64,
+        "optimizer": "adamw",
+        "weight_decay": 0.05,        # Table F.10(a): 0.05
+        "num_epochs_cv": 100,        # Table F.10(a): 100
+        "num_epochs_eval": 100,
+        "warmup_epochs": 10,         # Table F.10(a): 10
+        "label_smoothing": 0.1,      # Table F.10(a): 0.1
+    },
+    "loo_finetune": {  # LOO Fine-Tune phase 2 (Table F.4)
+        "learning_rate": 5e-5,       # Table F.4: 5e-5
+        "batch_size": 32,            # Table F.4: 32
+        "optimizer": "adamw",
+        "weight_decay": 0.01,        # Table F.4: 0.01
+        "num_epochs_cv": 50,         # Table F.4: 50
+        "num_epochs_eval": 50,
+        "warmup_epochs": 5,          # Table F.4: 5
+        "label_smoothing": 0.1,      # Table F.4: 0.1
+    },
 }
 
 def seed_worker(worker_id):
@@ -79,7 +131,7 @@ def time(func):
 
 
 class TrainerDownstream:
-    def __init__(self, model_name, model, optimizer, loss_fn, batch_size, config, early_stopper = EarlyStopper, train_data = None, val_data = None, test_data = None):
+    def __init__(self, model_name, model, optimizer, loss_fn, batch_size, config, early_stopper = EarlyStopper, train_data = None, val_data = None, test_data = None, training_mode = "linear_probe"):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name = model_name
         self.model = model
@@ -92,6 +144,48 @@ class TrainerDownstream:
         self.train_data = train_data
         self.val_data = val_data
         self.test_data = test_data
+        self.training_mode = training_mode  # "linear_probe", "full", "classic_nn", "loo_finetune"
+
+        # Detect if model.forward() accepts a channel_list argument
+        # Foundation model (Downstream) needs it; baselines (EEGNet, Conformer, etc.) don't
+        sig = inspect.signature(model.forward)
+        self._model_uses_channels = "channel_list" in sig.parameters
+
+    def _get_hp(self):
+        """Get the fixed hyperparameters for the current training mode."""
+        return FIXED_HP[self.training_mode]
+
+    def _build_loss_fn(self, label_smoothing=0.0):
+        """Build loss function with optional label smoothing."""
+        nc = self.config["num_classes"]
+        if label_smoothing > 0:
+            return torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        return self.loss_fn
+
+    @staticmethod
+    def _build_scheduler(optimizer, num_epochs, warmup_epochs=0):
+        """
+        Build a cosine decay scheduler with optional linear warmup.
+        Following ST-EEGFormer: linear warmup → cosine annealing.
+        """
+        if warmup_epochs > 0:
+            # Linear warmup scheduler
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_epochs
+            )
+            # Cosine annealing for the remaining epochs
+            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=num_epochs - warmup_epochs, eta_min=1e-6
+            )
+            return torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_epochs],
+            )
+        else:
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=num_epochs, eta_min=1e-6
+            )
 
     
 
@@ -106,10 +200,23 @@ class TrainerDownstream:
     
     def build_optimizer(self, model, optimizer_params):
         """Build a new optimizer instance"""
-        optimizer_cfg = self.config["optimizer"][self.optimizer_name]
-        optimizer_name = optimizer_cfg["name"]
+        # Support both nested config format {"optimizer": {"adam": {"name": "adam"}}}
+        # and direct optimizer name string (e.g. "adam")
+        if "optimizer" in self.config and isinstance(self.config["optimizer"], dict):
+            optimizer_cfg = self.config["optimizer"][self.optimizer_name]
+            optimizer_name = optimizer_cfg["name"]
+        else:
+            optimizer_name = self.optimizer_name
+
         optimizer = OPTIMIZER_REGISTRY[optimizer_name]
-        return optimizer(model.parameters(),**optimizer_params)
+
+        # For linear_probe, only train the classification head parameters
+        if self.training_mode == "linear_probe":
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+        else:
+            trainable_params = model.parameters()
+
+        return optimizer(trainable_params, **optimizer_params)
 
     def save_model(self, model, date):
         """Save the model to the path of interest"""
@@ -134,18 +241,43 @@ class TrainerDownstream:
     def train_one_epoch(self, optimizer, loss_fn, model, dataloader):
         '''
         One epoch iteration of training.
+        Supports two modes:
+          - "linear_probe": freeze encoder, only train fc head (foundation model)
+          - "full": train entire model end-to-end (baseline models)
         '''
-        model.eval()
-        model.fc.train()
-        loss_total = 0
-        
-        for x,y, channel_list in tqdm(dataloader):
-            x = x.float()   
+        if self.training_mode == "linear_probe":
+            model.eval()
+            # Enable training for the classification head only
+            # Supports different head naming conventions across models
+            for name in ["head", "fc", "fc1", "classHead", "classification", "classifier"]:
+                head = getattr(model, name, None)
+                if head is not None:
+                    head.train()
+                    break
+        else:
+            model.train()
 
-            x, y = x.to(self.device), y.long().to(self.device)
-            channel_list = channel_list.to(self.device)
-            pred = model(x, channel_list)
-            loss = loss_fn(pred,y)
+        loss_total = 0
+
+        for batch in tqdm(dataloader):
+            # Downstream_Dataset returns (x, y, channel_id); EEGdataset returns (x, y)
+            if len(batch) == 3:
+                x, y, channel_list = batch
+                channel_list = channel_list.to(self.device)
+            else:
+                x, y = batch
+                channel_list = None
+
+            x = x.float().to(self.device)
+            y = y.long().to(self.device)
+
+            # Only pass channel_list if the model actually uses it (foundation model)
+            if self._model_uses_channels and channel_list is not None:
+                pred = model(x, channel_list)
+            else:
+                pred = model(x)
+
+            loss = loss_fn(pred, y)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -155,39 +287,57 @@ class TrainerDownstream:
     
 
     def get_metrics(self):
-        """Set the evaluation metrics"""
-        metrics = {"accuracy": Accuracy(task="multiclass", num_classes=self.config["num_classes"]),
-        "recall": Recall(task = "multiclass", num_classes = self.config["num_classes"], average="macro"),
-        "precision": Precision(task = "multiclass", num_classes = self.config["num_classes"], average="macro"),
-        "f1_score": F1Score(task="multiclass", num_classes=self.config["num_classes"], average="macro"),
-        "confusion": ConfusionMatrix(task="multiclass", num_classes=self.config["num_classes"]),
-        "roc_auc": AUROC(task="multiclass",num_classes=self.config["num_classes"],average="macro"),
-        "kappa": CohenKappa(task="multiclass", num_classes=self.config["num_classes"])}
-
+        """
+        Evaluation metrics — original + paper metrics:
+          Original: accuracy, recall, precision, f1_score, confusion, roc_auc, kappa
+          Paper:    acc1 (top-1), acc2 (top-2), bacc (balanced accuracy)
+        """
+        nc = self.config["num_classes"]
+        metrics = {
+            # ── Original metrics ──
+            "accuracy":  Accuracy(task="multiclass", num_classes=nc),
+            "recall":    Recall(task="multiclass", num_classes=nc, average="macro"),
+            "precision": Precision(task="multiclass", num_classes=nc, average="macro"),
+            "f1_score":  F1Score(task="multiclass", num_classes=nc, average="macro"),
+            "confusion": ConfusionMatrix(task="multiclass", num_classes=nc),
+            "roc_auc":   AUROC(task="multiclass", num_classes=nc, average="macro"),
+            "kappa":     CohenKappa(task="multiclass", num_classes=nc),
+            # ── Paper-specific metrics ──
+            "acc1":  Accuracy(task="multiclass", num_classes=nc, top_k=1),
+            "acc2":  Accuracy(task="multiclass", num_classes=nc, top_k=2),
+            "bacc":  Recall(task="multiclass", num_classes=nc, average="macro"),  # balanced acc = macro recall
+        }
         return metrics
 
     def update_metrics(self, metrics, pred, probs, y):
         """Update the torchmetric metrics"""
-        for k,v in metrics.items():
-            if k != "roc_auc":
-                v.update(pred, y)
+        # Metrics that need full probability distribution (not argmax)
+        PROB_METRICS = {"roc_auc", "acc2", "auc"}
+        for k, v in metrics.items():
+            if k in PROB_METRICS:
+                v.update(probs, y)
             else:
-                v.update(probs,y)
+                v.update(pred, y)
         return self
 
     def compute_metrics(self, metrics):
         """Compute all metrics of evaluation"""
         return {k:v.compute() for k,v in metrics.items()}
 
+    @staticmethod
+    def _metrics_to_wandb(metrics, prefix="test"):
+        """Format metrics dict for wandb logging with an optional prefix."""
+        return {f"{prefix}_{k}": v for k, v in metrics.items() if k != "confusion"}
+
     def print_metric(self, metrics):
         """Print all evaluation metrics"""
         for k, v in metrics.items():
             if k == "confusion":
-                print(f"{k}:{v}")
+                print(f"{k}:\n{v}")
             elif hasattr(v, "item"):
-                print(f"{k}:{v.item()}")
+                print(f"{k}: {v.item():.4f}")
             else:
-                print(f"{k}:{v}")
+                print(f"{k}: {v}")
     
     def predict(self, model, dataloader):
         """
@@ -200,11 +350,21 @@ class TrainerDownstream:
             m.to(self.device)
             m.reset()
         with torch.no_grad():
-            for x,y,channel_list in tqdm(dataloader):
-                x = x.float()   
-                x, y = x.to(self.device), y.long().to(self.device)
-                channel_list = channel_list.to(self.device)
-                pred = model(x, channel_list)
+            for batch in tqdm(dataloader):
+                if len(batch) == 3:
+                    x, y, channel_list = batch
+                    channel_list = channel_list.to(self.device)
+                else:
+                    x, y = batch
+                    channel_list = None
+
+                x = x.float().to(self.device)
+                y = y.long().to(self.device)
+
+                if self._model_uses_channels and channel_list is not None:
+                    pred = model(x, channel_list)
+                else:
+                    pred = model(x)
                 probs = F.softmax(pred, dim = 1)
                 pred_labels = pred.argmax(dim=1)
 
@@ -215,22 +375,34 @@ class TrainerDownstream:
         metrics_comp = self.compute_metrics(metrics)
         self.print_metric(metrics_comp)
       
-        return {k:v.item() for k,v in metrics_comp.items() if k!="confusion"}
+        return {k: v.item() if v.dim() == 0 else v for k, v in metrics_comp.items()}
 
+
+    @staticmethod
+    def _extract_labels(dataset):
+        """Extract all labels from a dataset for stratification (handles Subset, ConcatDataset, etc.)."""
+        labels = []
+        for i in range(len(dataset)):
+            item = dataset[i]
+            y = item[1]
+            labels.append(y.item() if hasattr(y, 'item') else int(y))
+        return np.array(labels)
 
     @time
     def tune_params_cv(self, folds, trial, eval_scheme,name_project,save = False, train_dataset = None):
-        """Cross validation of the model with kfold."""
-        kf = KFold(n_splits=folds, shuffle=True, random_state=92)
+        """Cross validation of the model with stratified kfold."""
+        skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=92)
+        all_labels = self._extract_labels(train_dataset)
         g = torch.Generator()
         g.manual_seed(42)
-        # 1. Define the Optuna tuning parameters
-        # 1. Tighter Learning Rate for Linear Probing
-        learning_rate = trial.suggest_float("learning_rate", 5e-4, 2e-3, log=True)
-
-        # 2. Restrict Batch Size to standard powers of 2
-        batch_size = trial.suggest_categorical("batch_size", [32, 64])
-        opt_name = trial.suggest_categorical("optimizer", ["adam"])
+        # 1. Use fixed hyperparameters (no search)
+        hp = self._get_hp()
+        learning_rate = hp["learning_rate"]
+        batch_size = hp["batch_size"]
+        opt_name = hp["optimizer"]
+        weight_decay = hp["weight_decay"]
+        warmup_epochs = hp.get("warmup_epochs", 0)
+        label_smoothing = hp.get("label_smoothing", 0.0)
 
         # 2. START WANDB RUN FOR THIS TRIAL
         wandb.init(
@@ -241,18 +413,20 @@ class TrainerDownstream:
                 "learning_rate": learning_rate,
                 "batch_size": batch_size,
                 "optimizer": opt_name,
-                "folds": folds
+                "folds": folds,
+                "warmup_epochs": warmup_epochs,
+                "label_smoothing": label_smoothing,
             }
         )
 
         fold_scores = []
         fold_metrics = []
-        num_epochs = 20
-   
-        for fold, (train_idx, val_idx) in enumerate(kf.split(train_dataset)):
-            early_stopper = self.early_stopper(patience=5)
+        num_epochs = hp["num_epochs_cv"]
+
+        for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(train_dataset)), all_labels)):
+            early_stopper = self.early_stopper(patience=10)
             print("{:^100}".format(f"---Fold_{fold}---"))
-            
+
             train_subs = Subset(train_dataset, train_idx)
             val_subs = Subset(train_dataset, val_idx)
 
@@ -265,24 +439,24 @@ class TrainerDownstream:
             best_model = None
 
             self.optimizer_name = opt_name
-            optimizer = self.build_optimizer(model, {"lr": learning_rate})
-            loss_fn = self.loss_fn
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=3, factor=0.3, min_lr=1e-5)
-            
+            optimizer = self.build_optimizer(model, {"lr": learning_rate, "weight_decay": weight_decay})
+            loss_fn = self._build_loss_fn(label_smoothing)
+            scheduler = self._build_scheduler(optimizer, num_epochs, warmup_epochs)
+
             all_met = None
-            
+
             for epoch in range(num_epochs):
                 loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn)
                 if epoch % 10 == 0:
                     print(f"Epoch: {epoch} - Loss: {loss}")
-                
+
                 metrics = self.predict(model=model, dataloader=val_loader)
                 perf = metrics[self.config["metric"]]
-                scheduler.step(perf)
-                
+                scheduler.step()
+
                 # Log to WandB with the trial number included
                 wandb.log({"acc": perf, "epoch": epoch, "fold": fold, "trial": trial.number})
-                
+
                 if early_stopper.should_stop(perf):
                     break
 
@@ -306,12 +480,17 @@ class TrainerDownstream:
         print(f"mean fold score is {mean_score}")
         wandb.log({
             "mean_fold_score": mean_score,
-            "cv_accuracy": [met["accuracy"] for met in fold_metrics],
-            "cv_recall": [met["recall"] for met in fold_metrics],
+            # Original metrics
+            "cv_accuracy":  [met["accuracy"]  for met in fold_metrics],
+            "cv_recall":    [met["recall"]    for met in fold_metrics],
             "cv_precision": [met["precision"] for met in fold_metrics],
-            "cv_f1": [met["f1_score"] for met in fold_metrics],
-            "cv_roc_auc": [met["roc_auc"] for met in fold_metrics],
-            "cv_kappa": [met["kappa"] for met in fold_metrics]
+            "cv_f1":        [met["f1_score"]  for met in fold_metrics],
+            "cv_roc_auc":   [met["roc_auc"]   for met in fold_metrics],
+            "cv_kappa":     [met["kappa"]     for met in fold_metrics],
+            # Paper metrics
+            "cv_acc1":  [met["acc1"]  for met in fold_metrics],
+            "cv_acc2":  [met["acc2"]  for met in fold_metrics],
+            "cv_bacc":  [met["bacc"]  for met in fold_metrics],
         })
         
         # 3. FINISH WANDB RUN
@@ -323,9 +502,13 @@ class TrainerDownstream:
     def tune_params(self, trial, eval_scheme,name_project,train_dataset = None, val_dataset = None):
         g = torch.Generator()
         g.manual_seed(42)
-        learning_rate = trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True)
-        batch_size = trial.suggest_int("batch_size", 32, 128)
-        opt_name = trial.suggest_categorical("optimizer", ["adam"])
+        hp = self._get_hp()
+        learning_rate = hp["learning_rate"]
+        batch_size = hp["batch_size"]
+        opt_name = hp["optimizer"]
+        weight_decay = hp["weight_decay"]
+        warmup_epochs = hp.get("warmup_epochs", 0)
+        label_smoothing = hp.get("label_smoothing", 0.0)
 
         # START WANDB RUN FOR THIS TRIAL
         wandb.init(
@@ -335,12 +518,14 @@ class TrainerDownstream:
             config={
                 "learning_rate": learning_rate,
                 "batch_size": batch_size,
-                "optimizer": opt_name
+                "optimizer": opt_name,
+                "warmup_epochs": warmup_epochs,
+                "label_smoothing": label_smoothing,
             }
         )
 
-        num_epochs = 20
-        early_stopper = self.early_stopper(patience=10)        
+        num_epochs = hp["num_epochs_cv"]
+        early_stopper = self.early_stopper(patience=10)
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g, worker_init_fn=seed_worker)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
@@ -350,32 +535,32 @@ class TrainerDownstream:
         model.load_state_dict(self.initial_state)
 
         self.optimizer_name = opt_name
-        optimizer = self.build_optimizer(model, {"lr": learning_rate})
-        loss_fn = self.loss_fn
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=6, factor=0.3, min_lr=1e-5)
-            
+        optimizer = self.build_optimizer(model, {"lr": learning_rate, "weight_decay": weight_decay})
+        loss_fn = self._build_loss_fn(label_smoothing)
+        scheduler = self._build_scheduler(optimizer, num_epochs, warmup_epochs)
+
         for epoch in range(num_epochs):
             loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn)
             if epoch % 10 == 0:
                 print(f"Epoch: {epoch} - Loss: {loss}")
-                
+
             metrics = self.predict(model=model, dataloader=val_loader)
             perf = metrics[self.config["metric"]]
-            
+
             wandb.log({"acc": perf, "epoch": epoch, "trial": trial.number})
-            scheduler.step(perf)
-                
+            scheduler.step()
+
             if early_stopper.should_stop(perf):
                 break
 
             if perf > best:
                 best = perf
-                
+
             trial.report(best, step=epoch)
             if trial.should_prune():
                 wandb.finish() # Safely close before pruning
                 raise optuna.TrialPruned()
-                
+
         # FINISH WANDB RUN
         wandb.finish()
         return best
@@ -384,15 +569,19 @@ class TrainerDownstream:
     def evaluate_model(self, learning_rate, opt_name,batch_size,num_epochs,train_dataset = None, val_dataset = None, test_dataset = None):
         g = torch.Generator()
         g.manual_seed(42)
+        hp = self._get_hp()
+        weight_decay = hp["weight_decay"]
+        warmup_epochs = hp.get("warmup_epochs", 0)
+        label_smoothing = hp.get("label_smoothing", 0.0)
 
-        early_stopper = self.early_stopper(patience=20)        
+        early_stopper = self.early_stopper(patience=10)
 
         # Create DataLoaders for this specific fold
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g, worker_init_fn=seed_worker)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
 
-        #Define the best model 
+        #Define the best model
         best = -float("inf")
         model = deepcopy(self.model).to(self.device)
 
@@ -402,10 +591,10 @@ class TrainerDownstream:
 
         #Build the optimizer and define loss function
         self.optimizer_name = opt_name
-        optimizer = self.build_optimizer(model, {"lr": learning_rate})
-        loss_fn = self.loss_fn
-            
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=6, factor=0.3, min_lr=1e-5)
+        optimizer = self.build_optimizer(model, {"lr": learning_rate, "weight_decay": weight_decay})
+        loss_fn = self._build_loss_fn(label_smoothing)
+
+        scheduler = self._build_scheduler(optimizer, num_epochs, warmup_epochs)
             
             #Loop through epochs
         for epoch in range(num_epochs):
@@ -416,10 +605,13 @@ class TrainerDownstream:
                 
             #Get the metrics for validation set
             metrics = self.predict(model=model, dataloader=val_loader)
+            perf = metrics[self.config["metric"]]
+
                 
             #Retrieve the metric of interest (mostly accuracy)
             perf = metrics[self.config["metric"]]
-            scheduler.step(perf)
+            wandb.log({"acc": perf, "epoch": epoch})
+            scheduler.step()
             if perf > best:
                 best  = perf
                 best_model = deepcopy(model.state_dict())
@@ -436,140 +628,247 @@ class TrainerDownstream:
     
 
     def run_population(self, name_project,save=False):
+        hp = self._get_hp()
+
         def objective(trial):
             # Only combine train and val for K-Fold CV
             train_val_dataset = ConcatDataset([self.train_data, self.val_data])
             return self.tune_params_cv(folds=5, eval_scheme = "popularion_cv",name_project=name_project,trial=trial, save=save, train_dataset=train_val_dataset)
         sampler = TPESampler(seed=42)
-        study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=5)
-        
+        #study = optuna.create_study(direction="maximize", sampler=sampler)
+        #study.optimize(objective, n_trials=1)
+
         # --- FINAL TEST EVALUATION RUN ---
         wandb.init(
             project="population_eval",
             name=name_project,
             reinit=True,
-            config=study.best_trial.params
+            config={"learning_rate": hp["learning_rate"], "batch_size": hp["batch_size"],
+                     "optimizer": hp["optimizer"], "weight_decay": hp["weight_decay"]}
         )
         wandb.log({"evaluation_scheme": "population"})
-        
-        lr = study.best_trial.params["learning_rate"]
-        batch_size = study.best_trial.params["batch_size"]
-        opt_name = study.best_trial.params["optimizer"]
-        
+
         metrics = self.evaluate_model(
-            learning_rate=lr, 
-            opt_name=opt_name, 
-            batch_size=batch_size, 
-            num_epochs=50, 
-            train_dataset=self.train_data, 
-            val_dataset=self.val_data, 
-            test_dataset=self.test_data 
+            learning_rate=hp["learning_rate"],
+            opt_name=hp["optimizer"],
+            batch_size=hp["batch_size"],
+            num_epochs=hp["num_epochs_eval"],
+            train_dataset=self.train_data,
+            val_dataset=self.val_data,
+            test_dataset=self.test_data
         )
-        
-        wandb.log({"test_acc_pop": metrics["accuracy"], "test_f1_pop": metrics["f1_score"]})
+
+        wandb.log(self._metrics_to_wandb(metrics, prefix="test"))
         wandb.finish()
             
         
     def run_per_subject(self, name_project,participant_number, train_data_sub, val_data_sub, test_data_pop, test_data_sub, save = False):
+        hp = self._get_hp()
+
         def objective(trial):
             train_dataset = ConcatDataset([train_data_sub, val_data_sub])
             return self.tune_params_cv(folds=5, eval_scheme = "per_subject_cv" ,name_project=name_project,trial=trial, save=save, train_dataset=train_dataset)
         sampler = TPESampler(seed=42)
-        study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=20)
-        
+        study = optuna.create_study(direction="maximize", sampler = sampler)
+        study.optimize(objective, n_trials=1)
+
         # --- FINAL TEST EVALUATION RUN ---
         wandb.init(
             project="per_subject_eval",
             name=f"per_subject_{participant_number}_{name_project}",
             reinit=True,
-            config=study.best_trial.params
+            config={"learning_rate": hp["learning_rate"], "batch_size": hp["batch_size"],
+                     "optimizer": hp["optimizer"], "weight_decay": hp["weight_decay"]}
         )
         wandb.log({"evaluation_scheme": "per_subject", "participant_number": participant_number})
 
-        lr = study.best_trial.params["learning_rate"]
-        batch_size = study.best_trial.params["batch_size"]
-        opt_name = study.best_trial.params["optimizer"]
-        self.optimizer_name = opt_name
+        metrics_pop = self.evaluate_model(learning_rate=hp["learning_rate"], opt_name=hp["optimizer"], batch_size=hp["batch_size"], num_epochs=hp["num_epochs_eval"], train_dataset=train_data_sub, val_dataset=val_data_sub, test_dataset=test_data_pop)
 
-        metrics_pop = self.evaluate_model(learning_rate=lr, opt_name=opt_name, batch_size=batch_size, num_epochs=50, train_dataset=train_data_sub, val_dataset=val_data_sub, test_dataset=test_data_pop)
-        
-        wandb.log({
-            "test_acc_pop": metrics_pop["accuracy"], "test_recall_pop": metrics_pop["recall"], 
-            "test_precision_pop": metrics_pop["precision"], "test_f1_pop": metrics_pop["f1_score"], 
-            "test_roc_auc_pop": metrics_pop["roc_auc"], "test_kappa_pop": metrics_pop["kappa"]
-        })
-        
-        metrics_sub = self.evaluate_model(learning_rate=lr, opt_name=opt_name, batch_size=batch_size, num_epochs=50, train_dataset=train_data_sub, val_dataset=val_data_sub, test_dataset=test_data_sub)
-       
-        wandb.log({
-            "test_acc_sub": metrics_sub["accuracy"], "test_recall_sub": metrics_sub["recall"], 
-            "test_precision_sub": metrics_sub["precision"], "test_f1_sub": metrics_sub["f1_score"], 
-            "test_roc_auc_sub": metrics_sub["roc_auc"], "test_kappa_sub": metrics_sub["kappa"]
-        })
+        wandb.log(self._metrics_to_wandb(metrics_pop, prefix="transfer"))
+
+        metrics_sub = self.evaluate_model(learning_rate=hp["learning_rate"], opt_name=hp["optimizer"], batch_size=hp["batch_size"], num_epochs=hp["num_epochs_eval"], train_dataset=train_data_sub, val_dataset=val_data_sub, test_dataset=test_data_sub)
+
+        wandb.log(self._metrics_to_wandb(metrics_sub, prefix="self"))
         wandb.finish()
         
         
     def run_LOSO(self, participant_number, name_project, train_data_pop, val_data_pop, test_data_sub, save = False):
+        hp = self._get_hp()
+
         def objective(trial):
             return self.tune_params(trial, eval_scheme="LOSO",name_project=name_project,train_dataset=train_data_pop, val_dataset=val_data_pop)
         sampler = TPESampler(seed=42)
-        study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=20)
-        
+        study = optuna.create_study(direction="maximize", sampler=sampler)
+        study.optimize(objective, n_trials=1)
+
         # --- FINAL TEST EVALUATION RUN ---
         wandb.init(
             project="LOSO",
             name=f"LOSO_{participant_number}_{name_project}",
             reinit=True,
-            config=study.best_trial.params
+            config={"learning_rate": hp["learning_rate"], "batch_size": hp["batch_size"],
+                     "optimizer": hp["optimizer"], "weight_decay": hp["weight_decay"]}
         )
         wandb.log({"evaluation_scheme": "LOSO", "participant_number": participant_number})
-        
-        lr = study.best_trial.params["learning_rate"]
-        batch_size = study.best_trial.params["batch_size"]
-        opt_name = study.best_trial.params["optimizer"]
-        self.optimizer_name = opt_name
 
-        metrics_sub = self.evaluate_model(learning_rate=lr, opt_name=opt_name, batch_size=batch_size, num_epochs=50, train_dataset=train_data_pop, val_dataset=val_data_pop, test_dataset=test_data_sub)
-       
-        wandb.log({
-            "test_acc_sub": metrics_sub["accuracy"], "test_recall_sub": metrics_sub["recall"], 
-            "test_precision_sub": metrics_sub["precision"], "test_f1_sub": metrics_sub["f1_score"], 
-            "test_roc_auc_sub": metrics_sub["roc_auc"], "test_kappa_sub": metrics_sub["kappa"]
-        })
+        metrics_sub = self.evaluate_model(learning_rate=hp["learning_rate"], opt_name=hp["optimizer"], batch_size=hp["batch_size"], num_epochs=hp["num_epochs_eval"], train_dataset=train_data_pop, val_dataset=val_data_pop, test_dataset=test_data_sub)
+
+        wandb.log(self._metrics_to_wandb(metrics_sub, prefix="test"))
         wandb.finish()
-        
 
-        
+
     @time
-    def training_skf(self, dataset):
+    def _train_model(self, learning_rate, opt_name, batch_size, num_epochs, train_dataset, val_dataset):
         """
-        cross validation of the model with stratified kfold.
+        Train model and return the best state dict (selected by val performance).
+        Used as Phase 1 of LOO Fine-Tune and LOO Drop to get population-trained weights.
         """
-        
-        skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=1)
-        y = dataset.label.argmax(axis=1)
-    
-        for fold, (train_idx, test_idx) in enumerate(skf.split(dataset.data, y)):
-            model = self.build_model()
-            optimizer = self.build_optimizer(model)
-            loss_fn = self.loss_fn
-            train_loader = DataLoader(dataset=dataset, batch_size=64, sampler=torch.utils.data.SubsetRandomSampler(train_idx), worker_init_fn=worker_init_fn)
-            val_loader = DataLoader(dataset=dataset, batch_size=64, sampler=torch.utils.data.SubsetRandomSampler(test_idx))
-            
-            for epoch in range(10):
-                loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn)
-                metrics = self.predict(model=model, dataloader=val_loader)
-                perf = metrics[self.config["metric"]]
-                if perf > best:
-                    best_model = deepcopy(model.state_dict())
-                    best  = perf
+        g = torch.Generator()
+        g.manual_seed(42)
+        hp = self._get_hp()
+        warmup_epochs = hp.get("warmup_epochs", 0)
+        label_smoothing = hp.get("label_smoothing", 0.0)
 
-            if best_model is not None:
-                model.load_state_dict(best_model)
-            self.save_model(model, fold)
+        early_stopper = self.early_stopper(patience=10)
+
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g, worker_init_fn=seed_worker)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
+
+        best = -float("inf")
+        model = deepcopy(self.model).to(self.device)
+        model.load_state_dict(self.initial_state)
+        best_model = deepcopy(model.state_dict())
+
+        self.optimizer_name = opt_name
+        optimizer = self.build_optimizer(model, {"lr": learning_rate, "weight_decay": hp["weight_decay"]})
+        loss_fn = self._build_loss_fn(label_smoothing)
+        scheduler = self._build_scheduler(optimizer, num_epochs, warmup_epochs)
+
+        for epoch in range(num_epochs):
+            loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn)
+            if epoch % 10 == 0:
+                print(f"Epoch: {epoch} - Loss: {loss}")
+
+            metrics = self.predict(model=model, dataloader=val_loader)
+            perf = metrics[self.config["metric"]]
+            scheduler.step()
+
+            if perf > best:
+                best = perf
+                best_model = deepcopy(model.state_dict())
+
+            if early_stopper.should_stop(perf):
+                break
+
+        return best_model
+
+
+    def run_LOSO_fine_tune(self, participant_number, name_project,
+                           train_data_pop, val_data_pop,
+                           train_data_sub, val_data_sub, test_data_sub, save=False):
+        """
+        LOO Fine-Tune protocol (ST-EEGFormer Protocol 5):
+          Phase 1: Train on population with fixed HP
+          Phase 2: Fine-tune ENTIRE model on held-out subject's data, test on subject's test set
+        """
+        hp = FIXED_HP[self.training_mode]
+
+        # ── Phase 1: Population training ──
+        def objective_pop(trial):
+            return self.tune_params(trial, eval_scheme="LOSO_FT_pop", name_project=name_project,
+                                    train_dataset=train_data_pop, val_dataset=val_data_pop)
+
+        sampler = TPESampler(seed=42)
+        study_pop = optuna.create_study(direction="maximize", sampler=sampler)
+        study_pop.optimize(objective_pop, n_trials=1)
+
+        # Train population model → get best weights
+        pop_state = self._train_model(hp["learning_rate"], hp["optimizer"], hp["batch_size"], hp["num_epochs_eval"], train_data_pop, val_data_pop)
+
+        # ── Phase 2: Fine-tune on held-out subject ──
+        # Swap initial_state to population weights so evaluate_model starts from them
+        original_state = self.initial_state
+        original_mode = self.training_mode
+        self.initial_state = pop_state
+        self.training_mode = "loo_finetune"  # use LOO fine-tune specific HP (Table F.4)
+
+        hp_ft = FIXED_HP["loo_finetune"]
+        wandb.init(
+            project="LOSO_fine_tune",
+            name=f"LOSO_FT_{participant_number}_{name_project}",
+            reinit=True,
+            config={"phase": "fine_tune", "participant": participant_number,
+                     "learning_rate": hp_ft["learning_rate"], "batch_size": hp_ft["batch_size"],
+                     "optimizer": hp_ft["optimizer"], "weight_decay": hp_ft["weight_decay"]}
+        )
+        wandb.log({"evaluation_scheme": "LOSO_fine_tune", "participant_number": participant_number})
+
+        metrics = self.evaluate_model(
+            learning_rate=hp_ft["learning_rate"], opt_name=hp_ft["optimizer"], batch_size=hp_ft["batch_size"],
+            num_epochs=hp_ft["num_epochs_eval"], train_dataset=train_data_sub, val_dataset=val_data_sub, test_dataset=test_data_sub
+        )
+
+        wandb.log(self._metrics_to_wandb(metrics, prefix="test"))
+        wandb.finish()
+
+        # Restore original state
+        self.initial_state = original_state
+        self.training_mode = original_mode
+
+
+    def run_LOSO_drop(self, participant_number, name_project,
+                      train_data_pop, val_data_pop,
+                      train_data_sub, val_data_sub, test_data_sub, save=False):
+        """
+        LOO Drop protocol (ST-EEGFormer Protocol 6):
+          Phase 1: Train on population with fixed HP
+          Phase 2: Freeze everything except classification head, train head on held-out subject's data
+        """
+        hp = FIXED_HP[self.training_mode]
+
+        # ── Phase 1: Population training (identical to Fine-Tune Phase 1) ──
+        def objective_pop(trial):
+            return self.tune_params(trial, eval_scheme="LOSO_drop_pop", name_project=name_project,
+                                    train_dataset=train_data_pop, val_dataset=val_data_pop)
+
+        sampler = TPESampler(seed=42)
+        study_pop = optuna.create_study(direction="maximize", sampler=sampler)
+        study_pop.optimize(objective_pop, n_trials=1)
+
+        # Train population model → get best weights
+        pop_state = self._train_model(hp["learning_rate"], hp["optimizer"], hp["batch_size"], hp["num_epochs_eval"], train_data_pop, val_data_pop)
+
+        # ── Phase 2: Linear probe on held-out subject ──
+        original_state = self.initial_state
+        original_mode = self.training_mode
+        self.initial_state = pop_state
+        self.training_mode = "loo_finetune"  # use LOO-specific HP for adaptation phase
+        hp_ft = FIXED_HP["loo_finetune"]
+
+        wandb.init(
+            project="LOSO_drop",
+            name=f"LOSO_drop_{participant_number}_{name_project}",
+            reinit=True,
+            config={"phase": "drop", "participant": participant_number,
+                     "learning_rate": hp_ft["learning_rate"], "batch_size": hp_ft["batch_size"],
+                     "optimizer": hp_ft["optimizer"], "weight_decay": hp_ft["weight_decay"]}
+        )
+        wandb.log({"evaluation_scheme": "LOSO_drop", "participant_number": participant_number})
+
+        metrics = self.evaluate_model(
+            learning_rate=hp_ft["learning_rate"], opt_name=hp_ft["optimizer"], batch_size=hp_ft["batch_size"],
+            num_epochs=hp_ft["num_epochs_eval"], train_dataset=train_data_sub, val_dataset=val_data_sub, test_dataset=test_data_sub
+        )
+
+        wandb.log(self._metrics_to_wandb(metrics, prefix="test"))
+        wandb.finish()
+
+        # Restore original state
+        self.initial_state = original_state
+        self.training_mode = original_mode
+
+
+    
 
     def append_result(self, model, model_name, opt_name, study, accuracy, precision, recall, F1):
         """Write the results in a txt file"""

@@ -22,11 +22,23 @@ import math
 from MAE_pretraining.graph_embedding import GraphDataset
 from MAE_pretraining.gnn import GATModel
 import random
+import os
 import torch.nn.init as init
 from timm.models.vision_transformer import PatchEmbed, Block
 from torch_geometric.data import Batch
 from MAE_pretraining.transformer_variants import TransformerLayerViT
 import yaml
+
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 from torch_geometric.data import Data
 
 
@@ -65,7 +77,7 @@ class PatchEEG(nn.Module):
 class ChannelPositionalEmbed(nn.Module):
     def __init__(self, embedding_dim):
         super(ChannelPositionalEmbed, self).__init__()
-        self.channel_transformation = nn.Embedding(76, embedding_dim)
+        self.channel_transformation = nn.Embedding(144, embedding_dim)
         init.zeros_(self.channel_transformation.weight)
     def forward(self, channel_indices):
         channel_embeddings = self.channel_transformation(channel_indices)
@@ -127,7 +139,7 @@ class TemporalPositionalEncoding(nn.Module):
         return pe_embeddings
 
 
-class EncoderDecoder(pl.LightningModule):
+class GNNEncoderDecoder(pl.LightningModule):
     """Basic encoder decoder model following the ViT model"""
     def __init__(self, config = None, use_rotary = False,num_channels = 64, 
                  max_embedding = 2000, enc_dim = 512, dec_dim = 384, depth_e = 8, 
@@ -556,21 +568,7 @@ class EncoderDecoder(pl.LightningModule):
 
 
 if __name__ == "__main__":
-    #data = np.load("data/PCTram/21/trial_60_0.npz")
-    #x = data["x"]
-    #x = torch.tensor(x, dtype=torch.float32)
-    #x = x.unsqueeze(0)
+    seed_everything(42)
+    L.seed_everything(42, workers=True)
+
     
-    model = EncoderDecoder()
-    #data = EEGData(data_dir="MAE_pretraining/data_bis")
-    ckpt = ModelCheckpoint(
-    monitor="val_mse",
-    mode="min",
-    save_top_k=1,
-    filename="mae-{epoch:02d}-{val_mse:.4f}",
-)
-    #early = EarlyStopping(monitor="val_mse", mode="min", patience=10)
-    #trainer = Trainer(callbacks=[TQDMProgressBar(refresh_rate=20), ckpt, early], log_every_n_steps=5, max_epochs=15)
-    #trainer.fit(model, val_dataloaders=valid_loader, train_dataloaders=train_loader)
-    tensor_test = torch.rand(3,100,32,250)
-    model.masking(tensor_test)

@@ -168,9 +168,10 @@ def get_multi_mask_MAE(evaluation_scheme):
 
 if __name__ == "__main__":
 
-    seed_everything()
+    L.seed_everything(42, workers=True)
     with open("setting.yaml", "r") as file:
         config = yaml.safe_load(file)
 
-    get_multi_mask_MAE(evaluation_scheme="population")
+    get_graph_MAE(evaluation_scheme="population")
+
     

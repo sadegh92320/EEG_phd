@@ -37,9 +37,14 @@ n = len(dataset)
 n_val = int(n * val_ratio)
 n_train = n - n_val
 
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 g = torch.Generator().manual_seed(42)
 train_dataset, valid_dataset = random_split(dataset, [n_train, n_val], generator=g)
 
-
-train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, num_workers=0, shuffle=True)
-valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size, num_workers=0, shuffle=False)
+g_train = torch.Generator().manual_seed(42)
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, num_workers=0, shuffle=True, generator=g_train, worker_init_fn=seed_worker)
+valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size, num_workers=0, shuffle=False, worker_init_fn=seed_worker)

@@ -22,7 +22,19 @@ import math
 from MAE_pretraining.graph_embedding import GraphDataset
 from MAE_pretraining.gnn import GATModel
 import random
+import os
 from torch_geometric.data import Batch
+
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 from create_region import RegionToken, BrainMapper
 
 channel_list = ["Fp1","Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]
@@ -779,11 +791,9 @@ class EncoderDecoder(pl.LightningModule):
 
 
 if __name__ == "__main__":
-    #data = np.load("data/PCTram/21/trial_60_0.npz")
-    #x = data["x"]
-    #x = torch.tensor(x, dtype=torch.float32)
-    #x = x.unsqueeze(0)
-    
+    seed_everything(42)
+    L.seed_everything(42, workers=True)
+
     model = EncoderDecoder()
     #data = EEGData(data_dir="MAE_pretraining/data_bis")
     ckpt = ModelCheckpoint(

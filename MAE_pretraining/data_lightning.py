@@ -11,14 +11,18 @@ import lightning as L
 from dataset import EEGdataset
 import numpy as np
 import os
+import random
 from torch.utils.data import DataLoader, Subset
 from einops import rearrange, reduce, repeat
-import os
-import numpy as np
-import torch
 from process_data.preprocessing import Preprocessing
 from torch.utils.data import DataLoader, random_split
 import lightning as L  # or pytorch_lightning as pl
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 class EEGData(L.LightningDataModule):
     def __init__(self, data_dir, batch_size=32, val_split=0.1,
@@ -89,12 +93,16 @@ class EEGData(L.LightningDataModule):
             self.test_dataset = self.val_dataset
 
     def train_dataloader(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed)
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            worker_init_fn=seed_worker,
+            generator=g,
         )
 
     def val_dataloader(self):
@@ -104,6 +112,7 @@ class EEGData(L.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            worker_init_fn=seed_worker,
         )
 
     def test_dataloader(self):
@@ -113,4 +122,5 @@ class EEGData(L.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            worker_init_fn=seed_worker,
         )

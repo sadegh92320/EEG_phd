@@ -22,15 +22,51 @@ import math
 from MAE_pretraining.graph_embedding import GraphDataset
 from MAE_pretraining.gnn import GATModel
 import random
+import os
 import torch.nn.init as init
+
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 from timm.models.vision_transformer import PatchEmbed, Block
 from torch_geometric.data import Batch
 from MAE_pretraining.transformer_variants import TransformerLayerViT
+from MAE_pretraining.transformer_variants import CrossTransformerLayer
 
 
-channel_list = ["Fp1","Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]
-channel_list_2 = ["Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]
-CHANNEL_DICT = dict(zip(range(len(channel_list)), channel_list))
+
+class FreqTokens(nn.Module):
+    def __init__(self, embed_dim = 512, patch_size = 32):
+        super().__init__()
+        self.patch_size = patch_size
+
+        self.freq_proj = nn.Linear(patch_size, embed_dim)
+
+    def forward(self, x):
+        B, C, T = x.shape
+
+        x_freq = torch.fft.rfft(x, dim = -1)
+        x_freq = torch.abs(x_freq)
+
+        #Shape (B, C, freq_bin)
+        F_bin = x_freq.shape[-1]
+        pad = (self.patch_size - (F_bin%self.patch_size))%self.patch_size
+        if pad > 0:
+            x_freq = F.pad(x_freq, pad=(0,pad))
+        x_freq = rearrange(x_freq, 'b c (f p) -> b c f p', p = self.patch_size)
+        x_freq = self.freq_proj(x_freq)
+        x_freq = rearrange(x_freq, "b c f d -> b (c f) d")
+
+        return x_freq
+
+
 
 
 class PatchEEG(nn.Module):
@@ -63,7 +99,7 @@ class PatchEEG(nn.Module):
 class ChannelPositionalEmbed(nn.Module):
     def __init__(self, embedding_dim):
         super(ChannelPositionalEmbed, self).__init__()
-        self.channel_transformation = nn.Embedding(76, embedding_dim)
+        self.channel_transformation = nn.Embedding(144, embedding_dim)
         init.zeros_(self.channel_transformation.weight)
     def forward(self, channel_indices):
         channel_embeddings = self.channel_transformation(channel_indices)
@@ -141,6 +177,8 @@ class EncoderDecoder(pl.LightningModule):
         #Define the encoder and decoder layers
         self.encoder = nn.ModuleList([TransformerLayerViT(enc_dim, nhead=8, mlp_ratio=4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_e)])
         self.decoder = nn.ModuleList([TransformerLayerViT(dec_dim, nhead=16, mlp_ratio = 4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_d)])
+        self.encoder_freq = nn.ModuleList([TransformerLayerViT(enc_dim, nhead=8, mlp_ratio=4, qkv_bias=True, norm=nn.LayerNorm) for i in range(depth_e//4)])
+        self.cross_encoder = nn.ModuleList([(CrossTransformerLayer(enc_dim, nhead=8, mlp_ratio=4, qkv_bias=True, norm=nn.LayerNorm), CrossTransformerLayer(enc_dim, nhead=8, mlp_ratio=4, qkv_bias=True, norm=nn.LayerNorm)) for i in range(2)])
 
         #Set the probability for a token to be masked
         self.mask_prob = mask_prob
@@ -150,6 +188,7 @@ class EncoderDecoder(pl.LightningModule):
 
         self.patch_size = patch_size
         self.patch = PatchEEG(patch_size=patch_size, embed_dim=enc_dim)
+        self.patch_freq = FreqTokens(patch_size=patch_size, embed_dim=enc_dim)
         self.mask_token = nn.Parameter(torch.zeros((1, 1, dec_dim)))
         self.fc = nn.Linear(dec_dim, patch_size)
         self.num_channels = num_channels
@@ -161,6 +200,9 @@ class EncoderDecoder(pl.LightningModule):
         self.channel_embedding_d = ChannelPositionalEmbed(embedding_dim=dec_dim)
         self.temporal_embedding_d = TemporalPositionalEncoding(d_model=dec_dim, max_len=max_embedding)
         self.temporal_embedding_e = TemporalPositionalEncoding(d_model=enc_dim, max_len=max_embedding)
+
+        self.channel_embedding_f = ChannelPositionalEmbed(embedding_dim=enc_dim)
+        self.temporal_embedding_f = TemporalPositionalEncoding(d_model=enc_dim, max_len=max_embedding)
 
         self.criterion = nn.MSELoss()
         self.class_token = nn.Parameter(torch.zeros(1,1,enc_dim))
@@ -216,34 +258,34 @@ class EncoderDecoder(pl.LightningModule):
         x_full = self.mask_token.view(1,1,-1).expand(B,L,D).clone()
         x_full.scatter_(dim = 1, index=keep_id, src = x)
         return x_full
+
+    def mask_block(self, x):
+        B, L, D = x.shape
+        device = x.device
+        assert L%4 == 0
+        x = rearrange(x, "b (n b) d -> b n b d", b = self.block_size)
+        B, N, b, D = x.shape
+        noise = torch.randn((B, N), device = device)
+        l_keep = int(N*(1-self.mask_prob))
+        shuffle_id = torch.argsort(noise)
+        restore_id = torch.argsort(shuffle_id)
+        keep_id = shuffle_id[:,:l_keep]
+        keep_id = repeat(keep_id,"b n -> b n b d", b = self.block_size, d = D)
+        x_mask = torch.gather(input = x, dim = 1, index=keep_id)
+
+        #Size B,n -> B,n,b
+        restore_id_extended = restore_id.unsqueeze(-1).repeat(1,1,self.block_size) * self.block_size
+        offset = torch.arange(self.block_size, device = device).view(1,1,self.block_size)
+        restore_id_extended = (restore_id_extended + offset).view(B,L)
+
+        mask = torch.ones(B,N, device = device)
+        mask[:,:l_keep] = 0
+        mask = torch.gather(mask, dim = 1, index = restore_id)
+        mask = mask.repeat_interleave(self.block_size, dim = 1)
+        x_mask = rearrange(x_mask, "b n b d -> b (n b) d")
+        return x_mask, restore_id, mask
+
     
-
-    def random_masking(self, x, mask_ratio):
-        """
-        Perform per-sample random masking by per-sample shuffling.
-        Per-sample shuffling is done by argsort random noise.
-        x: [N, L, D], sequence
-        """
-        N, L, D = x.shape  # batch, length, dim
-        len_keep = int(L * (1 - mask_ratio))
-        
-        noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
-        
-        # sort noise for each sample
-        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
-        ids_restore = torch.argsort(ids_shuffle, dim=1)
-
-        # keep the first subset
-        ids_keep = ids_shuffle[:, :len_keep]
-        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
-
-        # generate the binary mask: 0 is keep, 1 is remove
-        mask = torch.ones([N, L], device=x.device)
-        mask[:, :len_keep] = 0
-        # unshuffle to get the binary mask
-        mask = torch.gather(mask, dim=1, index=ids_restore)
-
-        return x_masked, mask, ids_restore
     
 
     def masking_vit(self, x):
@@ -262,71 +304,53 @@ class EncoderDecoder(pl.LightningModule):
 
 
         return x_masked, ids_restore,mask
-
-
-
-    def masking(self, x):
-        """Mask random patch of the eeg input"""
-
-        B, N, C, T = x.shape
-        device = x.device
-
-        while True:
-            chan_drop = [c for c in range(C) if random.random() < 0.2]
-            if len(chan_drop) < C:
-                break
-        
-        #Pick the channels to drop
-        if len(chan_drop) > 0:
-            idx_chan = torch.arange(0,N, device=device, dtype=torch.long).repeat_interleave(len(chan_drop))
-            idx_chan = idx_chan.reshape(N,(len(chan_drop))) * C + torch.tensor(chan_drop, device=device, dtype=torch.long)
-            idx_chan = idx_chan.view(-1)
-        else:
-            idx_chan = torch.empty(0, device=device, dtype=torch.long)
-
-        #Compute total number of patch
-        L = N*C
-
-        #Stack all patches in a 1D array
-        x_flat = rearrange(x, "b n c t -> b (n c) t")
-        
-        #Compute the number of patches to keep
-        num_drop = idx_chan.numel()
-        num_allowed = L - num_drop
-        L_keep = min(int(L * (1 - self.mask_prob)), num_allowed)
-
-        #Retrieve shuffle as well as ordered indices
-        noise = torch.rand(B,L, device=device)
-        noise[:,idx_chan] = 2
-        id_shuffle = torch.argsort(noise, dim = 1)
-        #id_restore = torch.argsort(id_shuffle, dim = 1)
-
-        #Retrieve the id that we will be kept, sort them and repeat it T times so that patches are either fully
-        # visible or fully masked
-        id_keep = id_shuffle[:, :L_keep].to(device=device)    
-        id_sorted, _ = torch.sort(id_keep, dim=1)
-        to_keep = repeat(id_sorted, "b l -> b l t", t = T)
-
-        #Only keep the non masked indices from the original signal
-        x_return = torch.gather(x_flat, dim = 1, index=to_keep)
-        
-        #Compute the mask to remove the non masked patches for prediction
-        mask = torch.ones(B,L, device=device)
-        mask.scatter_(dim = 1, index=id_sorted, src=torch.zeros(B,L_keep, dtype=mask.dtype, device=device))
-
-        return x_return, mask, id_sorted
     
+    def freq_encoder_forward(self, x, channel_list):
+        B, C, T = x.shape
+        device = x.device
+        x_freq = self.patch_freq(x)
+        original = x_freq
+        B,L,D = x_freq.shape
+        
+
+        if channel_list.dim() == 1:
+            channel_list = channel_list.unsqueeze(0).expand(B, -1)
+
+        N_f = x_freq.shape[1]//C
+
+        chan_id = channel_list.unsqueeze(-1).repeat(1,1,N_f).view(B,L)
+        chan_embedding = self.channel_embedding_f(chan_id)
+
+        x_freq = x_freq + chan_embedding
+
+        seq_idx = torch.arange(0, N_f, device=device, dtype=torch.long)
+        temp_enc = seq_idx.unsqueeze(0).unsqueeze(0).repeat(B,C,1).view(B,L)
+        temp_enc = self.temporal_embedding_f(temp_enc)
+        x_freq = x_freq + temp_enc
+
+        x_freq, ids_restore, mask = self.masking_vit(x_freq)
+
+        for transformer in self.encoder_freq:
+            x_freq = transformer(x_freq)
+
+        x_freq = self.norm_enc(x_freq)
+
+        return x_freq, ids_restore, mask, original
+
+        
+
+
+
     def encoder_forward(self,x, channel_list):
         B, C, T = x.shape
         device = x.device
-        channel_list = torch.tensor(channel_list, dtype=torch.long, device=device)
     
         #Return the patch eeg with shape (b, n, c, d)
         x = self.patch(x)
         original = x
         N = x.shape[1]
         L = x.shape[1] * x.shape[2]
-        x = x.view(B,L,-1)
+        x = x.reshape(B,L,-1)
 
         #Define the embeddings
         if channel_list.dim() == 1:
@@ -342,12 +366,11 @@ class EncoderDecoder(pl.LightningModule):
             seq_idx = torch.arange(0, N, device=device, dtype=torch.long)  # use 0..Seq-1 (or 1..Seq if your ref does)
             eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
 
-            tp = self.temporal_embedding_e(eeg_seq_indices) if isinstance(self.temporal_embedding_e, TemporalPositionalEncoding) \
-            else self.temporal_embedding_e(seq_length=L, num_channel=C).to(device).expand(B, -1, -1)
+            tp = self.temporal_embedding_e(eeg_seq_indices) 
             x += tp
 
         #Mask the eeg patches
-        x, ids_restore, mask = self.masking_vit(x)
+        x, ids_restore, mask = self.mask_block(x)
 
         #Concatenate the class token to the eeg
         class_token = self.class_token + self.temporal_embedding_e.get_class_token()
@@ -362,11 +385,16 @@ class EncoderDecoder(pl.LightningModule):
 
         return x, ids_restore, mask, original
 
-    def decoder_forward(self, x, ids_restore, mask, original, channel_list):
+    def decoder_forward(self, x, x_freq,ids_restore, mask, original, channel_list):
         B, N, C, D = original.shape
         L = N*C
         device = x.device
         #Get decoder dimensions (B,N*C,D)
+
+        for transformer_freq, transformer_time in self.cross_encoder:
+            x_freq = transformer_freq(query = x_freq, key = x)
+            x = transformer_time(query = x, key = x_freq)
+
         x = self.encoder_decoder(x)
         #Retrieve the class token which is not used for decoding
         x, class_token = x[:,1:,:], x[:,:1,:]
@@ -393,9 +421,7 @@ class EncoderDecoder(pl.LightningModule):
             seq_idx = torch.arange(0, N, device=device, dtype=torch.long)  # use 0..Seq-1 (or 1..Seq if your ref does)
             eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
 
-            tp = self.temporal_embedding_d(eeg_seq_indices) if isinstance(self.temporal_embedding_e, TemporalPositionalEncoding) \
-            else self.temporal_embedding_d(seq_length=L, num_channel=C).to(device).expand(B, -1, -1)
-
+            tp = self.temporal_embedding_d(eeg_seq_indices) 
             x = x + tp
 
         
@@ -421,7 +447,8 @@ class EncoderDecoder(pl.LightningModule):
     def forward(self, eeg, channel_list):
 
         x, ids_restore, mask, original = self.encoder_forward(eeg, channel_list)
-        pred, mask = self.decoder_forward(x, ids_restore, mask, original, channel_list)
+        x_freq, _, _, _ = self.freq_encoder_forward(eeg, channel_list)
+        pred, mask = self.decoder_forward(x, x_freq,ids_restore, mask, original, channel_list)
         target, pad = self.patchify_1d(eeg, self.patch_size)   
         B, Seq, Ch, P = target.shape
         target = target.view(B, Seq * Ch, P)
@@ -432,16 +459,6 @@ class EncoderDecoder(pl.LightningModule):
         loss_per_patch = ((pred - target) ** 2).mean(dim=-1)    # (B, L)
         loss = (loss_per_patch * mask).sum() / mask.sum().clamp_min(1.0)
         return loss, pred, mask
-
-    
-    def create_batch_graphs(self,eeg_batch):
-        graph_list = []
-        for eeg, chn_list in eeg_batch:
-            g = self.graph_gen.create_graph(chn_list)
-            graph_list.append(g)
-        graph_batch = Batch(graph_list)
-        return graph_batch
-
 
     def patchify_1d(self, x, patch_size: int):
         """Segment the target eeg signal in patch and pad if necessary"""
@@ -521,5 +538,5 @@ class EncoderDecoder(pl.LightningModule):
 
 
 if __name__ == "__main__":
-    eeg = np.load("/Users/sadeghemami/paper_1_code/downstream/data/physionet/physionet300_0_1.npz")
-    print(eeg["x"].shape)
+    seed_everything(42)
+    L.seed_everything(42, workers=True)

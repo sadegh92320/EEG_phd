@@ -6,57 +6,52 @@ import numpy as np
 import os
 from scipy.io import loadmat
 import re
+from export_data.export_data_pretrain import ImportDataPre
+from pathlib import Path
 import torch
 import mne
 
 
-class ImportBCIComp2a(DataImport):
 
-    def get_config(self):
-        self.config = r"MAE_pretraining\info_dataset\bci_comp_2a.yaml"
+
+
+class ImportBCIComp2a(ImportDataPre):
+
+    def get_participant_number(self, file: Path):
+        participant_nb = int(file.name[1:3])
+        return participant_nb
     
-    def import_data(self):
-        data_eeg = []
-        path = "D:\EEG_data\pretraining\BCICIV_2a_gdf"
+    def condition_file_name(self, file):
+        if file.name.startswith("._"):
+            return True
 
-        for file in sorted(os.listdir(path)):
-            if not file.endswith(".gdf") or file.startswith("._"):
-                continue
-
-            gdf_path = os.path.join(path, file)
-
-            # Extract subject number (S10_Session_1.mat → 10)
-            participant_nb = int(file[1:3])
-
-            raw = mne.io.read_raw_gdf(gdf_path, preload=True)
-            raw = raw.get_data()
-
-            if raw.shape[0] != 25 and raw.shape[1] == 25:
-                    raw = raw.T
-            
-            data_eeg.append((participant_nb, raw[:22,:]))
-            
+        if file.suffix.lower() != ".gdf":
+            return True
         
-        return data_eeg
-    
-    def preprocessing(self):
-        preprocess_data = self.apply_preprocessing_pretrain()
-        data_splitted = []
-       
-        for p, d in preprocess_data:
-          
-            split_data = self.split_with_hops(data=d, participant=p,window_s=6, hop_s=0.5,
-                                                              sampling_rate=128, channels_expected=22)
-            zip_data = [(x[0], x[1]) for x in split_data]
-            data_splitted.extend(zip_data)
-        self.data = data_splitted
-    
-        return self
+        return False
+        
+    def get_config(self):
+        self.config = "MAE_pretraining/info_dataset/bci_comp_2a.yaml"
 
+    def _extract_trials(self, file_path):
+        """
+        Read one .mat file, preprocess each trial, return list of arrays (C, T).
+        """
+        
+        trials = []
+        raw = mne.io.read_raw_gdf(file_path, preload=True)
+        raw = raw.get_data()
+        
 
+        if raw.shape[0] != 25 and raw.shape[1] == 25:
+                raw = raw.T
 
+        raw = raw[:22,:]
+        raw = self.apply_preprocessing_pretrain(raw)
+        trials.append(raw)
+        return trials
 
 
 if __name__ == "__main__":
-    data_import = ImportBCIComp2a()
-    data_import().preprocessing().split_train_val().save_data_pretrain()
+    data_import = ImportBCIComp2a(num_chan=22)
+    data_import.import_data(input_dir="/Volumes/Elements/EEG_data/pretraining/BCICIV_2a_gdf",output_dir= "MAE_pretraining/data/bci_comp_2a")

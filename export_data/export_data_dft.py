@@ -39,14 +39,17 @@ class ImportDataDFT(ImportDataPre):
         with h5py.File(file_path, "r") as f:
                 y = np.array(f["y"])
                 eeg = y[:,1:33]
-                trials.append(eeg.T)
+                eeg = eeg.T
+                eeg = self.apply_preprocessing_pretrain(eeg)
+                trials.append(eeg)
         return trials
 
 
 
 
 if __name__ == "__main__":
-    pass
+    data_import = ImportDataDFT(num_chan=32)
+    data_import.import_data(input_dir="/Volumes/Elements/EEG_data/pretraining/EEGforSadegh/DFT", output_dir="MAE_pretraining/data/im_lab")
     
 
 

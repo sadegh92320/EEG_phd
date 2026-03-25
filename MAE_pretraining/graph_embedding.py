@@ -6,12 +6,30 @@ import networkx as nx
 import matplotlib.pyplot as plt
 import yaml
 
+
 class GraphDataset():
     def __init__(self):
         super().__init__()
         self.montage = mne.channels.make_standard_montage("standard_1005")
         self.pos = self.montage.get_positions()["ch_pos"]
         self.pos_dict = {k.lower(): torch.tensor(v, dtype=torch.float32) for k, v in self.pos.items()}
+        aliases = {
+            'cb1': 'poo7',
+            'cb2': 'poo8',
+            'cbz': 'pooz',
+            't3': 't7',    # Old 10-20 to 10-05 mapping
+            't4': 't8',
+            't5': 'p7',
+            't6': 'p8',
+            'm1': 'tp9',   # Mastoids
+            'm2': 'tp10'
+        }
+        
+        # Inject the aliases into our position dictionary
+        for alias, standard_name in aliases.items():
+            if standard_name in self.pos_dict:
+                self.pos_dict[alias] = self.pos_dict[standard_name]
+        
         self.created_graph = {}
 
     def create_graph(self, ch_names, radius, show_graph=False):
@@ -90,6 +108,7 @@ if __name__ == "__main__":
         config = yaml.safe_load(f)
     ch = config["channels_mapping"]
     data = GraphDataset()
-    data.create_graph(ch_names=ch, show_graph=False, radius=0.4)
+    data.create_graph(ch_names=ch, show_graph=True, radius=0.4)
+    
 
     

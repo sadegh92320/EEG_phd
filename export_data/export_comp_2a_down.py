@@ -112,7 +112,6 @@ class ImportBCIComp2a(ImportDataDownstream):
             )
 
             count = 0
-            print(file_tuples)
             for participant_nb, file_path in file_tuples:
                 print(f"[{split_name}] processing subject={participant_nb}, file={file_path.name}")
 
@@ -151,6 +150,20 @@ class ImportBCIComp2a(ImportDataDownstream):
             if x_ds is not None:
                 f.attrs["n_channels"] = x_ds.shape[1]
                 f.attrs["time_samples"] = x_ds.shape[2]
+
+    def apply_preprocessing(self, array):
+        """
+        Preprocessing for BCI-IV-2a downstream (keep at 250 Hz baseline).
+        Band-pass 0.1–124 Hz, notch 50/60 Hz, no resampling.
+        Per-model resampling happens in Downstream_Dataset at training time.
+        """
+        raw_mne_object = self.mne_process.create_mne_object(array, "dataset")
+        nyq = raw_mne_object.info["sfreq"] / 2.0
+        h_freq = min(128.0, nyq - 1.0)  # 124 Hz at 250 Hz source
+        raw_mne_object.filter(l_freq=0.1, h_freq=h_freq, method="iir")
+        raw_mne_object.notch_filter(freqs=50, method="iir")
+        raw_mne_object.notch_filter(freqs=60, method="iir")
+        return raw_mne_object.get_data()
 
     def condition(self, file: Path):
         if file.name.startswith("._"):
@@ -238,14 +251,12 @@ class ImportBCIComp2a(ImportDataDownstream):
             cue_codes = {7}
 
         if file_path.name.split(".")[0][-1] == "T":
-            print(events)
             cue_codes = {7,8,9,10}
 
         cue_positions = []
         rejected_positions = set()
 
         for event in events:
-            print(event)
             pos = int(event[0])
             code = int(event[2])
 
@@ -285,8 +296,6 @@ class ImportBCIComp2a(ImportDataDownstream):
                 continue
 
             eeg = data[:, start:end]
-            print("shape")
-            print(eeg.shape)
             eeg = self.apply_preprocessing(eeg)
 
             # Convert labels to 0..3 if they are 1..4
@@ -301,7 +310,7 @@ class ImportBCIComp2a(ImportDataDownstream):
     
 if __name__ == "__main__":
     dataimport = ImportBCIComp2a()
-    #dataimport.import_data(input_dir="/Users/sadeghemami/Downloads/BCICIV_2a_gdf", output_dir="downstream/data/bci_comp_2a")
+    dataimport.import_data(input_dir="/Volumes/Elements/EEG_data/pretraining/BCICIV_2a_gdf", output_dir="downstream/data/bci_comp_2a")
     with h5py.File("/Users/sadeghemami/paper_1_code/downstream/data/bci_comp_2a/train.h5", "r") as f:
         print(np.unique(f["participant"][:]))
 

@@ -89,7 +89,7 @@ def get_dataloader(config):
     data_loader_train = DataLoader(
         concat_ds_train,
         batch_sampler=train_sampler,
-        num_workers=7,          
+        num_workers=10,          
         pin_memory=True,
         persistent_workers=True,
     )
@@ -97,7 +97,7 @@ def get_dataloader(config):
     data_loader_valid = DataLoader(
         concat_ds_valid,
         batch_sampler=valid_sampler,
-        num_workers=7,           
+        num_workers=10,           
         pin_memory=True,
         persistent_workers=True,
     )    

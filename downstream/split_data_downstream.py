@@ -32,11 +32,13 @@ from torch.utils.data import Subset
 
 
 class DownstreamDataLoader:
-    def __init__(self, data_path, config, custom_dataset_class=None):
+    def __init__(self, data_path, config, custom_dataset_class=None, norm_mode="default", base_sfreq=256):
         random.seed(92)
         self.data_path = data_path
         self.config = config
         self.custom_dataset_class = custom_dataset_class
+        self.norm_mode = norm_mode  # per-model normalization key (e.g. "steegformer", "biot")
+        self.base_sfreq = base_sfreq  # baseline sampling rate of the stored data
 
         self.train_data_path = os.path.join(self.data_path, "train.h5")
         self.val_data_path = os.path.join(self.data_path, "val.h5")
@@ -211,6 +213,59 @@ class DownstreamDataLoader:
 
         return self.make_dataset(x, y, custom_dataset_class=self.custom_dataset_class)
 
+    # ─────────────────────────────────────────────────────────────
+    # Cross-subject split (ST-EEGFormer / CBraMod convention)
+    # ─────────────────────────────────────────────────────────────
+
+    def get_cross_subject_split(self, test_ratio=0.2, val_ratio=0.1, seed=42):
+        """
+        Cross-subject evaluation (ST-EEGFormer FACED protocol):
+        - 80% of SUBJECTS → train (further split into train/val)
+        - 20% of SUBJECTS → test
+        - No subject appears in more than one split.
+
+        This combines all data from train.h5 + val.h5 first
+        (since the export splits trials, not subjects).
+
+        Returns: (train_dataset, val_dataset, test_dataset)
+        """
+        # Load ALL data (combine trial-level splits back together)
+        x_all, y_all, part_all = self._load_all_data()
+
+        all_pids = np.unique(part_all)
+        rng = np.random.default_rng(seed)
+        rng.shuffle(all_pids)
+
+        n_test = max(1, int(round(len(all_pids) * test_ratio)))
+        n_val = max(1, int(round(len(all_pids) * val_ratio)))
+
+        test_pids = set(all_pids[:n_test].tolist())
+        val_pids = set(all_pids[n_test:n_test + n_val].tolist())
+        train_pids = set(all_pids[n_test + n_val:].tolist())
+
+        train_idx = np.array([i for i, p in enumerate(part_all) if p in train_pids])
+        val_idx = np.array([i for i, p in enumerate(part_all) if p in val_pids])
+        test_idx = np.array([i for i, p in enumerate(part_all) if p in test_pids])
+
+        print(f"  Cross-subject split: {len(train_pids)} train, {len(val_pids)} val, {len(test_pids)} test subjects")
+        print(f"  Samples: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
+
+        train_ds = self.make_dataset(x_all[train_idx], y_all[train_idx], custom_dataset_class=self.custom_dataset_class)
+        val_ds = self.make_dataset(x_all[val_idx], y_all[val_idx], custom_dataset_class=self.custom_dataset_class)
+        test_ds = self.make_dataset(x_all[test_idx], y_all[test_idx], custom_dataset_class=self.custom_dataset_class)
+
+        return train_ds, val_ds, test_ds
+
+    def _load_all_data(self):
+        """Load and merge all data from train.h5 + val.h5 into (x, y, participant) arrays."""
+        xs, ys, ps = [], [], []
+        for path in [self.train_data_path, self.val_data_path]:
+            with h5py.File(path, "r") as f:
+                xs.append(f["x"][:])
+                ys.append(f["y"][:])
+                ps.append(f["participant"][:])
+        return np.concatenate(xs), np.concatenate(ys), np.concatenate(ps)
+
     def get_per_subject_transfer(self):
         """
         Returns list of:
@@ -230,7 +285,7 @@ class DownstreamDataLoader:
 
     def make_dataset(self, x, y, custom_dataset_class):
         """Convert x, y arrays into a dataset."""
-        return custom_dataset_class(x, y, config_path = self.config)
+        return custom_dataset_class(x, y, config_path=self.config, norm_mode=self.norm_mode, base_sfreq=self.base_sfreq)
 
     
 

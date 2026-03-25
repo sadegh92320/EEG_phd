@@ -52,6 +52,7 @@ class ImportHGD(ImportDataPre):
                     
         if data.shape[0] != 128 and data.shape[1] == 128:
             data = data.T
+        data = self.apply_preprocessing_pretrain(data)
 
         trials.append(data)
 
@@ -59,7 +60,8 @@ class ImportHGD(ImportDataPre):
 
 
 if __name__ == "__main__":
-    pass
+    data_import = ImportHGD(num_chan=128)
+    data_import.import_data(input_dir="/Volumes/Elements/EEG_data/pretraining/HGD", output_dir="MAE_pretraining/data/hgd")
     
 
 

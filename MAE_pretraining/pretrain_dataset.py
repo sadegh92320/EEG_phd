@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import Dataset, Sampler, DistributedSampler, BatchSampler
 from pathlib import Path
 import math
+import h5py
 
 
 
@@ -344,7 +345,6 @@ class InterleavedDistributedBatchSampler(Sampler):
 
 
 
-
 class PretrainDataset(Dataset):
     def __init__(self, dataset_name, config, 
                  new_freq=None, resample=False, type = "train"):
@@ -402,13 +402,9 @@ class PretrainDataset(Dataset):
 
     def __getitem__(self, index):
         
-        path = self.file_paths[index]
-        try:
-            with np.load(path) as npz:
-                eeg = npz["x"]
-        except Exception as e:
-            print(f"\nCORRUPTED FILE FOUND: {path}")
-            raise e
+        
+        with h5py.File(self.datafolder, 'r') as f:
+            eeg = f["x"][index,:]
         
        
         if self.resample and (self.new_freq != self.old_freq):
@@ -424,3 +420,78 @@ class PretrainDataset(Dataset):
     def __len__(self):
        
         return len(self.file_paths)
+
+
+class PretrainDataset(Dataset):
+    def __init__(self, dataset_name, config, 
+                 new_freq=None, resample=False, type="train"):
+        super().__init__()
+        
+        self.dataset_name = dataset_name
+        self.resample = resample 
+        self.new_freq = new_freq
+
+        # Load Global Channel Config
+        with open(Path("MAE_pretraining/info_dataset/channel_info_red.yaml"), "r") as file:
+            self.channel_config = yaml.safe_load(file)
+
+        # Load Dataset-Specific Config
+        if config is None:
+             raise ValueError("config_path must be provided")
+             
+        with open(config, "r") as file:
+            self.config = yaml.safe_load(file)
+        
+        self.old_freq = self.config["frequency"] 
+        self.channel_list = self.config.get("channel_list", [])
+        self.channel_id = self.get_chan_idx()
+        self.channel_num = len(self.channel_id)
+        
+        # 1. DEFINE EXACT H5 PATH (Adjust the filename as needed based on your structure)
+        datafolder = Path(self.config["data_file"]) 
+        self.h5_file_path = datafolder / f"{type}.h5" # Make sure this points to the exact .h5 file
+        
+        # 2. GET LENGTH ONCE AND CLOSE
+        # We only open it briefly here to find out how many samples exist
+        with h5py.File(self.h5_file_path, 'r') as f:
+            self.num_samples = f["x"].shape[0]
+
+        # 3. SET H5 HANDLE TO NONE (It will be opened in __getitem__)
+        self.h5_file = None
+
+    def get_chan_idx(self):
+        # (Keep your existing implementation here)
+        channel_id = []
+        channel_list = [ch.lower() for ch in self.channel_list]
+        chan_map = {key.lower(): val for key,val in self.channel_config["channels_mapping"].items()}
+        for ch in channel_list:
+            idx = chan_map.get(ch)
+            if idx is None:
+                raise ValueError(f"Channel '{ch}' not found in general channel_info.yaml mapping.")
+            channel_id.append(idx)
+        return channel_id
+
+    def __len__(self):
+        # Return the actual number of rows in the HDF5 dataset
+        return self.num_samples
+
+    def __getitem__(self, index):
+        # 4. LAZY INITIALIZATION FOR MULTIPROCESSING
+        # Each DataLoader worker will hit this and open its own read-only file handle
+        if self.h5_file is None:
+            self.h5_file = h5py.File(self.h5_file_path, 'r')
+            self.dataset_x = self.h5_file["x"]
+        else:
+            raise Exception("no file")
+        
+        # Fetch the data using the open file handle (very fast)
+        eeg = self.dataset_x[index, :]
+        
+        # Preprocessing (Keep your existing implementation)
+        if self.resample and (self.new_freq != self.old_freq):
+            eeg = resample_eeg(eeg=eeg, previous_freq=self.old_freq, new_freq=self.new_freq)
+            
+        eeg = standardize_channel(eeg)
+        eeg = np.clip(eeg, -500, 500)
+        
+        return torch.from_numpy(eeg).float(), torch.tensor(self.channel_id, dtype=torch.long)

@@ -1,0 +1,49 @@
+name_dataset: faced
+
+channel_list:
+  - FP1
+  - FP2
+  - FZ
+  - F3
+  - F4
+  - F7
+  - F8
+  - FC1
+  - FC2
+  - FC5
+  - FC6
+  - CZ
+  - C3
+  - C4
+  - T7
+  - T8
+  - CP1
+  - CP2
+  - CP5
+  - CP6
+  - PZ
+  - P3
+  - P4
+  - P7
+  - P8
+  - PO3
+  - PO4
+  - OZ
+  - O1
+  - O2
+  - A1
+  - A2
+
+frequency: 256
+num_classes: 9
+
+emotion_labels:
+  0: Anger
+  1: Disgust
+  2: Fear
+  3: Sadness
+  4: Neutral
+  5: Amusement
+  6: Inspiration
+  7: Joy
+  8: Tenderness

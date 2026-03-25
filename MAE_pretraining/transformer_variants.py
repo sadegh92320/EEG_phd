@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 
 class RotaryEmbedding(nn.Module):
@@ -170,6 +171,47 @@ class MultiHeadAttentionViT(nn.Module):
         out = self.fc(out)
         out = self.proj_drop(out)
         return out
+
+
+class MultiHeadCrossAttention(nn.Module):
+    """Multi head attention module, takes the embedding dim and number of head."""
+    def __init__(self, embed_dim, num_heads = 3, proj_drop = 0.1, att_dropout = 0.1, qkv_bias = True):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.h = num_heads
+        self.dim_head = embed_dim//num_heads
+        self.k = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
+        self.q = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
+        self.v = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
+        self.fc = nn.Linear(embed_dim,embed_dim)
+        self.att_dropout = att_dropout
+        self.proj_drop = nn.Dropout(proj_drop)
+
+
+    def split_heads(self, X):
+        return X.view(X.size(0), X.size(1), self.h, self.dim_head).permute(0, 2, 1, 3)      
+
+    def forward(self, key, query, mask_pad = None):
+        #Compute Q, K and V and seperate segments per head
+
+        #Extract the query key value vectors each with shape
+        # B, num_head, num_patches, dim_head
+        k = self.k(key)
+        v = self.v(key)
+        q = self.q(query)
+        k = self.split_heads(k)
+        v = self.split_heads(v)
+        q = self.split_heads(q)
+
+        #Compute the attention score
+        out = torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask_pad, dropout_p=self.att_dropout if self.training else 0, is_causal=False)
+
+        out = out.transpose(1,2)
+        out = out.reshape(out.size(0), out.size(1), self.h*self.dim_head)
+        out = self.fc(out)
+        out = self.proj_drop(out)
+        return out
     
 
 
@@ -235,6 +277,25 @@ class TransformerLayerViT(nn.Module):
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
 
         return x
+    
+class CrossTransformerLayer(nn.Module):
+    def __init__(self, embed_dim, nhead, mlp_ratio = 4, qkv_bias = True,drop = 0, att_drop = 0, 
+                 drop_path = 0, act = nn.GELU, norm = nn.LayerNorm):
+        super().__init__()
+        self.attn = MultiHeadCrossAttention(embed_dim=embed_dim, num_heads=nhead, proj_drop=drop,
+                                               att_dropout=att_drop, qkv_bias=qkv_bias)
+        self.drop_path = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+        self.drop_path2 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+        self.norm1 = norm(embed_dim)
+        self.norm2 = norm(embed_dim)
+        hidden_size = int(embed_dim * mlp_ratio)
+        self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
+
+    def forward(self, query, key, mask_pad = None):
+        x = query + self.drop_path(self.attn(self.norm1(key), self.norm1(query), mask_pad))
+        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+
+        return x
 
 
 
@@ -268,3 +329,569 @@ class TransformerLayer(nn.Module):
         ff = self.dropout(self.linear2(self.dropout(self.activation(self.linear1(ff)))))
 
         return (Z + self.drop_path(ff))
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+
+class TimeAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads=3, dropout=0.1, att_dropout=0.1, is_causal=False):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.h = num_heads
+        self.dim_head = embed_dim // num_heads
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
+        self.fc = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.is_causal = is_causal
+        self.att_dropout = att_dropout
+
+    def split_heads(self, x):
+        return x.view(x.size(0), x.size(1), 3, self.h, self.dim_head).permute(2, 0, 3, 1, 4)
+
+    def forward(self, x, num_chan):
+        B, L, D = x.shape
+        assert L % num_chan == 0
+        N = L // num_chan
+
+        # (B, L, D) -> (B, N, C, D) -> (B*C, N, D)
+        x = rearrange(x, "b (n c) d -> b n c d", c=num_chan)
+        x = rearrange(x, "b n c d -> (b c) n d")
+
+        qkv = self.split_heads(self.qkv(x))
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        x = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.att_dropout if self.training else 0.0,
+            is_causal=self.is_causal
+        )
+
+        x = x.transpose(1, 2).reshape(x.size(0), x.size(2), self.h * self.dim_head)
+        x = self.fc(x)
+
+        # (B*C, N, D) -> (B, N, C, D) -> (B, L, D)
+        x = rearrange(x, "(b c) n d -> b n c d", b=B, c=num_chan)
+        x = rearrange(x, "b n c d -> b (n c) d")
+
+        return self.dropout(x)
+
+
+class SpaceAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads=3, dropout=0.1, att_dropout=0.1):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.h = num_heads
+        self.dim_head = embed_dim // num_heads
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
+        self.fc = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.att_dropout = att_dropout
+
+    def split_heads(self, x):
+        return x.view(x.size(0), x.size(1), 3, self.h, self.dim_head).permute(2, 0, 3, 1, 4)
+
+    def forward(self, x, num_chan):
+        B, L, D = x.shape
+        assert L % num_chan == 0
+        N = L // num_chan
+
+        # (B, L, D) -> (B, N, C, D) -> (B*N, C, D)
+        x = rearrange(x, "b (n c) d -> b n c d", c=num_chan)
+        x = rearrange(x, "b n c d -> (b n) c d")
+
+        qkv = self.split_heads(self.qkv(x))
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        score = (q @ k.transpose(-2, -1)) / (self.dim_head ** 0.5)
+        score = score.softmax(dim=-1)
+        attn = F.dropout(score, p=self.att_dropout, training=self.training)
+
+        out = attn @ v
+        out = out.transpose(1, 2).reshape(out.size(0), out.size(2), self.h * self.dim_head)
+        out = self.fc(out)
+
+        # (B*N, C, D) -> (B, N, C, D) -> (B, L, D)
+        out = rearrange(out, "(b n) c d -> b n c d", b=B, n=N)
+        out = rearrange(out, "b n c d -> b (n c) d")
+
+        return self.dropout(out)
+
+
+
+class CrissCrossTransformer(nn.Module):
+    def __init__(self, embed_dim, nhead, num_chan, mlp_ratio=4, drop=0.0, att_drop=0.0,
+                 drop_path=0.0, act=nn.GELU, norm=nn.LayerNorm):
+        super().__init__()
+        self.num_chan = num_chan
+
+        self.attn_time = TimeAttention(
+            embed_dim=embed_dim,
+            num_heads=nhead,
+            dropout=drop,
+            att_dropout=att_drop
+        )
+        self.attn_space = SpaceAttention(
+            embed_dim=embed_dim,
+            num_heads=nhead,
+            dropout=drop,
+            att_dropout=att_drop
+        )
+
+        self.drop_path1 = nn.Identity()
+        self.drop_path2 = nn.Identity()
+        self.drop_path3 = nn.Identity()
+
+        self.norm1 = norm(embed_dim)
+        self.norm2 = norm(embed_dim)
+        self.norm3 = norm(embed_dim)
+
+        hidden_size = int(embed_dim * mlp_ratio)
+        self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
+
+    def forward(self, x):
+        x = x + self.drop_path1(self.attn_time(self.norm1(x), self.num_chan))
+        x = x + self.drop_path2(self.attn_space(self.norm2(x), self.num_chan))
+        x = x + self.drop_path3(self.mlp(self.norm3(x)))
+        return x
+
+    
+def dist_spd(spd1, spd2):
+    pass
+
+
+# =============================================================================
+# Riemannian Attention Bias for Spatial Attention
+# =============================================================================
+#
+# Core idea: EEG channel relationships are fundamentally about covariance
+# structure, which lives on the SPD (Symmetric Positive Definite) manifold.
+# Standard dot-product attention treats channel interactions as Euclidean,
+# ignoring this geometry. We inject the Riemannian structure as an additive
+# bias to the spatial attention logits.
+#
+# Pipeline at each time step t:
+#   1. Given channel embeddings X_t ∈ R^{C×D}, compute the sample covariance:
+#        S_t = (1/D) X_t X_t^T + εI    (SPD matrix, C×C)
+#   2. Project to the tangent space at the identity via matrix logarithm:
+#        L_t = log(S_t)                 (symmetric matrix, C×C)
+#   3. Use L_t as an attention bias with per-head learned scaling:
+#        attention_logits = QK^T/√d + α_h · L_t
+#
+# Why this works:
+# - The matrix log maps SPD matrices to the tangent space where Euclidean
+#   operations become valid approximations of Riemannian operations
+# - L_t(i,j) encodes the log-domain correlation between channels i and j,
+#   respecting the manifold geometry (log-Euclidean metric)
+# - Per-head scaling lets each head decide how much geometric prior to use
+# - Initialized at α=0, so the model starts as standard attention and
+#   gradually learns to incorporate the Riemannian bias during training
+# =============================================================================
+
+
+class SPDLogMap(nn.Module):
+    """
+    Projects SPD matrices to the tangent space at identity via matrix logarithm.
+    Uses eigendecomposition: S = QΛQ^T → log(S) = Q log(Λ) Q^T
+
+    This is the Log-Euclidean projection, which is computationally efficient
+    and provides a good approximation of the full AIRM tangent space.
+    """
+    def __init__(self, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, S):
+        """
+        Args:
+            S: (..., C, C) batch of SPD matrices
+        Returns:
+            (..., C, C) batch of symmetric matrices in tangent space
+        """
+        # eigh is guaranteed to return real eigenvalues for symmetric input
+        # and is numerically more stable than eig for symmetric matrices
+        eigenvalues, eigenvectors = torch.linalg.eigh(S)
+
+        # Clamp eigenvalues for numerical stability (must stay positive for log)
+        eigenvalues = eigenvalues.clamp(min=self.eps)
+
+        # log in the eigenvalue domain
+        log_eigenvalues = torch.log(eigenvalues)
+
+        # Reconstruct: Q @ diag(log(λ)) @ Q^T
+        return eigenvectors @ torch.diag_embed(log_eigenvalues) @ eigenvectors.transpose(-2, -1)
+
+
+class RiemannianAttentionBias(nn.Module):
+    """
+    Computes a geometry-aware attention bias from channel embeddings.
+
+    At each time step, channel embeddings form a covariance matrix on the SPD
+    manifold. We project this to the tangent space and use it as an additive
+    bias to the attention logits, giving the model awareness of the Riemannian
+    structure of inter-channel relationships.
+
+    Args:
+        num_heads: Number of attention heads (each gets its own learned scale)
+        eps: Regularization for SPD matrix (ensures strict positive definiteness)
+    """
+    def __init__(self, num_heads, eps=1e-5):
+        super().__init__()
+        self.num_heads = num_heads
+        self.eps = eps
+        self.spd_log = SPDLogMap(eps=eps)
+
+        # Per-head learnable scaling — initialized to 0 so the model starts
+        # as standard Euclidean attention and learns to use the bias
+        self.head_scales = nn.Parameter(torch.zeros(num_heads))
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B*N, C, D) channel embeddings at each time step
+               B*N = batch_size * num_time_patches
+               C = number of channels
+               D = embedding dimension
+        Returns:
+            (B*N, num_heads, C, C) attention bias per head
+        """
+        BN, C, D = x.shape
+
+        # Step 1: Compute sample covariance → SPD matrix
+        # S = (1/D) X X^T + εI ∈ R^{C×C}
+        S = torch.bmm(x, x.transpose(-2, -1)) / D
+        S = S + self.eps * torch.eye(C, device=x.device, dtype=x.dtype).unsqueeze(0)
+
+        # Step 2: Project to tangent space via matrix log
+        L = self.spd_log(S)  # (B*N, C, C)
+
+        # Step 3: Per-head scaling
+        # head_scales: (num_heads,) → (1, num_heads, 1, 1)
+        scales = self.head_scales.view(1, self.num_heads, 1, 1)
+
+        # L: (B*N, C, C) → (B*N, 1, C, C) → broadcast to (B*N, num_heads, C, C)
+        bias = L.unsqueeze(1) * scales
+
+        return bias
+
+
+class RiemannianSpaceAttention(nn.Module):
+    """
+    Spatial attention with Riemannian bias.
+
+    Drop-in replacement for SpaceAttention. Adds a Riemannian attention bias
+    derived from the SPD manifold structure of channel covariances. The bias
+    is computed from the channel embeddings BEFORE the QKV projection, so it
+    captures the raw geometric structure of the input.
+
+    Args:
+        embed_dim: Total embedding dimension
+        num_heads: Number of attention heads
+        dropout: Output dropout probability
+        att_dropout: Attention weight dropout probability
+        eps: SPD regularization constant
+    """
+    def __init__(self, embed_dim, num_heads=3, dropout=0.1, att_dropout=0.1, eps=1e-5):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.h = num_heads
+        self.dim_head = embed_dim // num_heads
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
+        self.fc = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.att_dropout = att_dropout
+
+        # Riemannian bias module
+        self.riemannian_bias = RiemannianAttentionBias(num_heads=num_heads, eps=eps)
+
+    def split_heads(self, x):
+        return x.view(x.size(0), x.size(1), 3, self.h, self.dim_head).permute(2, 0, 3, 1, 4)
+
+    def forward(self, x, num_chan):
+        B, L, D = x.shape
+        assert L % num_chan == 0
+        N = L // num_chan
+
+        # Reshape: (B, N*C, D) → (B*N, C, D)
+        x = rearrange(x, "b (n c) d -> (b n) c d", c=num_chan)
+
+        # Compute Riemannian bias from raw embeddings (before QKV projection)
+        # This captures the geometric structure of the input, not the projected space
+        riem_bias = self.riemannian_bias(x)  # (B*N, num_heads, C, C)
+
+        # Standard QKV computation
+        qkv = self.split_heads(self.qkv(x))
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # Attention scores with Riemannian bias
+        score = (q @ k.transpose(-2, -1)) / (self.dim_head ** 0.5)
+        score = score + riem_bias  # Add geometric bias
+        score = score.softmax(dim=-1)
+        attn = F.dropout(score, p=self.att_dropout, training=self.training)
+
+        out = attn @ v
+        out = out.transpose(1, 2).reshape(out.size(0), out.size(2), self.h * self.dim_head)
+        out = self.fc(out)
+
+        # Reshape back: (B*N, C, D) → (B, N*C, D)
+        out = rearrange(out, "(b n) c d -> b (n c) d", b=B, n=N)
+
+        return self.dropout(out)
+
+
+class RiemannianCrissCrossTransformer(nn.Module):
+    """
+    Criss-Cross Transformer with Riemannian spatial attention.
+
+    Drop-in replacement for CrissCrossTransformer. Uses standard Euclidean
+    attention for the temporal dimension (where Riemannian geometry doesn't
+    apply) and Riemannian-biased attention for the spatial dimension (where
+    channel covariance structure is geometrically meaningful).
+
+    Args:
+        embed_dim: Total embedding dimension
+        nhead: Number of attention heads
+        num_chan: Number of EEG channels (needed for reshaping)
+        mlp_ratio: MLP hidden dimension ratio
+        drop: Dropout probability
+        att_drop: Attention dropout probability
+        drop_path: Stochastic depth probability
+        act: Activation function class
+        norm: Normalization layer class
+        spd_eps: Regularization for SPD computation
+    """
+    def __init__(self, embed_dim, nhead, mlp_ratio=4, drop=0.0, att_drop=0.0,
+                 drop_path=0.0, act=nn.GELU, norm=nn.LayerNorm, spd_eps=1e-5):
+        super().__init__()
+       
+
+        # Temporal attention stays Euclidean — temporal dynamics within a single
+        # channel are sequential, not covariance-structured
+        self.attn_time = TimeAttention(
+            embed_dim=embed_dim,
+            num_heads=nhead,
+            dropout=drop,
+            att_dropout=att_drop
+        )
+
+        # Spatial attention with Riemannian bias — this is where the manifold
+        # structure of channel covariances gets injected
+        self.attn_space = RiemannianSpaceAttention(
+            embed_dim=embed_dim,
+            num_heads=nhead,
+            dropout=drop,
+            att_dropout=att_drop,
+            eps=spd_eps
+        )
+
+        self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+        self.drop_path2 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+        self.drop_path3 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+
+        self.norm1 = norm(embed_dim)
+        self.norm2 = norm(embed_dim)
+        self.norm3 = norm(embed_dim)
+
+        hidden_size = int(embed_dim * mlp_ratio)
+        self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
+
+    def forward(self, x, num_chan):
+        x = x + self.drop_path1(self.attn_time(self.norm1(x), num_chan))
+        x = x + self.drop_path2(self.attn_space(self.norm2(x), num_chan))
+        x = x + self.drop_path3(self.mlp(self.norm3(x)))
+        return x
+    
+
+
+class RiemannianSpaceTransformer(nn.Module):
+    
+    def __init__(self, embed_dim, nhead, mlp_ratio=4, drop=0.0, att_drop=0.0,
+                 drop_path=0.0, act=nn.GELU, norm=nn.LayerNorm, spd_eps=1e-5):
+        super().__init__()
+       
+        # Spatial attention with Riemannian bias — this is where the manifold
+        # structure of channel covariances gets injected
+        self.attn_space = RiemannianSpaceAttention(
+            embed_dim=embed_dim,
+            num_heads=nhead,
+            dropout=drop,
+            att_dropout=att_drop,
+            eps=spd_eps
+        )
+
+        self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+        self.drop_path2 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+        
+        self.norm1 = norm(embed_dim)
+        self.norm2 = norm(embed_dim)
+       
+
+        hidden_size = int(embed_dim * mlp_ratio)
+        self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
+
+    def forward(self, x, num_chan):
+        
+        x = x + self.drop_path1(self.attn_space(self.norm1(x), num_chan))
+        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+        return x
+    
+class RiemannianTimeTransformer(nn.Module):
+    
+    def __init__(self, embed_dim, nhead, mlp_ratio=4, drop=0.0, att_drop=0.0,
+                 drop_path=0.0, act=nn.GELU, norm=nn.LayerNorm, spd_eps=1e-5):
+        super().__init__()
+       
+
+        # Temporal attention stays Euclidean — temporal dynamics within a single
+        # channel are sequential, not covariance-structured
+        self.attn_time = TimeAttention(
+            embed_dim=embed_dim,
+            num_heads=nhead,
+            dropout=drop,
+            att_dropout=att_drop
+        )
+
+      
+
+        self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+        self.drop_path2 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+       
+
+        self.norm1 = norm(embed_dim)
+        self.norm2 = norm(embed_dim)
+       
+
+        hidden_size = int(embed_dim * mlp_ratio)
+        self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
+
+    def forward(self, x, num_chan):
+        x = x + self.drop_path1(self.attn_time(self.norm1(x), num_chan))
+        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+        return x
+
+
+class RiemannianParallelAttention(nn.Module):
+    """
+    CBraMod-style parallel spatial-temporal attention with Riemannian bias.
+
+    A single QKV projection is shared. Heads are split in two:
+      - First half: temporal attention (B*C, N, D_half) — Euclidean
+      - Second half: spatial attention (B*N, C, D_half) — Riemannian-biased
+
+    Outputs are concatenated back to full dimension and projected.
+    """
+    def __init__(self, embed_dim, num_heads=8, dropout=0.1, att_dropout=0.1, spd_eps=1e-5):
+        super().__init__()
+        assert num_heads % 2 == 0, "num_heads must be even for parallel split"
+        assert embed_dim % num_heads == 0
+
+        self.num_heads = num_heads
+        self.heads_per_branch = num_heads // 2
+        self.dim_head = embed_dim // num_heads
+        self.embed_dim = embed_dim
+        self.half_dim = self.heads_per_branch * self.dim_head  # D // 2
+
+        # Shared QKV projection
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
+        # Output projection
+        self.fc = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.att_dropout = att_dropout
+
+        # Riemannian bias for spatial heads only
+        self.riemannian_bias = RiemannianAttentionBias(num_heads=self.heads_per_branch, eps=spd_eps)
+
+    def forward(self, x, num_chan):
+        B, L, D = x.shape
+        assert L % num_chan == 0
+        N = L // num_chan
+        H = self.num_heads
+        H2 = self.heads_per_branch
+        d = self.dim_head
+
+        # Shared QKV: (B, L, D) -> (B, L, 3*D)
+        qkv = self.qkv(x).reshape(B, L, 3, H, d).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, H, L, d)
+
+        # Split heads: first H2 for temporal, last H2 for spatial
+        q_t, q_s = q[:, :H2], q[:, H2:]  # (B, H2, L, d)
+        k_t, k_s = k[:, :H2], k[:, H2:]
+        v_t, v_s = v[:, :H2], v[:, H2:]
+
+        # ── Temporal attention (Euclidean) ──
+        # Reshape: (B, H2, N*C, d) -> (B, H2, N, C, d) -> (B*C, H2, N, d)
+        q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
+        k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
+        v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
+
+        out_t = F.scaled_dot_product_attention(
+            q_t, k_t, v_t,
+            dropout_p=self.att_dropout if self.training else 0.0,
+        )  # (B*C, H2, N, d)
+        # Back to (B, H2, N*C, d)
+        out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=num_chan)
+
+        # ── Spatial attention (Riemannian-biased) ──
+        # Reshape: (B, H2, N*C, d) -> (B*N, H2, C, d)
+        q_s = rearrange(q_s, 'b h (n c) d -> (b n) h c d', c=num_chan)
+        k_s = rearrange(k_s, 'b h (n c) d -> (b n) h c d', c=num_chan)
+        v_s = rearrange(v_s, 'b h (n c) d -> (b n) h c d', c=num_chan)
+
+        # Compute Riemannian bias from the input embeddings at each time step
+        x_space = rearrange(x, 'b (n c) d -> (b n) c d', c=num_chan)
+        riem_bias = self.riemannian_bias(x_space)  # (B*N, H2, C, C)
+
+        # Manual attention with Riemannian bias
+        score = (q_s @ k_s.transpose(-2, -1)) / (d ** 0.5)
+        score = score + riem_bias
+        score = score.softmax(dim=-1)
+        score = F.dropout(score, p=self.att_dropout, training=self.training)
+        out_s = score @ v_s  # (B*N, H2, C, d)
+
+        # Back to (B, H2, N*C, d)
+        out_s = rearrange(out_s, '(b n) h c d -> b h (n c) d', b=B, n=N)
+
+        # ── Concatenate heads and project ──
+        out = torch.cat([out_t, out_s], dim=1)  # (B, H, L, d)
+        out = rearrange(out, 'b h l d -> b l (h d)')
+        out = self.fc(out)
+        return self.dropout(out)
+
+
+class RiemannianParallelCrissCrossTransformer(nn.Module):
+    """
+    CBraMod-style transformer layer: parallel head-split spatial-temporal attention
+    with Riemannian bias on the spatial heads.
+
+    Unlike sequential (time→space) or separate (two encoder stacks), this fuses
+    spatial and temporal information at every layer through shared MLP processing
+    after parallel head-split attention.
+    """
+    def __init__(self, embed_dim, nhead=8, mlp_ratio=4, drop=0.0, att_drop=0.0,
+                 drop_path=0.0, act=nn.GELU, norm=nn.LayerNorm, spd_eps=1e-5):
+        super().__init__()
+
+        self.attn = RiemannianParallelAttention(
+            embed_dim=embed_dim,
+            num_heads=nhead,
+            dropout=drop,
+            att_dropout=att_drop,
+            spd_eps=spd_eps,
+        )
+
+        self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+        self.drop_path2 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+
+        self.norm1 = norm(embed_dim)
+        self.norm2 = norm(embed_dim)
+
+        hidden_size = int(embed_dim * mlp_ratio)
+        self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
+
+    def forward(self, x, num_chan):
+        x = x + self.drop_path1(self.attn(self.norm1(x), num_chan))
+        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+        return x

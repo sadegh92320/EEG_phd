@@ -63,6 +63,8 @@ channel_list:
   - Oz
   - O2
   - CB2
+  - M1
+  - M2
 
 frequency: 200
 

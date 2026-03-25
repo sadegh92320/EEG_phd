@@ -41,8 +41,10 @@ class ImportMIBCI(ImportDataPre):
         mat = loadmat(file_path, struct_as_record=False, squeeze_me=True)
         
         data = np.asarray(mat["eeg"].movement_left[:64,:], dtype=np.float32)
+        data = self.apply_preprocessing_pretrain(data)
         trials.append(data)
         data = np.asarray(mat["eeg"].movement_right[:64,:], dtype=np.float32)
+        data = self.apply_preprocessing_pretrain(data)
         trials.append(data)
 
         return trials
@@ -51,7 +53,8 @@ class ImportMIBCI(ImportDataPre):
 
 
 if __name__ == "__main__":
-    pass
+    data_import = ImportMIBCI(num_chan=64)
+    data_import.import_data(input_dir="/Volumes/Elements/EEG_data/pretraining/ EEG-MI-BCI", output_dir="MAE_pretraining/data/mi_bci")
     
 
 

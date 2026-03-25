@@ -22,10 +22,22 @@ import math
 from MAE_pretraining.graph_embedding import GraphDataset
 from MAE_pretraining.gnn import GATModel
 import random
+import os
 import torch.nn.init as init
 from timm.models.vision_transformer import PatchEmbed, Block
 from torch_geometric.data import Batch
 from MAE_pretraining.transformer_variants import TransformerLayerViT
+
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 channel_list = ["Fp1","Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]
@@ -63,7 +75,7 @@ class PatchEEG(nn.Module):
 class ChannelPositionalEmbed(nn.Module):
     def __init__(self, embedding_dim):
         super(ChannelPositionalEmbed, self).__init__()
-        self.channel_transformation = nn.Embedding(76, embedding_dim)
+        self.channel_transformation = nn.Embedding(144, embedding_dim)
         init.zeros_(self.channel_transformation.weight)
     def forward(self, channel_indices):
         channel_embeddings = self.channel_transformation(channel_indices)
@@ -326,7 +338,7 @@ class EncoderDecoder(pl.LightningModule):
         original = x
         N = x.shape[1]
         L = x.shape[1] * x.shape[2]
-        x = x.view(B,L,-1)
+        x = x.reshape(B,L,-1)
 
         #Define the embeddings
         if channel_list.dim() == 1:
@@ -342,8 +354,7 @@ class EncoderDecoder(pl.LightningModule):
             seq_idx = torch.arange(0, N, device=device, dtype=torch.long)  # use 0..Seq-1 (or 1..Seq if your ref does)
             eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
 
-            tp = self.temporal_embedding_e(eeg_seq_indices) if isinstance(self.temporal_embedding_e, TemporalPositionalEncoding) \
-            else self.temporal_embedding_e(seq_length=L, num_channel=C).to(device).expand(B, -1, -1)
+            tp = self.temporal_embedding_e(eeg_seq_indices) 
             x += tp
 
         #Mask the eeg patches
@@ -393,9 +404,7 @@ class EncoderDecoder(pl.LightningModule):
             seq_idx = torch.arange(0, N, device=device, dtype=torch.long)  # use 0..Seq-1 (or 1..Seq if your ref does)
             eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
 
-            tp = self.temporal_embedding_d(eeg_seq_indices) if isinstance(self.temporal_embedding_e, TemporalPositionalEncoding) \
-            else self.temporal_embedding_d(seq_length=L, num_channel=C).to(device).expand(B, -1, -1)
-
+            tp = self.temporal_embedding_d(eeg_seq_indices) 
             x = x + tp
 
         
@@ -521,11 +530,9 @@ class EncoderDecoder(pl.LightningModule):
 
 
 if __name__ == "__main__":
-    #data = np.load("data/PCTram/21/trial_60_0.npz")
-    #x = data["x"]
-    #x = torch.tensor(x, dtype=torch.float32)
-    #x = x.unsqueeze(0)
-    
+    seed_everything(42)
+    L.seed_everything(42, workers=True)
+
     model = EncoderDecoder()
     #data = EEGData(data_dir="MAE_pretraining/data_bis")
     ckpt = ModelCheckpoint(
