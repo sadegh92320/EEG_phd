@@ -178,10 +178,9 @@ class Pipeline:
                 callbacks=[TQDMProgressBar(refresh_rate=20), ckpt_callback],
                 log_every_n_steps=5,
                 logger=wandb_logger,
-                max_epochs=10,
+                max_epochs=200,
                 precision="16-mixed",
                 gradient_clip_val=1.0,
-                deterministic=True
             )
 
             trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
