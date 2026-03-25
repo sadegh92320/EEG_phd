@@ -149,7 +149,7 @@ class Pipeline:
 
         if pretrain:
             train_loader, valid_loader = self.import_data_pretrain()
-            model = GNNEncoderDecoder()
+            model = EncoderDecoder()
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
@@ -157,7 +157,7 @@ class Pipeline:
                     mode="min",
                     save_top_k=5,
                     save_last=True,
-                    filename="epoch{epoch}-gnn-{val_mse:.4f}",
+                    filename="epoch{epoch}-baseline-{val_mse:.4f}",
                 )
 
             wandb_logger = WandbLogger(
