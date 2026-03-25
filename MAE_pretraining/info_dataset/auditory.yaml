@@ -72,4 +72,4 @@ frequency: 1024
 
 num_participant: 85
 
-data_file: /content/eeg_data/auditory
+data_file: /content/eeg_data/KU
