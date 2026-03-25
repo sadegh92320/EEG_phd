@@ -914,15 +914,61 @@ class EEGPTClassifier(nn.Module):
     # def load_state_dict(self, state_dict, strict: bool = False):
     #     return super().load_state_dict(state_dict, strict)
 
+# Aliases from old 10-20 naming to EEGPT's codebook names
+_CHAN_ALIASES = {
+    "T3": "T7", "T4": "T8", "T5": "P7", "T6": "P8",
+    "A1": None, "A2": None,  # mastoid refs — not in codebook, skip
+}
+
+
+def _resolve_eegpt_channels(dataset_channel_list):
+    """
+    Given a dataset's channel_list (from its YAML), return the subset
+    that exists in EEGPT's 58-electrode codebook, with aliases resolved.
+
+    Returns list of channel names (upper-cased, matching CHANNEL_DICT keys).
+    """
+    resolved = []
+    for ch in dataset_channel_list:
+        name = ch.upper().strip()
+        # Apply alias if exists
+        if name in _CHAN_ALIASES:
+            name = _CHAN_ALIASES[name]
+            if name is None:
+                continue  # skip channels not in codebook (e.g. A1, A2)
+        if name in CHANNEL_DICT:
+            resolved.append(name)
+    return resolved
+
+
 class LitEEGPTModel(nn.Module):
 
-    def __init__(self, chans_num , num_class, data_length, load_path="../checkpoint/eegpt_mcae_58chs_4s_large4E.ckpt"):
-        super().__init__()    
-        self.chans_num = chans_num
+    def __init__(self, chans_num, num_class, data_length,
+                 load_path="../checkpoint/eegpt_mcae_58chs_4s_large4E.ckpt",
+                 dataset_channel_list=None):
+        super().__init__()
+        self.chans_num = chans_num          # dataset's channel count (e.g. 22 for BCI-2a)
         self.num_class = num_class
-        # init model
+
+        # Resolve which dataset channels exist in EEGPT's codebook
+        if dataset_channel_list is not None:
+            target_channels = _resolve_eegpt_channels(dataset_channel_list)
+        else:
+            # Fallback: standard 10-20 (19 channels)
+            target_channels = [
+                'FP1', 'FP2', 'F7', 'F3', 'FZ', 'F4', 'F8',
+                'T7', 'C3', 'CZ', 'C4', 'T8',
+                'P7', 'P3', 'PZ', 'P4', 'P8', 'O1', 'O2',
+            ]
+
+        self.proj_chans = len(target_channels)
+        self.target_channel_names = target_channels
+        print(f"  EEGPT: projecting {chans_num} dataset channels → "
+              f"{self.proj_chans} codebook channels: {target_channels}")
+
+        # Encoder sees proj_chans channels (the dataset's subset in EEGPT's codebook)
         target_encoder = EEGTransformer(
-            img_size=[self.chans_num, data_length],
+            img_size=[self.proj_chans, data_length],
             patch_size=32*2,
             embed_num=4,
             embed_dim=512,
@@ -933,44 +979,45 @@ class LitEEGPTModel(nn.Module):
             attn_drop_rate=0.0,
             drop_path_rate=0.0,
             init_std=0.02,
-            qkv_bias=True, 
+            qkv_bias=True,
             norm_layer=partial(nn.LayerNorm, eps=1e-6))
-            
+
         self.target_encoder = target_encoder
-        #self.chans_id       = target_encoder.prepare_chan_ids(use_channels_names)
-        
+
+        # Channel IDs from EEGPT's own 58-electrode codebook
+        self.register_buffer(
+            "chans_id",
+            target_encoder.prepare_chan_ids(target_channels),
+        )
+
         # -- load checkpoint
-        pretrain_ckpt = torch.load(load_path, map_location=torch.device('cpu'))
-        
+        pretrain_ckpt = torch.load(load_path, map_location=torch.device('cpu'), weights_only=False)
+
         target_encoder_stat = {}
-        for k,v in pretrain_ckpt['state_dict'].items():
+        for k, v in pretrain_ckpt['state_dict'].items():
             if k.startswith("target_encoder."):
-                target_encoder_stat[k[15:]]=v
-        
-                
+                target_encoder_stat[k[15:]] = v
+
         self.target_encoder.load_state_dict(target_encoder_stat)
 
-        self.chan_conv       = Conv1dWithConstraint(self.chans_num, self.chans_num, 1, max_norm=1)
-      
-        self.linear_probe1   =   LinearWithConstraint(2048, 16, max_norm=1)
-        self.linear_probe2   =   LinearWithConstraint(int(16*data_length/64), self.num_class, max_norm=0.25)
-       
-        self.drop           = torch.nn.Dropout(p=0.50)
-        
-        
-    def forward(self, x, chans_id):
+        # Adaptive spatial filter: map dataset channels → codebook channels
+        self.chan_conv = Conv1dWithConstraint(self.chans_num, self.proj_chans, 1, max_norm=1)
+
+        self.linear_probe1 = LinearWithConstraint(2048, 16, max_norm=1)
+        self.linear_probe2 = LinearWithConstraint(int(16 * data_length / 64), self.num_class, max_norm=0.25)
+
+        self.drop = torch.nn.Dropout(p=0.50)
+
+    def forward(self, x, chans_id=None):
+        # chans_id argument kept for API compatibility but ignored —
+        # we always use the internal codebook IDs resolved from the dataset.
         B, C, T = x.shape
-        input_chans = chans_id[0]
-        x = self.chan_conv(x)
+        x = self.chan_conv(x)                          # (B, dataset_chans, T) → (B, proj_chans, T)
         self.target_encoder.eval()
-        z = self.target_encoder(x, input_chans)
-        
+        z = self.target_encoder(x, self.chans_id)      # uses EEGPT's own channel IDs
         h = z.flatten(2)
-        
         h = self.linear_probe1(self.drop(h))
-        #print("l1:",h.shape)
         h = h.flatten(1)
-        #print("l1 flatten:",h.shape)
         h = self.linear_probe2(h)
         return h
     

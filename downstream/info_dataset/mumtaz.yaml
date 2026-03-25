@@ -22,6 +22,7 @@ channel_list:
   - O2
 
 frequency: 256
+data_unit: V   # MNE read_raw_edf → get_data() returns Volts
 num_classes: 2
 
 class_labels:

@@ -64,6 +64,7 @@ channel_list:
   - CP6
 
 frequency: 512
+data_unit: V   # MNE read_raw_gdf → get_data() returns Volts
 
 num_participant: 15
 

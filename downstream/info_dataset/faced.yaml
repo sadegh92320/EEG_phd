@@ -35,6 +35,7 @@ channel_list:
   - A2
 
 frequency: 256
+data_unit: uV  # Pickle files already preprocessed and scaled to µV
 num_classes: 9
 
 emotion_labels:

@@ -101,8 +101,8 @@ DATASET_CONFIGS = {
 # Model builders
 # ────────────────────────────────────────────────────────────────
 
-def buil_baseline(num_claases, checkpoint_path, num_channels, data_length, **kwargs):
-    model = Downstream(checkpoint_path=checkpoint_path, num_classes=num_claases)
+def buil_baseline(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
+    model = Downstream(checkpoint_path=checkpoint_path, num_classes=num_classes)
     return model
 
 def build_gnn_embedding(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
@@ -319,17 +319,27 @@ def build_eegpt(num_classes, checkpoint_path, num_channels, data_length, **kwarg
     We keep the paper's probe structure for both modes since modifying it
     would require changing the forward() method.
     """
+    import yaml
     from downstream.models.foundation_models.eegpt import LitEEGPTModel
 
     base_sfreq = kwargs.get("base_sfreq", 256)
     training_mode = kwargs.get("training_mode", "linear_probe")
+    config_yaml = kwargs.get("config_yaml", None)
     data_length = _resampled_length(data_length, base_sfreq, "eegpt")
+
+    # Read dataset's channel list from its YAML config
+    dataset_channel_list = None
+    if config_yaml is not None:
+        with open(config_yaml, "r") as f:
+            cfg = yaml.safe_load(f)
+        dataset_channel_list = cfg.get("channel_list", None)
 
     model = LitEEGPTModel(
         chans_num=num_channels,
         num_class=num_classes,
         data_length=data_length,
         load_path=checkpoint_path if checkpoint_path else "../checkpoint/eegpt_mcae_58chs_4s_large4E.ckpt",
+        dataset_channel_list=dataset_channel_list,
     )
 
     # Freeze encoder, only train linear probes + channel conv
@@ -575,6 +585,7 @@ def main():
         data_length=ds_cfg["data_length"],
         base_sfreq=ds_cfg["sampling_rate"],
         training_mode=args.training_mode,
+        config_yaml=ds_cfg["config_yaml"],
     )
 
     print(f"\n{'='*60}")

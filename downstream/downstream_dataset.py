@@ -16,7 +16,7 @@ MODEL_PREPROCESS_CONFIG = {
     "labram":       {"norm": {"method": "rescale", "scale": 1e-4},  "sfreq": 200},
     "biot":         {"norm": {"method": "percentile_95"},            "sfreq": 200},
     "cbramod":      {"norm": {"method": "rescale", "scale": 1e-4},  "sfreq": 200},
-    "eegpt":        {"norm": {"method": "rescale", "scale": 1e-3},  "sfreq": 256},
+    "eegpt":        {"norm": {"method": "rescale", "scale": 1e-3},  "sfreq": 256},  # µV → mV (V→µV conversion handled by data_unit flag)
     "bendr":        {"norm": {"method": "minmax_neg1_1"},            "sfreq": 256},
     # Classic NN baselines run at the baseline 256 Hz with z-standardization
     "default":      {"norm": {"method": "z_standardize"},            "sfreq": 256},
@@ -73,6 +73,11 @@ class Downstream_Dataset(Dataset):
         self.channel_list = self.config.get("channel_list", [])
         self.channel_id = self.get_chan_idx()
         self.channel_num = len(self.channel_id)
+
+        # Unit conversion: if data is stored in Volts, convert to µV
+        # so that model-specific rescaling (e.g. ×1e-3 for EEGPT = µV→mV) works as intended.
+        data_unit = self.config.get("data_unit", "uV")  # default assumes µV
+        self._v_to_uv = (data_unit.upper() == "V")
 
     def get_chan_idx(self):
         channel_id = []
@@ -140,11 +145,15 @@ class Downstream_Dataset(Dataset):
         if self.data_length is not None:
             trial_data = trial_data[:, :self.data_length]
 
+        # Convert Volts → µV if needed (before clipping and normalization)
+        if self._v_to_uv:
+            trial_data = trial_data * 1e6
+
         # Resample to model's native rate BEFORE normalization
         if self._needs_resample:
             trial_data = self._resample(trial_data)
 
-        trial_data = np.clip(trial_data, -500, 500)
+        trial_data = np.clip(trial_data, -500, 500)  # ±500 µV artifact rejection
 
         if self.normalize:
             trial_data = self._normalize(trial_data)

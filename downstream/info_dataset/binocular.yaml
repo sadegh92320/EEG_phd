@@ -67,6 +67,7 @@ channel_list:
   - I2
 
 frequency: 250
+data_unit: uV  # CSV source data already in µV
 
 num_participant: 35
 

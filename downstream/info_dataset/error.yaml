@@ -67,3 +67,4 @@ channel_list:
   - PO8
 
 frequency: 500
+data_unit: V   # MNE read_raw_brainvision → get_data() returns Volts

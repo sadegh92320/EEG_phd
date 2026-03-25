@@ -53,10 +53,12 @@ FIXED_HP = {
         "batch_size": 64,
         "optimizer": "adamw",
         "weight_decay": 0.05,        # Table F.2(b): 0.05
-        "num_epochs_cv": 2,        # Table F.2(b): 100
+        "num_epochs_cv": 2,          # Table F.2(b): 100
         "num_epochs_eval": 50,
         "warmup_epochs": 10,         # Table F.2(b): 10
         "label_smoothing": 0.1,      # Table F.2(b): 0.1
+        "scheduler": "cosine",       # cosine with warmup (ST-EEGFormer default)
+        "early_stopping_patience": 10,
     },
     "full": {  # Foundation model fine-tuning or baseline NN training from scratch
         "learning_rate": 5e-4,       # Table F.2(a)/F.5(a): 5e-4
@@ -67,6 +69,8 @@ FIXED_HP = {
         "num_epochs_eval": 100,
         "warmup_epochs": 10,         # Table F.2(a): 10
         "label_smoothing": 0.1,      # Table F.2(a): 0.1
+        "scheduler": "cosine",
+        "early_stopping_patience": 10,
     },
     "classic_nn": {  # Classic NN models (EEGNet, Conformer, CTNet, DeepConvNet)
         "learning_rate": 3e-3,       # Table F.10(a): 3e-3
@@ -77,6 +81,8 @@ FIXED_HP = {
         "num_epochs_eval": 100,
         "warmup_epochs": 10,         # Table F.10(a): 10
         "label_smoothing": 0.1,      # Table F.10(a): 0.1
+        "scheduler": "cosine",
+        "early_stopping_patience": 10,
     },
     "loo_finetune": {  # LOO Fine-Tune phase 2 (Table F.4)
         "learning_rate": 5e-5,       # Table F.4: 5e-5
@@ -87,7 +93,54 @@ FIXED_HP = {
         "num_epochs_eval": 50,
         "warmup_epochs": 5,          # Table F.4: 5
         "label_smoothing": 0.1,      # Table F.4: 0.1
+        "scheduler": "cosine",
+        "early_stopping_patience": 10,
     },
+}
+
+# ── Per-model HP overrides for linear_probe mode ──
+# Each paper has its own optimal training recipe.
+# These override FIXED_HP["linear_probe"] when model_name matches.
+# Keys not present here fall back to FIXED_HP["linear_probe"].
+MODEL_HP_OVERRIDES = {
+    "eegpt": {  # EEGPT paper: OneCycleLR, lower lr, no smoothing
+        "learning_rate": 4e-4,
+        "weight_decay": 0.01,
+        "label_smoothing": 0.0,
+        "scheduler": "onecycle",     # OneCycleLR stepped per batch
+        "warmup_epochs": 0,          # OneCycleLR handles its own warmup via pct_start
+        "num_epochs_eval": 100,
+        "early_stopping_patience": 30,
+    },
+    "cbramod": {  # CBraMod paper: similar recipe
+        "learning_rate": 1e-3,
+        "weight_decay": 0.01,
+        "label_smoothing": 0.0,
+        "scheduler": "onecycle",
+        "warmup_epochs": 0,
+        "num_epochs_eval": 100,
+        "early_stopping_patience": 30,
+    },
+    "labram": {  # LaBraM: from their released code
+        "learning_rate": 4e-4,
+        "weight_decay": 0.01,
+        "label_smoothing": 0.0,
+        "scheduler": "onecycle",
+        "warmup_epochs": 0,
+        "num_epochs_eval": 100,
+        "early_stopping_patience": 30,
+    },
+    "biot": {
+        "learning_rate": 1e-3,
+        "weight_decay": 0.01,
+        "label_smoothing": 0.0,
+        "scheduler": "onecycle",
+        "warmup_epochs": 0,
+        "num_epochs_eval": 100,
+        "early_stopping_patience": 30,
+    },
+    # steegformer: no override → uses FIXED_HP["linear_probe"] as-is (ST-EEGFormer paper settings)
+    # baseline/classic_nn: no override
 }
 
 def seed_worker(worker_id):
@@ -152,8 +205,11 @@ class TrainerDownstream:
         self._model_uses_channels = "channel_list" in sig.parameters
 
     def _get_hp(self):
-        """Get the fixed hyperparameters for the current training mode."""
-        return FIXED_HP[self.training_mode]
+        """Get hyperparameters: FIXED_HP base merged with per-model overrides."""
+        base = dict(FIXED_HP[self.training_mode])
+        if self.training_mode == "linear_probe" and self.model_name in MODEL_HP_OVERRIDES:
+            base.update(MODEL_HP_OVERRIDES[self.model_name])
+        return base
 
     def _build_loss_fn(self, label_smoothing=0.0):
         """Build loss function with optional label smoothing."""
@@ -163,29 +219,44 @@ class TrainerDownstream:
         return self.loss_fn
 
     @staticmethod
-    def _build_scheduler(optimizer, num_epochs, warmup_epochs=0):
+    def _build_scheduler(optimizer, num_epochs, warmup_epochs=0,
+                         scheduler_type="cosine", steps_per_epoch=None, max_lr=None):
         """
-        Build a cosine decay scheduler with optional linear warmup.
-        Following ST-EEGFormer: linear warmup → cosine annealing.
+        Build LR scheduler.
+        - "cosine": linear warmup → cosine annealing (ST-EEGFormer default), stepped per epoch.
+        - "onecycle": OneCycleLR (EEGPT/CBraMod/LaBraM), stepped per batch.
+        Returns (scheduler, step_per_batch: bool).
         """
+        if scheduler_type == "onecycle":
+            if steps_per_epoch is None or max_lr is None:
+                raise ValueError("OneCycleLR requires steps_per_epoch and max_lr")
+            sched = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=max_lr,
+                steps_per_epoch=steps_per_epoch,
+                epochs=num_epochs,
+                pct_start=0.2,
+            )
+            return sched, True  # step per batch
+
+        # Default: cosine with optional warmup (step per epoch)
         if warmup_epochs > 0:
-            # Linear warmup scheduler
             warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
                 optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_epochs
             )
-            # Cosine annealing for the remaining epochs
             cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=num_epochs - warmup_epochs, eta_min=1e-6
             )
-            return torch.optim.lr_scheduler.SequentialLR(
+            sched = torch.optim.lr_scheduler.SequentialLR(
                 optimizer,
                 schedulers=[warmup_scheduler, cosine_scheduler],
                 milestones=[warmup_epochs],
             )
         else:
-            return torch.optim.lr_scheduler.CosineAnnealingLR(
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=num_epochs, eta_min=1e-6
             )
+        return sched, False  # step per epoch
 
     
 
@@ -238,22 +309,23 @@ class TrainerDownstream:
         #model.load_state_dict(torch.load(PATH, weights_only=True))
         pass
         
-    def train_one_epoch(self, optimizer, loss_fn, model, dataloader):
+    def train_one_epoch(self, optimizer, loss_fn, model, dataloader, scheduler=None, step_per_batch=False):
         '''
         One epoch iteration of training.
         Supports two modes:
-          - "linear_probe": freeze encoder, only train fc head (foundation model)
+          - "linear_probe": freeze encoder, only train trainable modules
           - "full": train entire model end-to-end (baseline models)
         '''
         if self.training_mode == "linear_probe":
-            model.eval()
-            # Enable training for the classification head only
-            # Supports different head naming conventions across models
-            for name in ["head", "fc", "fc1", "classHead", "classification", "classifier"]:
-                head = getattr(model, name, None)
-                if head is not None:
-                    head.train()
-                    break
+            # Strategy: set everything to train mode first, then set eval only
+            # on children that are entirely frozen (have params but none trainable).
+            # This ensures parameterless modules like Dropout in the probe head
+            # stay in train mode, while frozen encoder blocks go to eval.
+            model.train()
+            for child in model.children():
+                child_params = list(child.parameters())
+                if child_params and not any(p.requires_grad for p in child_params):
+                    child.eval()
         else:
             model.train()
 
@@ -282,6 +354,11 @@ class TrainerDownstream:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+
+            # OneCycleLR steps per batch, not per epoch
+            if step_per_batch and scheduler is not None:
+                scheduler.step()
+
             loss_total = loss.item() + loss_total
         return loss_total/len(dataloader)
     
@@ -424,7 +501,7 @@ class TrainerDownstream:
         num_epochs = hp["num_epochs_cv"]
 
         for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(train_dataset)), all_labels)):
-            early_stopper = self.early_stopper(patience=10)
+            early_stopper = self.early_stopper(patience=hp.get("early_stopping_patience", 10))
             print("{:^100}".format(f"---Fold_{fold}---"))
 
             train_subs = Subset(train_dataset, train_idx)
@@ -441,18 +518,25 @@ class TrainerDownstream:
             self.optimizer_name = opt_name
             optimizer = self.build_optimizer(model, {"lr": learning_rate, "weight_decay": weight_decay})
             loss_fn = self._build_loss_fn(label_smoothing)
-            scheduler = self._build_scheduler(optimizer, num_epochs, warmup_epochs)
+            scheduler, step_per_batch = self._build_scheduler(
+                optimizer, num_epochs, warmup_epochs,
+                scheduler_type=hp.get("scheduler", "cosine"),
+                steps_per_epoch=len(train_loader),
+                max_lr=learning_rate,
+            )
 
             all_met = None
 
             for epoch in range(num_epochs):
-                loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn)
+                loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn,
+                                            scheduler=scheduler, step_per_batch=step_per_batch)
                 if epoch % 10 == 0:
                     print(f"Epoch: {epoch} - Loss: {loss}")
 
                 metrics = self.predict(model=model, dataloader=val_loader)
                 perf = metrics[self.config["metric"]]
-                scheduler.step()
+                if not step_per_batch:
+                    scheduler.step()
 
                 # Log to WandB with the trial number included
                 wandb.log({"acc": perf, "epoch": epoch, "fold": fold, "trial": trial.number})
@@ -525,7 +609,7 @@ class TrainerDownstream:
         )
 
         num_epochs = hp["num_epochs_cv"]
-        early_stopper = self.early_stopper(patience=10)
+        early_stopper = self.early_stopper(patience=hp.get("early_stopping_patience", 10))
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g, worker_init_fn=seed_worker)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
@@ -537,10 +621,16 @@ class TrainerDownstream:
         self.optimizer_name = opt_name
         optimizer = self.build_optimizer(model, {"lr": learning_rate, "weight_decay": weight_decay})
         loss_fn = self._build_loss_fn(label_smoothing)
-        scheduler = self._build_scheduler(optimizer, num_epochs, warmup_epochs)
+        scheduler, step_per_batch = self._build_scheduler(
+            optimizer, num_epochs, warmup_epochs,
+            scheduler_type=hp.get("scheduler", "cosine"),
+            steps_per_epoch=len(train_loader),
+            max_lr=learning_rate,
+        )
 
         for epoch in range(num_epochs):
-            loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn)
+            loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn,
+                                        scheduler=scheduler, step_per_batch=step_per_batch)
             if epoch % 10 == 0:
                 print(f"Epoch: {epoch} - Loss: {loss}")
 
@@ -548,7 +638,8 @@ class TrainerDownstream:
             perf = metrics[self.config["metric"]]
 
             wandb.log({"acc": perf, "epoch": epoch, "trial": trial.number})
-            scheduler.step()
+            if not step_per_batch:
+                scheduler.step()
 
             if early_stopper.should_stop(perf):
                 break
@@ -566,22 +657,23 @@ class TrainerDownstream:
         return best
     
     @time
-    def evaluate_model(self, learning_rate, opt_name,batch_size,num_epochs,train_dataset = None, val_dataset = None, test_dataset = None):
+    def evaluate_model(self, learning_rate, opt_name, batch_size, num_epochs, train_dataset=None, val_dataset=None, test_dataset=None):
         g = torch.Generator()
         g.manual_seed(42)
         hp = self._get_hp()
         weight_decay = hp["weight_decay"]
         warmup_epochs = hp.get("warmup_epochs", 0)
         label_smoothing = hp.get("label_smoothing", 0.0)
+        patience = hp.get("early_stopping_patience", 10)
 
-        early_stopper = self.early_stopper(patience=10)
+        early_stopper = self.early_stopper(patience=patience)
 
         # Create DataLoaders for this specific fold
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g, worker_init_fn=seed_worker)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
 
-        #Define the best model
+        # Define the best model
         best = -float("inf")
         model = deepcopy(self.model).to(self.device)
 
@@ -589,36 +681,39 @@ class TrainerDownstream:
         model.load_state_dict(self.initial_state)
         best_model = model.state_dict()
 
-        #Build the optimizer and define loss function
+        # Build the optimizer and define loss function
         self.optimizer_name = opt_name
         optimizer = self.build_optimizer(model, {"lr": learning_rate, "weight_decay": weight_decay})
         loss_fn = self._build_loss_fn(label_smoothing)
 
-        scheduler = self._build_scheduler(optimizer, num_epochs, warmup_epochs)
-            
-            #Loop through epochs
+        scheduler, step_per_batch = self._build_scheduler(
+            optimizer, num_epochs, warmup_epochs,
+            scheduler_type=hp.get("scheduler", "cosine"),
+            steps_per_epoch=len(train_loader),
+            max_lr=learning_rate,
+        )
+
+        # Loop through epochs
         for epoch in range(num_epochs):
-            #Train one epoch
-            loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn)
-            if epoch%10 == 0:
+            # Train one epoch
+            loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn,
+                                        scheduler=scheduler, step_per_batch=step_per_batch)
+            if epoch % 10 == 0:
                 print(f"Epoch: {epoch} - Loss: {loss}")
-                
-            #Get the metrics for validation set
+
+            # Get the metrics for validation set
             metrics = self.predict(model=model, dataloader=val_loader)
             perf = metrics[self.config["metric"]]
 
-                
-            #Retrieve the metric of interest (mostly accuracy)
-            perf = metrics[self.config["metric"]]
             wandb.log({"acc": perf, "epoch": epoch})
-            scheduler.step()
+            if not step_per_batch:
+                scheduler.step()
             if perf > best:
-                best  = perf
+                best = perf
                 best_model = deepcopy(model.state_dict())
             wandb.log({"acc_eval": perf, "epoch": epoch})
 
-                
-            #Stop training if the val accuracy has not improved for a while
+            # Stop training if the val accuracy has not improved for a while
             if early_stopper.should_stop(perf):
                 break
             #Report results to Optuna and prune if necessary
@@ -669,8 +764,8 @@ class TrainerDownstream:
             train_dataset = ConcatDataset([train_data_sub, val_data_sub])
             return self.tune_params_cv(folds=5, eval_scheme = "per_subject_cv" ,name_project=name_project,trial=trial, save=save, train_dataset=train_dataset)
         sampler = TPESampler(seed=42)
-        study = optuna.create_study(direction="maximize", sampler = sampler)
-        study.optimize(objective, n_trials=1)
+        #study = optuna.create_study(direction="maximize", sampler = sampler)
+        #study.optimize(objective, n_trials=1)
 
         # --- FINAL TEST EVALUATION RUN ---
         wandb.init(
@@ -682,13 +777,15 @@ class TrainerDownstream:
         )
         wandb.log({"evaluation_scheme": "per_subject", "participant_number": participant_number})
 
-        metrics_pop = self.evaluate_model(learning_rate=hp["learning_rate"], opt_name=hp["optimizer"], batch_size=hp["batch_size"], num_epochs=hp["num_epochs_eval"], train_dataset=train_data_sub, val_dataset=val_data_sub, test_dataset=test_data_pop)
-
-        wandb.log(self._metrics_to_wandb(metrics_pop, prefix="transfer"))
-
         metrics_sub = self.evaluate_model(learning_rate=hp["learning_rate"], opt_name=hp["optimizer"], batch_size=hp["batch_size"], num_epochs=hp["num_epochs_eval"], train_dataset=train_data_sub, val_dataset=val_data_sub, test_dataset=test_data_sub)
 
         wandb.log(self._metrics_to_wandb(metrics_sub, prefix="self"))
+
+        #metrics_pop = self.evaluate_model(learning_rate=hp["learning_rate"], opt_name=hp["optimizer"], batch_size=hp["batch_size"], num_epochs=hp["num_epochs_eval"], train_dataset=train_data_sub, val_dataset=val_data_sub, test_dataset=test_data_pop)
+
+        #wandb.log(self._metrics_to_wandb(metrics_pop, prefix="transfer"))
+
+       
         wandb.finish()
         
         
@@ -729,7 +826,8 @@ class TrainerDownstream:
         warmup_epochs = hp.get("warmup_epochs", 0)
         label_smoothing = hp.get("label_smoothing", 0.0)
 
-        early_stopper = self.early_stopper(patience=10)
+        patience = hp.get("early_stopping_patience", 10)
+        early_stopper = self.early_stopper(patience=patience)
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g, worker_init_fn=seed_worker)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
@@ -742,16 +840,23 @@ class TrainerDownstream:
         self.optimizer_name = opt_name
         optimizer = self.build_optimizer(model, {"lr": learning_rate, "weight_decay": hp["weight_decay"]})
         loss_fn = self._build_loss_fn(label_smoothing)
-        scheduler = self._build_scheduler(optimizer, num_epochs, warmup_epochs)
+        scheduler, step_per_batch = self._build_scheduler(
+            optimizer, num_epochs, warmup_epochs,
+            scheduler_type=hp.get("scheduler", "cosine"),
+            steps_per_epoch=len(train_loader),
+            max_lr=learning_rate,
+        )
 
         for epoch in range(num_epochs):
-            loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn)
+            loss = self.train_one_epoch(model=model, dataloader=train_loader, optimizer=optimizer, loss_fn=loss_fn,
+                                        scheduler=scheduler, step_per_batch=step_per_batch)
             if epoch % 10 == 0:
                 print(f"Epoch: {epoch} - Loss: {loss}")
 
             metrics = self.predict(model=model, dataloader=val_loader)
             perf = metrics[self.config["metric"]]
-            scheduler.step()
+            if not step_per_batch:
+                scheduler.step()
 
             if perf > best:
                 best = perf

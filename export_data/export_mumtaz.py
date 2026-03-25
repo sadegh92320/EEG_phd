@@ -55,7 +55,7 @@ def _normalize_ch_name(edf_name: str) -> str:
 
 # File name parsing
 _FILE_RE = re.compile(
-    r"^(H|MDD)\s+S(\d+)\s+(EC|EO|TASK)\.edf$", re.IGNORECASE
+    r"^(?:\d+_)?(H|MDD)\s+S(\d+)\s+(EC|EO|TASK)\.edf$", re.IGNORECASE
 )
 
 
@@ -277,7 +277,8 @@ class ImportMumtaz(DataImport):
 if __name__ == "__main__":
     data_import = ImportMumtaz()
     data_import.import_data_to_hdf5(
-        input_dir="/Volumes/Elements/EEG_data/downstream/mumtaz/4244171",
+        input_dir="/Users/sadeghemami/Downloads/4244171",
+        output_dir="downstream/data/mumtaz"
     )
     # Quick verification
     for split in ["train", "val"]:
