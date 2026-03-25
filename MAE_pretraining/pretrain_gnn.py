@@ -141,9 +141,9 @@ class TemporalPositionalEncoding(nn.Module):
 
 class GNNEncoderDecoder(pl.LightningModule):
     """Basic encoder decoder model following the ViT model"""
-    def __init__(self, config = None, use_rotary = False,num_channels = 64, 
-                 max_embedding = 2000, enc_dim = 512, dec_dim = 384, depth_e = 8, 
-                 depth_d = 4, mask_prob = 0.7, patch_size = 16, norm_pix_loss = False, use_graph = True):
+    def __init__(self, config = None, use_rotary = False,num_channels = 64,
+                 max_embedding = 2000, enc_dim = 512, dec_dim = 384, depth_e = 8,
+                 depth_d = 4, mask_prob = 0.7, patch_size = 16, norm_pix_loss = False):
         super().__init__()
 
         self.config = config
@@ -162,7 +162,6 @@ class GNNEncoderDecoder(pl.LightningModule):
         g = gnn_data.create_graph(ch_names=ordered_channels, radius=0.4)
         self.register_buffer("g_x", g.x)
         self.register_buffer("g_edge_index", g.edge_index)
-        self.use_graph = use_graph
         self.gnn_enc = GATModel(num_head=3, enc_dim=enc_dim)
         self.gnn_dec = GATModel(num_head=3, enc_dim=dec_dim)
 
@@ -184,10 +183,8 @@ class GNNEncoderDecoder(pl.LightningModule):
         self.num_channels = num_channels
         self.norm_enc = nn.LayerNorm(enc_dim)
         self.norm_dec = nn.LayerNorm(dec_dim)
-        
-        #Define the temporal and channel embeddings 
-        self.channel_embedding_e = ChannelPositionalEmbed(embedding_dim=enc_dim)
-        self.channel_embedding_d = ChannelPositionalEmbed(embedding_dim=dec_dim)
+
+        #Define the temporal embeddings (channel embeddings handled by GNN)
         self.temporal_embedding_d = TemporalPositionalEncoding(d_model=dec_dim, max_len=max_embedding)
         self.temporal_embedding_e = TemporalPositionalEncoding(d_model=enc_dim, max_len=max_embedding)
 
@@ -215,9 +212,6 @@ class GNNEncoderDecoder(pl.LightningModule):
 
         nn.init.normal_(self.class_token, std=0.02)
         nn.init.normal_(self.mask_token, std=0.02)
-
-        nn.init.normal_(self.channel_embedding_e.channel_transformation.weight, std=0.02)
-        nn.init.normal_(self.channel_embedding_d.channel_transformation.weight, std=0.02)
 
 
     def restore_seq(self, x, num_patches, id_restore):
@@ -362,20 +356,12 @@ class GNNEncoderDecoder(pl.LightningModule):
             
 
         
-        if not self.use_graph:
-            # (B, C) -> (B, 1, C) -> (B, N, C) -> (B, N*C)
-            chan_id = channel_list.unsqueeze(1).repeat(1, N, 1).view(B, L)
-            #(B,N*C,enc_dim)
-            chan_embedding = self.channel_embedding_e(chan_id)
-        else:
-            #Output of size (B,chan_total, enc)
-            g_device = Data(x=self.g_x, edge_index=self.g_edge_index)
-            chan_total = self.gnn_enc(g_device)
-            chan_total = chan_total[channel_list]
+        #GNN channel embedding
+        g_device = Data(x=self.g_x, edge_index=self.g_edge_index)
+        chan_total = self.gnn_enc(g_device)
+        chan_total = chan_total[channel_list]
+        chan_embedding = chan_total.unsqueeze(1).repeat(1,N,1,1).view(B,L,-1)
 
-            #(B,1,C,enc)
-            chan_embedding = chan_total.unsqueeze(1).repeat(1,N,1,1).view(B,L,-1)
-        
         x += chan_embedding 
 
         if not self.use_rotary:
@@ -423,19 +409,12 @@ class GNNEncoderDecoder(pl.LightningModule):
             channel_list = channel_list.unsqueeze(0).expand(B, -1) # Make it (B, C)
             
         
-        if not self.use_graph:
-           # (B, C) -> (B, 1, C) -> (B, N, C) -> (B, N*C)
-            chan_id = channel_list.unsqueeze(1).repeat(1, N, 1).view(B, L)
-            chan_embedding = self.channel_embedding_d(chan_id)
-        else:
-            #Output of size (B,chan_total, enc)
-            g_device = Data(x=self.g_x, edge_index=self.g_edge_index)
-            chan_total = self.gnn_dec(g_device)
-            chan_total = chan_total[channel_list]
+        #GNN channel embedding
+        g_device = Data(x=self.g_x, edge_index=self.g_edge_index)
+        chan_total = self.gnn_dec(g_device)
+        chan_total = chan_total[channel_list]
+        chan_embedding = chan_total.unsqueeze(1).repeat(1,N,1,1).view(B,L,-1)
 
-            #(B,1,C,enc)
-            chan_embedding = chan_total.unsqueeze(1).repeat(1,N,1,1).view(B,L,-1)
-        
         x = x + chan_embedding
 
         #Add the temporal embedding if the rotary embedding are not used
