@@ -485,8 +485,7 @@ class PretrainDataset(Dataset):
         if self.h5_file is None:
             self.h5_file = h5py.File(self.h5_file_path, 'r')
             self.dataset_x = self.h5_file["x"]
-        else:
-            raise Exception("no file")
+        
         
         # Fetch the data using the open file handle (very fast)
         eeg = self.dataset_x[index, :]
