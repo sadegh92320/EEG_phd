@@ -68,4 +68,4 @@ channel_list:
 
 frequency: 160
 
-data_file: /content/eeg_data/physionet
+data_file: /content/eeg_data/physio
