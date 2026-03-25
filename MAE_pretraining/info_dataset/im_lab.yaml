@@ -38,4 +38,4 @@ num_participant: 9
 
 frequency: 250
 
-data_file: MAE_pretraining/data/im_lab
+data_file: /content/eeg_data/im_lab

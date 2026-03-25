@@ -40,7 +40,7 @@ def get_chan_idx(channel_list, total):
         return channel_id
     
 if __name__ == "__main__":
-    with open("MAE_pretraining/info_dataset/channel_info_red.yaml") as f:
+    with open("MAE_pretraining/info_dataset/channel_info.yaml") as f:
         config = yaml.safe_load(f)
     ch = config["channels_mapping"]
 

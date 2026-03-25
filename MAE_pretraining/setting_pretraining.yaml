@@ -4,7 +4,6 @@ data_use:
   - hgd
   - seed2
   - eeg_mi_bci
-  - bci_comp_iv2a
   - bci_comp_iv2b
   - auditory
   - online

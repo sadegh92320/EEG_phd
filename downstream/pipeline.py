@@ -13,9 +13,9 @@ import numpy as np
 import optuna
 from process_data.preprocessing import Preprocessing
 from sklearn.model_selection import train_test_split
-#from MAE_pretraining.pretraining import EncoderDecoder
-#from MAE_pretraining.pretrain_gnn import EncoderDecoder
-from MAE_pretraining.pretraining_with_different_masking import EncoderDecoder
+from MAE_pretraining.bert_riemaniann_loss import RiemannLossBert
+from MAE_pretraining.pretrain_gnn import GNNEncoderDecoder
+from MAE_pretraining.pretraining import EncoderDecoder
 import random
 import torchvision
 from torch.utils.data import random_split
@@ -64,12 +64,8 @@ class Pipeline:
         self.data = None
         self.label = None
         self.pretraining = pretraining
-        self.encoder = None
         self.model = None
-        self.temporal_embedding = None
-        self.channel_embedding = None
-        self.class_token = None
-        self.patch = None
+        self.checkpoint_path = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
        
     #Change in the future be careful of different size samples 
@@ -145,24 +141,23 @@ class Pipeline:
 
     def load_encoder(self, pretrain=True):
         """
-        Load the encoder of the pretrained model and optionally pretrain the model if 
-        not done before.
+        Pretrain the MAE (EncoderDecoder) and return the checkpoint path
+        for downstream loading.
         """
         CKPT_DIR = self.config["lighting_CKPT_DIR"]
         os.makedirs(CKPT_DIR, exist_ok=True)
-        CKPT_PATH = os.path.join(CKPT_DIR, "best_test.ckpt")
 
         if pretrain:
             train_loader, valid_loader = self.import_data_pretrain()
             model = EncoderDecoder()
 
-            ckpt = ModelCheckpoint(
+            ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
                     monitor="val_mse",
                     mode="min",
                     save_top_k=5,
                     save_last=True,
-                    filename="epoch{epoch}-val_mse_multi_mask{val_mse:.4f}",
+                    filename="epoch{epoch}-baseline-{val_mse:.4f}",
                 )
 
             wandb_logger = WandbLogger(
@@ -180,7 +175,7 @@ class Pipeline:
             })
 
             trainer = Trainer(
-                callbacks=[TQDMProgressBar(refresh_rate=20), ckpt],
+                callbacks=[TQDMProgressBar(refresh_rate=20), ckpt_callback],
                 log_every_n_steps=5,
                 logger=wandb_logger,
                 max_epochs=10,
@@ -191,17 +186,21 @@ class Pipeline:
 
             trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
 
-        # Load trained weights
-        if pretrain or os.path.exists(CKPT_PATH):
-            model = EncoderDecoder.load_from_checkpoint(CKPT_PATH)
+            # Use the best checkpoint from this run
+            self.checkpoint_path = ckpt_callback.best_model_path
+            print(f"Best checkpoint: {self.checkpoint_path}")
         else:
-            model = EncoderDecoder()  # untrained model if no checkpoint available
-
-        self.encoder = model.encoder
-        self.temporal_embedding = model.temporal_embedding_e
-        self.channel_embedding = model.channel_embedding_e
-        self.class_token = model.class_token
-        self.patch = model.patch.patch
+            # Find the best existing checkpoint (or last.ckpt as fallback)
+            import glob
+            candidates = sorted(glob.glob(os.path.join(CKPT_DIR, "epoch*-baseline-*.ckpt")))
+            last_ckpt = os.path.join(CKPT_DIR, "last.ckpt")
+            if candidates:
+                self.checkpoint_path = candidates[-1]  # latest/best by filename sort
+            elif os.path.exists(last_ckpt):
+                self.checkpoint_path = last_ckpt
+            else:
+                print("WARNING: No checkpoint found. Downstream will use random weights.")
+                self.checkpoint_path = None
     
     def import_data(self):
         """get the raw data, process them, save them and input them in the dataset"""
@@ -216,12 +215,16 @@ class Pipeline:
         return self
     
     def load_downstream(self, pretrain=True):
-        """Load the downstream model using the encoder"""
+        """Load the downstream model using the pretrained checkpoint."""
         self.load_encoder(pretrain=pretrain)
         print("done loading encoder")
-        self.model = Downstream(encoder=self.encoder, temporal_embedding=self.temporal_embedding, path_eeg=self.patch,\
-                                channel_embedding=self.channel_embedding, class_token=self.class_token, \
-                                 enc_dim=1024, num_classes=self.config["num_classes"])
+        self.model = Downstream(
+            checkpoint_path=self.checkpoint_path,
+            enc_dim=512,       # must match EncoderDecoder default
+            depth_e=8,         # must match EncoderDecoder default
+            patch_size=16,     # must match EncoderDecoder default
+            num_classes=self.config["num_classes"],
+        )
         
     def get_data_downstream(self, evaluation_scheme):
         if evaluation_scheme == "population":
@@ -235,13 +238,11 @@ class Pipeline:
     
     def make_model(self):
             return Downstream(
-                encoder=self.encoder,
-                temporal_embedding=self.temporal_embedding,
-                path_eeg=self.patch,
-                channel_embedding=self.channel_embedding,
-                class_token=self.class_token,
-                enc_dim=768,
-                num_classes=self.config["num_classes"]
+                checkpoint_path=self.checkpoint_path,
+                enc_dim=512,       # must match EncoderDecoder default
+                depth_e=8,
+                patch_size=16,
+                num_classes=self.config["num_classes"],
             )
     
     def make_conv_model(self):

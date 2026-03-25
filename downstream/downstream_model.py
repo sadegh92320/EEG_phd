@@ -125,7 +125,15 @@ class Downstream(nn.Module):
         self.class_token.requires_grad = False
 
     def _load_pretrained(self, checkpoint_path):
-        """Load encoder weights from a full MAE checkpoint."""
+        """
+        Load encoder weights from a full MAE (EncoderDecoder) checkpoint.
+
+        Handles:
+          - Lightning checkpoints (state_dict under "state_dict" key)
+          - Key remapping: EncoderDecoder uses *_e suffix for encoder embeddings
+            (channel_embedding_e, temporal_embedding_e) but Downstream drops the suffix.
+          - Skips all decoder-related keys.
+        """
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
         if "model" in ckpt:
@@ -135,20 +143,46 @@ class Downstream(nn.Module):
         else:
             state_dict = ckpt
 
+        # ── Skip decoder keys ──
+        # EncoderDecoder keys to skip: decoder.*, encoder_decoder.*, mask_token,
+        # channel_embedding_d.*, temporal_embedding_d.*, norm_dec.*, fc.* (decoder proj)
+        SKIP_PREFIXES = (
+            "decoder.", "encoder_decoder.", "mask_token",
+            "channel_embedding_d.", "temporal_embedding_d.",
+            "norm_dec.", "fc.", "criterion.",
+        )
+
+        # ── Remap encoder embedding names ──
+        # EncoderDecoder: channel_embedding_e.* → Downstream: channel_embedding.*
+        # EncoderDecoder: temporal_embedding_e.* → Downstream: temporal_embedding.*
+        KEY_REMAP = {
+            "channel_embedding_e.": "channel_embedding.",
+            "temporal_embedding_e.": "temporal_embedding.",
+        }
+
         encoder_keys = {}
         for k, v in state_dict.items():
-            if any(prefix in k for prefix in ["decoder_", "mask_token", "dec_channel_emd", "dec_temporal_emd"]):
+            if any(k.startswith(p) or k == p for p in SKIP_PREFIXES):
                 continue
-            encoder_keys[k] = v
+
+            # Apply key remapping
+            new_k = k
+            for old_prefix, new_prefix in KEY_REMAP.items():
+                if k.startswith(old_prefix):
+                    new_k = new_prefix + k[len(old_prefix):]
+                    break
+
+            encoder_keys[new_k] = v
 
         missing, unexpected = self.load_state_dict(encoder_keys, strict=False)
 
+        # head/fc are expected to be missing (new classification head)
         missing_real = [k for k in missing if not k.startswith("fc") and not k.startswith("head")]
         if missing_real:
-            print(f" Missing encoder keys: {missing_real}")
+            print(f"  [Downstream] Missing encoder keys: {missing_real}")
         if unexpected:
-            print(f" Unexpected keys (ignored): {unexpected}")
-        print(f"Loaded pretrained encoder from {checkpoint_path}")
+            print(f"  [Downstream] Unexpected keys (ignored): {unexpected}")
+        print(f"  [Downstream] Loaded pretrained encoder from {checkpoint_path}")
 
     def _get_channel_embedding(self, channel_list, N, B, L):
         """Compute channel positional embedding. Override in subclasses for different novelties."""

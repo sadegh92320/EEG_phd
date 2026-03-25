@@ -134,4 +134,4 @@ frequency: 500
 
 num_participant: 20
 
-data_file: MAE_pretraining/data/hgd
+data_file: /content/eeg_data/hgd

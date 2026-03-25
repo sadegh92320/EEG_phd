@@ -69,6 +69,10 @@ def get_pretrain_dataset(datasetName, type):
     if datasetName == "mif":
         dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/LMI_F.yaml",
                                   new_freq=200)
+
+     if datasetName == "physionet":
+        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/physionet.yaml",
+                                  new_freq=200)
     if dataset == None:
         print(datasetName)
         raise ValueError("Please enter a correct dataset name")
@@ -357,7 +361,7 @@ class PretrainDataset(Dataset):
         self.new_freq = new_freq
 
         # Load Global Channel Config
-        with open(Path("MAE_pretraining/info_dataset/channel_info_red.yaml"), "r") as file:
+        with open(Path("MAE_pretraining/info_dataset/channel_info.yaml"), "r") as file:
             self.channel_config = yaml.safe_load(file)
 
         # Load Dataset-Specific Config
@@ -432,7 +436,7 @@ class PretrainDataset(Dataset):
         self.new_freq = new_freq
 
         # Load Global Channel Config
-        with open(Path("MAE_pretraining/info_dataset/channel_info_red.yaml"), "r") as file:
+        with open(Path("MAE_pretraining/info_dataset/channel_info.yaml"), "r") as file:
             self.channel_config = yaml.safe_load(file)
 
         # Load Dataset-Specific Config

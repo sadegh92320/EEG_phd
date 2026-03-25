@@ -71,4 +71,4 @@ num_participant: 52
 
 frequency: 512
 
-data_file: MAE_pretraining/data/eeg_mi_bci
+data_file: /content/eeg_data/mi_bci

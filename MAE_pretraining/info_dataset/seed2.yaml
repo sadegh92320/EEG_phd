@@ -70,4 +70,4 @@ frequency: 200
 
 num_participant: 20
 
-data_file: /content/eeg_data/seed2
+data_file: /content/eeg_data/seed

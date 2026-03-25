@@ -584,6 +584,22 @@ class STEEGFormerDownstream(nn.Module):
                 continue
             encoder_keys[k] = v
 
+        # Handle channel embedding size mismatch gracefully:
+        # Checkpoint may have fewer channels (e.g. 76 or 142) than the model (145).
+        # Copy the first N rows from checkpoint into the larger embedding.
+        ch_key = "enc_channel_emd.channel_transformation.weight"
+        if ch_key in encoder_keys:
+            ckpt_ch = encoder_keys[ch_key]
+            model_ch = self.state_dict()[ch_key]
+            if ckpt_ch.shape[0] != model_ch.shape[0]:
+                print(f"  [STEEGFormer] Channel embedding size mismatch: "
+                      f"checkpoint {ckpt_ch.shape[0]} vs model {model_ch.shape[0]}. "
+                      f"Copying first {ckpt_ch.shape[0]} rows.")
+                new_ch = model_ch.clone()  # starts at zeros
+                n = min(ckpt_ch.shape[0], model_ch.shape[0])
+                new_ch[:n] = ckpt_ch[:n]
+                encoder_keys[ch_key] = new_ch
+
         missing, unexpected = self.load_state_dict(encoder_keys, strict=False)
 
         # fc/head are expected to be missing (it's our new classification head)

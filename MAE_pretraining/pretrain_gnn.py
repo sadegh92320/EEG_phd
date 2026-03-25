@@ -151,7 +151,7 @@ class GNNEncoderDecoder(pl.LightningModule):
         self.dec_dim = dec_dim
         self.enc_dim = enc_dim
 
-        with open("MAE_pretraining/info_dataset/channel_info_red.yaml") as f:
+        with open("MAE_pretraining/info_dataset/channel_info.yaml") as f:
             config = yaml.safe_load(f)
         ch_total = config["channels_mapping"]
 

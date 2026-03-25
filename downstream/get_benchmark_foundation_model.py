@@ -131,13 +131,30 @@ def build_steegformer(num_classes, checkpoint_path, num_channels, data_length, *
     return model
 
 
+def _resampled_length(data_length, base_sfreq, model_name):
+    """
+    Compute the data_length the model will actually see after
+    Downstream_Dataset resamples from base_sfreq to the model's native rate.
+    """
+    from downstream.downstream_dataset import MODEL_PREPROCESS_CONFIG
+    target_sfreq = MODEL_PREPROCESS_CONFIG.get(model_name, MODEL_PREPROCESS_CONFIG["default"])["sfreq"]
+    if target_sfreq == base_sfreq:
+        return data_length
+    return int(round(data_length * target_sfreq / base_sfreq))
+
+
 def build_labram(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
     """
     LaBraM: BEiT-v2 style neural transformer.
     forward(x, input_chans) where x is (B, N_electrodes, n_patches, patch_size)
     and input_chans is channel indices for positional embedding.
+    Head is already a single Linear(200, num_classes) — proper linear probe.
     """
     from downstream.models.foundation_models.labram import NeuralTransformer
+
+    base_sfreq = kwargs.get("base_sfreq", 256)
+    training_mode = kwargs.get("training_mode", "linear_probe")
+    data_length = _resampled_length(data_length, base_sfreq, "labram")
 
     # LaBraM-base config: 200-dim embed, 200-size patches, depth=12
     model = NeuralTransformer(
@@ -177,10 +194,12 @@ def build_labram(num_classes, checkpoint_path, num_channels, data_length, **kwar
     # Reset classification head for the target task
     model.reset_classifier(num_classes)
 
-    # Freeze encoder, only train head
-    for name, p in model.named_parameters():
-        if "head" not in name:
-            p.requires_grad = False
+    if training_mode == "linear_probe":
+        # Freeze encoder, only train head (already Linear(200, num_classes))
+        for name, p in model.named_parameters():
+            if "head" not in name:
+                p.requires_grad = False
+    # else: all params trainable for fine-tuning
 
     return model
 
@@ -190,7 +209,9 @@ def build_biot(num_classes, checkpoint_path, num_channels, data_length, **kwargs
     BIOT: Linear-attention transformer with STFT-based patch embedding.
     forward(x) where x is (B, C, T).
     """
-    from downstream.models.foundation_models.biot import BIOTClassifier
+    from downstream.models.foundation_models.biot import BIOTClassifier, ClassificationHead
+
+    training_mode = kwargs.get("training_mode", "linear_probe")
 
     model = BIOTClassifier(
         input_eeg_channel=num_channels,
@@ -228,6 +249,19 @@ def build_biot(num_classes, checkpoint_path, num_channels, data_length, **kwargs
     for p in model.biot.parameters():
         p.requires_grad = False
 
+    if training_mode == "linear_probe":
+        # Replace paper's ELU+Linear head with standardized linear probe
+        # (original head preserved in ClassificationHead for fine-tuning)
+        model.classifier = nn.Sequential(
+            nn.LayerNorm(256),
+            nn.Linear(256, num_classes),
+        )
+    # else: keep paper's ClassificationHead (ELU + Linear)
+
+    if training_mode == "full":
+        for p in model.biot.parameters():
+            p.requires_grad = True
+
     return model
 
 
@@ -237,6 +271,10 @@ def build_cbramod(num_classes, checkpoint_path, num_channels, data_length, **kwa
     forward(x) where x is (B, C, T) — internally windows into patches of 200.
     """
     from downstream.models.foundation_models.cbramod import CBraModClassifier
+
+    base_sfreq = kwargs.get("base_sfreq", 256)
+    training_mode = kwargs.get("training_mode", "linear_probe")
+    data_length = _resampled_length(data_length, base_sfreq, "cbramod")
 
     # data_length must work with patch_size=200 (it unfolds with step=200)
     n_patches = data_length // 200
@@ -251,6 +289,22 @@ def build_cbramod(num_classes, checkpoint_path, num_channels, data_length, **kwa
     for p in model.backbone.parameters():
         p.requires_grad = False
 
+    if training_mode == "linear_probe":
+        # Replace the paper's MLP head (~14M params) with a standardized
+        # linear probe for fair comparison across all foundation models.
+        # Original head is preserved in CBraModClassifier for fine-tuning.
+        in_features = num_channels * n_patches * 200
+        model.feed_forward = nn.Sequential(
+            nn.LayerNorm(in_features),
+            nn.Linear(in_features, num_classes),
+        )
+    # else: keep the paper's original 3-layer MLP head for fine-tuning
+
+    if training_mode == "full":
+        # Unfreeze backbone for full fine-tuning
+        for p in model.backbone.parameters():
+            p.requires_grad = True
+
     return model
 
 
@@ -258,8 +312,18 @@ def build_eegpt(num_classes, checkpoint_path, num_channels, data_length, **kwarg
     """
     EEGPT: JEPA-based encoder with LitEEGPTModel wrapper.
     forward(x, chans_id) where x is (B, C, T).
+
+    EEGPT's published linear probe is a 2-layer design:
+        Linear(2048, 16) → flatten → Linear(16*data_length/64, num_class)
+    Total ~34K params — close enough to the other models' single-linear probes.
+    We keep the paper's probe structure for both modes since modifying it
+    would require changing the forward() method.
     """
     from downstream.models.foundation_models.eegpt import LitEEGPTModel
+
+    base_sfreq = kwargs.get("base_sfreq", 256)
+    training_mode = kwargs.get("training_mode", "linear_probe")
+    data_length = _resampled_length(data_length, base_sfreq, "eegpt")
 
     model = LitEEGPTModel(
         chans_num=num_channels,
@@ -271,6 +335,13 @@ def build_eegpt(num_classes, checkpoint_path, num_channels, data_length, **kwarg
     # Freeze encoder, only train linear probes + channel conv
     for p in model.target_encoder.parameters():
         p.requires_grad = False
+
+    # EEGPT's probe (Linear(2048,16) → Linear(~256, C)) is already small (~34K params).
+    # Paper's forward() has probe logic baked in, so we keep it as-is for linear_probe.
+    # For fine-tuning, unfreeze the encoder.
+    if training_mode == "full":
+        for p in model.target_encoder.parameters():
+            p.requires_grad = True
 
     return model
 
@@ -312,7 +383,7 @@ def run_population(model, model_name, loader, config):
         train_data=train_ds,
         val_data=val_ds,
         test_data=test_ds,
-        training_mode="linear_probe",
+        training_mode=config.get("training_mode", "linear_probe"),
     )
     trainer.run_population(name_project=f"{model_name}_population")
 
@@ -331,7 +402,7 @@ def run_per_subject(model, model_name, loader, config):
             batch_size=64,
             config=config,
             early_stopper=EarlyStopper,
-            training_mode="linear_probe",
+            training_mode=config.get("training_mode", "linear_probe"),
         )
         trainer.run_per_subject(
             name_project=f"{model_name}",
@@ -357,7 +428,7 @@ def run_loso_zero_shot(model, model_name, loader, config):
             batch_size=64,
             config=config,
             early_stopper=EarlyStopper,
-            training_mode="linear_probe",
+            training_mode=config.get("training_mode", "linear_probe"),
         )
         trainer.run_LOSO(
             participant_number=pid,
@@ -382,7 +453,7 @@ def run_loso_fine_tune(model, model_name, loader, config):
             batch_size=64,
             config=config,
             early_stopper=EarlyStopper,
-            training_mode="linear_probe",
+            training_mode=config.get("training_mode", "linear_probe"),
         )
         trainer.run_LOSO_fine_tune(
             participant_number=pid,
@@ -415,7 +486,7 @@ def run_cross_subject(model, model_name, loader, config):
         train_data=train_ds,
         val_data=val_ds,
         test_data=test_ds,
-        training_mode="linear_probe",
+        training_mode=config.get("training_mode", "linear_probe"),
     )
     trainer.run_population(name_project=f"{model_name}_cross_subject")
 
@@ -461,6 +532,12 @@ def main():
         help="Override default data path for the dataset.",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--training_mode", type=str, default="linear_probe",
+        choices=["linear_probe", "full"],
+        help="Training mode: 'linear_probe' uses standardized single-linear head, "
+             "'full' uses each paper's original classifier head.",
+    )
 
     args = parser.parse_args()
 
@@ -477,6 +554,7 @@ def main():
         "metric": ds_cfg["metric"],
         "model_path": ds_cfg["model_path"],
         "result_output": ds_cfg["result_output"],
+        "training_mode": args.training_mode,
     }
 
     # ── Data loader (with per-model normalization) ──
@@ -495,6 +573,8 @@ def main():
         checkpoint_path=args.checkpoint,
         num_channels=ds_cfg["num_channels"],
         data_length=ds_cfg["data_length"],
+        base_sfreq=ds_cfg["sampling_rate"],
+        training_mode=args.training_mode,
     )
 
     print(f"\n{'='*60}")
