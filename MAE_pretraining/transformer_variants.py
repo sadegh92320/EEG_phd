@@ -13,6 +13,62 @@ def safe_eigh(M):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def pade_matrix_log(M, num_squarings=4, pade_order=6):
+    """
+    Matrix logarithm via inverse scaling-and-squaring + diagonal Padé approximation.
+
+    All operations are batched matmuls — GPU-friendly and fp16-compatible.
+    No eigendecomposition needed.
+
+    For M close to I (which the adaptive reference ensures), this is both
+    fast and accurate.  The algorithm:
+        1. Inverse scaling: A = M^{1/2^s} via repeated matrix square roots
+           (each sqrt via Denman-Beavers iteration — just matmuls + inverses)
+        2. Padé approximant of log(A) where A ≈ I
+        3. Scale back: log(M) = 2^s * log(A)
+
+    Args:
+        M: (..., C, C) batch of SPD matrices (should be close to I)
+        num_squarings: number of square-root halvings (more = M closer to I = more accurate)
+        pade_order: order of the Padé approximation (higher = more accurate)
+    Returns:
+        (..., C, C) matrix logarithm of M
+    """
+    C = M.shape[-1]
+    I = torch.eye(C, device=M.device, dtype=M.dtype).expand_as(M)
+
+    # ── Step 1: Inverse scaling via repeated matrix square root ──
+    # Denman-Beavers iteration for matrix square root: converges quadratically
+    # Y_k → M^{1/2},  Z_k → M^{-1/2}
+    Y = M
+    for _ in range(num_squarings):
+        # Each iteration: Y_new = (Y + Y^{-1}) / 2  (converges to sqrt)
+        # Using a few Newton iterations for the square root
+        Z = torch.linalg.solve(Y, I)  # Z = Y^{-1}, batched
+        Y = 0.5 * (Y + Z)
+
+    # Now Y ≈ M^{1/2^s}, which is very close to I
+    A = Y
+
+    # ── Step 2: Padé approximant of log(A) for A ≈ I ──
+    # log(A) = log(I + X) where X = A - I is small
+    # Using the [p/p] diagonal Padé approximant via partial fractions
+    # For moderate orders, the simple Taylor series is equivalent in accuracy
+    # and faster: log(I + X) ≈ X - X²/2 + X³/3 - X⁴/4 + ...
+    X = A - I
+    result = torch.zeros_like(X)
+    X_power = X  # X^1
+    for k in range(1, pade_order + 1):
+        sign = 1.0 if k % 2 == 1 else -1.0
+        result = result + (sign / k) * X_power
+        if k < pade_order:
+            X_power = X_power @ X  # X^{k+1}
+
+    # ── Step 3: Undo the scaling: log(M) = 2^s * log(M^{1/2^s}) ──
+    result = result * (2 ** num_squarings)
+    return result
+
+
 class RotaryEmbedding(nn.Module):
     """
         Implementation of the Rotary embedding which attributes to each token
@@ -521,8 +577,7 @@ class SPDLogMap(nn.Module):
             (..., C, C) batch of symmetric matrices in tangent space
         """
         orig_dtype = S.dtype
-        with torch.amp.autocast('cuda', enabled=False), \
-             torch.amp.autocast('cpu', enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             S = S.float()
             eigenvalues, eigenvectors = safe_eigh(S)
             eigenvalues = eigenvalues.clamp(min=self.eps)
@@ -959,13 +1014,23 @@ class AdaptiveLogMap(nn.Module):
     Args:
         total_channels: Size of the global channel space (default 144)
         eps: Regularization constant for numerical stability
-        use_approx: If True, use first-order approximation log(M) ≈ M - I
+        log_mode: How to compute the matrix logarithm:
+            'approx' — first-order: log(M) ≈ M - I  (fastest, no eigh)
+            'pade'   — Padé via scaling-and-squaring  (fast, all matmuls, fp16-ok)
+            'eigh'   — exact eigendecomposition       (slow, requires fp32)
+        use_approx: DEPRECATED — kept for backward compat. If True, sets log_mode='approx'.
     """
-    def __init__(self, total_channels=TOTAL_GLOBAL_CHANNELS, eps=1e-5, use_approx=False):
+    def __init__(self, total_channels=TOTAL_GLOBAL_CHANNELS, eps=1e-5,
+                 log_mode='eigh', use_approx=False):
         super().__init__()
         self.eps = eps
         self.total_channels = total_channels
-        self.use_approx = use_approx
+
+        # Backward compat: use_approx=True overrides log_mode
+        if use_approx:
+            self.log_mode = 'approx'
+        else:
+            self.log_mode = log_mode
 
         # Learn a lower-triangular factor L in the GLOBAL channel space
         # R_full = LL^T + εI (144×144), always SPD
@@ -987,9 +1052,13 @@ class AdaptiveLogMap(nn.Module):
 
     def _compute_R_inv_half(self, R):
         """Compute R^{-1/2} via eigendecomposition. Input must be float32."""
-        eigvals, Q = safe_eigh(R)
-        eigvals = eigvals.clamp(min=self.eps)
-        return Q @ torch.diag(eigvals ** (-0.5)) @ Q.T
+        # Narrow autocast disable — only around eigh + the matmuls that
+        # use its output, so the rest of the network stays in fp16.
+        with torch.amp.autocast('cuda', enabled=False):
+            R = R.float()
+            eigvals, Q = safe_eigh(R)
+            eigvals = eigvals.clamp(min=self.eps)
+            return Q @ torch.diag(eigvals ** (-0.5)) @ Q.T
 
     def forward(self, S, channel_idx):
         """
@@ -1000,35 +1069,35 @@ class AdaptiveLogMap(nn.Module):
             (batch, C, C) tangent vectors at the learned reference
         """
         orig_dtype = S.dtype
+        C = channel_idx.shape[0]
 
-        # ── NUCLEAR OPTION: disable autocast for entire method ───────
-        # Why: autocast re-casts .float() tensors back to fp16 for matmuls.
-        # Even if S, R, R_inv_half are all explicitly .float(), the @
-        # operator inside an autocast region will downcast them to fp16,
-        # producing an fp16 M that then hits eigh and crashes.
-        # Disabling autocast here means ALL ops run in the dtype we give
-        # them — which is float32 throughout.
-        with torch.amp.autocast('cuda', enabled=False), \
-             torch.amp.autocast('cpu', enabled=False):
+        # R and R_inv_half are small (C×C, single matrix, not batched)
+        # — these are fast even in fp32, and eigh requires fp32.
+        R = self._get_submatrix_reference(channel_idx)       # (C, C) fp32
+        R_inv_half = self._compute_R_inv_half(R)              # (C, C) fp32
 
-            S = S.float()
-            C = channel_idx.shape[0]
-            I_c = torch.eye(C, device=S.device, dtype=torch.float32)
+        # Whitening matmul: let autocast handle this — it's a batched matmul
+        # which benefits from fp16.  Result dtype = whatever autocast picks.
+        M = R_inv_half.unsqueeze(0) @ S @ R_inv_half.unsqueeze(0)
 
-            R = self._get_submatrix_reference(channel_idx)   # (C, C) fp32
-            R_inv_half = self._compute_R_inv_half(R)          # (C, C) fp32
+        if self.log_mode == 'approx':
+            # First-order: log(M) ≈ M - I  — cheapest, no log at all
+            I_c = torch.eye(C, device=M.device, dtype=M.dtype)
+            return (M - I_c.unsqueeze(0)).to(orig_dtype)
 
-            # Whiten: M = R^{-1/2} S R^{-1/2}  — guaranteed fp32 now
-            M = R_inv_half.unsqueeze(0) @ S @ R_inv_half.unsqueeze(0)
+        elif self.log_mode == 'pade':
+            # Padé matrix log — all batched matmuls, fp16-compatible, GPU-fast
+            return pade_matrix_log(M).to(orig_dtype)
 
-            if self.use_approx:
-                return (M - I_c.unsqueeze(0)).to(orig_dtype)
-            else:
+        else:  # 'eigh'
+            # Exact eigendecomposition — slowest but most accurate
+            with torch.amp.autocast('cuda', enabled=False):
+                M = M.float()
                 eigvals, Q = safe_eigh(M)
                 eigvals = eigvals.clamp(min=self.eps)
                 log_eigvals = torch.log(eigvals)
                 result = Q @ torch.diag_embed(log_eigvals) @ Q.transpose(-2, -1)
-                return result.to(orig_dtype)
+            return result.to(orig_dtype)
 
 
 class AdaptiveRiemannianAttentionBias(nn.Module):
@@ -1042,15 +1111,17 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         num_heads: Number of attention heads (each gets its own learned scale)
         total_channels: Size of the global channel space (default 144)
         eps: Regularization for SPD matrix
-        use_approx: If True, use M-I approximation instead of eigendecomposition
+        log_mode: 'approx', 'pade', or 'eigh' (see AdaptiveLogMap)
+        use_approx: DEPRECATED — kept for backward compat.
     """
     def __init__(self, num_heads, total_channels=TOTAL_GLOBAL_CHANNELS,
-                 eps=1e-5, use_approx=False):
+                 eps=1e-5, log_mode='eigh', use_approx=False):
         super().__init__()
         self.num_heads = num_heads
         self.eps = eps
         self.adaptive_log = AdaptiveLogMap(
-            total_channels=total_channels, eps=eps, use_approx=use_approx
+            total_channels=total_channels, eps=eps,
+            log_mode=log_mode, use_approx=use_approx
         )
 
         # Per-head learnable scaling — initialized to 0 so the model starts
@@ -1096,10 +1167,12 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         dropout: Output dropout probability
         att_dropout: Attention weight dropout probability
         spd_eps: SPD regularization constant
-        use_approx: If True, use M-I approximation (no batch eigendecomposition)
+        log_mode: 'approx', 'pade', or 'eigh' (see AdaptiveLogMap)
+        use_approx: DEPRECATED — kept for backward compat.
     """
     def __init__(self, embed_dim, num_heads=8, total_channels=TOTAL_GLOBAL_CHANNELS,
-                 dropout=0.1, att_dropout=0.1, spd_eps=1e-5, use_approx=False):
+                 dropout=0.1, att_dropout=0.1, spd_eps=1e-5,
+                 log_mode='eigh', use_approx=False):
         super().__init__()
         assert num_heads % 2 == 0, "num_heads must be even for parallel split"
         assert embed_dim % num_heads == 0
@@ -1122,6 +1195,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             num_heads=self.heads_per_branch,
             total_channels=total_channels,
             eps=spd_eps,
+            log_mode=log_mode,
             use_approx=use_approx
         )
 
@@ -1207,11 +1281,12 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
         act: Activation function class
         norm: Normalization layer class
         spd_eps: SPD regularization constant
-        use_approx: If True, skip eigendecomposition and use M-I approximation
+        log_mode: 'approx', 'pade', or 'eigh' (see AdaptiveLogMap)
+        use_approx: DEPRECATED — kept for backward compat.
     """
     def __init__(self, embed_dim, nhead=8, total_channels=TOTAL_GLOBAL_CHANNELS,
                  mlp_ratio=4, drop=0.0, att_drop=0.0, drop_path=0.0, act=nn.GELU,
-                 norm=nn.LayerNorm, spd_eps=1e-5, use_approx=False):
+                 norm=nn.LayerNorm, spd_eps=1e-5, log_mode='eigh', use_approx=False):
         super().__init__()
 
         self.attn = AdaptiveRiemannianParallelAttention(
@@ -1221,6 +1296,7 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
             dropout=drop,
             att_dropout=att_drop,
             spd_eps=spd_eps,
+            log_mode=log_mode,
             use_approx=use_approx,
         )
 

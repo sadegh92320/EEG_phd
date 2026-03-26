@@ -14,6 +14,7 @@ import optuna
 from process_data.preprocessing import Preprocessing
 from sklearn.model_selection import train_test_split
 from MAE_pretraining.bert_riemaniann_loss import RiemannLossBert
+from MAE_pretraining.bert_parallel_approx_riemann import ApproxAdaptiveRiemannBert
 from MAE_pretraining.pretrain_gnn import GNNEncoderDecoder
 from MAE_pretraining.bert_parallel_adaptive_riemann import AdaptiveRiemannBert
 from MAE_pretraining.pretraining import EncoderDecoder
@@ -151,7 +152,7 @@ class Pipeline:
         if pretrain:
             print("pretrain")
             train_loader, valid_loader = self.import_data_pretrain()
-            model = AdaptiveRiemannBert()
+            model = ApproxAdaptiveRiemannBert()
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,

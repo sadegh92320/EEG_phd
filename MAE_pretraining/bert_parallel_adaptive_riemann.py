@@ -130,11 +130,13 @@ class AdaptiveRiemannBert(pl.LightningModule):
         self.num_channels = num_channels
 
         # Adaptive Riemannian parallel transformer layers
-        # use_approx=False → full eigendecomposition for matrix log
+        # log_mode='pade' → Padé matrix log via scaling-and-squaring (all matmuls,
+        #   GPU-fast, fp16-compatible, no eigendecomposition)
+        # Alternatives: 'eigh' (exact but slow), 'approx' (M-I, fastest)
         # No num_channels needed — reference lives in global 144-channel space
         self.encoder = nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
-                enc_dim, nhead=8, mlp_ratio=4, use_approx=False
+                enc_dim, nhead=8, mlp_ratio=4, log_mode='pade'
             ) for _ in range(depth_e)
         ])
 
