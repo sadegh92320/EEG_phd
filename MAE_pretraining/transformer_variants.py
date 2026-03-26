@@ -504,6 +504,7 @@ class SPDLogMap(nn.Module):
         super().__init__()
         self.eps = eps
 
+    @torch.amp.custom_fwd(device_type='cuda', cast_to=torch.float32)
     def forward(self, S):
         """
         Args:
@@ -513,10 +514,7 @@ class SPDLogMap(nn.Module):
         """
         # eigh is guaranteed to return real eigenvalues for symmetric input
         # and is numerically more stable than eig for symmetric matrices
-        # Cast to float32 — eigh is not implemented for half precision on CUDA
-        orig_dtype = S.dtype
-        S_f32 = S.float()
-        eigenvalues, eigenvectors = torch.linalg.eigh(S_f32)
+        eigenvalues, eigenvectors = torch.linalg.eigh(S)
 
         # Clamp eigenvalues for numerical stability (must stay positive for log)
         eigenvalues = eigenvalues.clamp(min=self.eps)
@@ -525,8 +523,7 @@ class SPDLogMap(nn.Module):
         log_eigenvalues = torch.log(eigenvalues)
 
         # Reconstruct: Q @ diag(log(λ)) @ Q^T
-        result = eigenvectors @ torch.diag_embed(log_eigenvalues) @ eigenvectors.transpose(-2, -1)
-        return result.to(orig_dtype)
+        return eigenvectors @ torch.diag_embed(log_eigenvalues) @ eigenvectors.transpose(-2, -1)
 
 
 class RiemannianAttentionBias(nn.Module):
@@ -990,15 +987,13 @@ class AdaptiveLogMap(nn.Module):
         return R
 
     def _compute_R_inv_half(self, R):
-        """Compute R^{-1/2} via eigendecomposition of R (single C×C matrix)."""
-        # Cast to float32 — eigh is not implemented for half precision on CUDA
-        orig_dtype = R.dtype
-        R_f32 = R.float()
-        eigvals, Q = torch.linalg.eigh(R_f32)
+        """Compute R^{-1/2} via eigendecomposition of R (single C×C matrix).
+        Expects float32 input (forward handles the casting)."""
+        eigvals, Q = torch.linalg.eigh(R)
         eigvals = eigvals.clamp(min=self.eps)
-        result = Q @ torch.diag(eigvals ** (-0.5)) @ Q.T
-        return result.to(orig_dtype)
+        return Q @ torch.diag(eigvals ** (-0.5)) @ Q.T
 
+    @torch.amp.custom_fwd(device_type='cuda', cast_to=torch.float32)
     def forward(self, S, channel_idx):
         """
         Args:
@@ -1006,6 +1001,9 @@ class AdaptiveLogMap(nn.Module):
             channel_idx: (C,) long tensor — global channel indices for this batch
         Returns:
             (batch, C, C) tangent vectors at the learned reference
+
+        Note: @custom_fwd forces all float inputs to float32 and returns float32.
+              The caller's autocast context will handle casting the output back.
         """
         C = channel_idx.shape[0]
         I_c = torch.eye(C, device=S.device, dtype=S.dtype)
@@ -1022,14 +1020,10 @@ class AdaptiveLogMap(nn.Module):
             return M - I_c.unsqueeze(0)
         else:
             # Full matrix logarithm via eigendecomposition
-            # Cast to float32 — eigh is not implemented for half precision on CUDA
-            orig_dtype = M.dtype
-            M_f32 = M.float()
-            eigvals, Q = torch.linalg.eigh(M_f32)
+            eigvals, Q = torch.linalg.eigh(M)
             eigvals = eigvals.clamp(min=self.eps)
             log_eigvals = torch.log(eigvals)
-            result = Q @ torch.diag_embed(log_eigvals) @ Q.transpose(-2, -1)
-            return result.to(orig_dtype)
+            return Q @ torch.diag_embed(log_eigvals) @ Q.transpose(-2, -1)
 
 
 class AdaptiveRiemannianAttentionBias(nn.Module):
