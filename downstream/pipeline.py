@@ -149,7 +149,7 @@ class Pipeline:
 
         if pretrain:
             train_loader, valid_loader = self.import_data_pretrain()
-            model = EncoderDecoder()
+            model = GNNEncoderDecoder()
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
@@ -183,7 +183,7 @@ class Pipeline:
                 gradient_clip_val=1.0,
             )
 
-            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
+            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader, ckpt_path="/Users/sadeghemami/Library/CloudStorage/GoogleDrive-semami92320@gmail.com/My Drive/checkpoints_pretraining/last-v4.ckpt")
 
             # Use the best checkpoint from this run
             self.checkpoint_path = ckpt_callback.best_model_path
