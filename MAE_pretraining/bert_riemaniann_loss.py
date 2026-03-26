@@ -207,11 +207,12 @@ class RiemannLossBert(pl.LightningModule):
             # Compute channel covariance (B, C, C)
             S = torch.bmm(x_pool.transpose(-1, -2), x_pool) / self.enc_dim
             # Project to tangent space via matrix log
-            # .float() because eigh has no fp16/bf16 CUDA kernel
-            S_f32 = S.float()
-            eigvals, Q = torch.linalg.eigh(S_f32)
-            eigvals = eigvals.clamp(min=1e-7)
-            S_log = Q @ torch.diag_embed(torch.log(eigvals)) @ Q.transpose(-1, -2)
+            with torch.amp.autocast('cuda', enabled=False), \
+                 torch.amp.autocast('cpu', enabled=False):
+                S_f32 = S.float()
+                eigvals, Q = torch.linalg.eigh(S_f32)
+                eigvals = eigvals.clamp(min=1e-7)
+                S_log = Q @ torch.diag_embed(torch.log(eigvals)) @ Q.transpose(-1, -2)
             S_log = S_log.to(S.dtype)
             if prev_spd is not None:
                 d = (S_log - prev_spd).norm(p='fro', dim=(-2, -1)).mean()
