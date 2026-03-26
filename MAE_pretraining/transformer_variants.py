@@ -993,7 +993,6 @@ class AdaptiveLogMap(nn.Module):
         eigvals = eigvals.clamp(min=self.eps)
         return Q @ torch.diag(eigvals ** (-0.5)) @ Q.T
 
-    @torch.amp.custom_fwd(device_type='cuda', cast_to=torch.float32)
     def forward(self, S, channel_idx):
         """
         Args:
@@ -1001,29 +1000,35 @@ class AdaptiveLogMap(nn.Module):
             channel_idx: (C,) long tensor — global channel indices for this batch
         Returns:
             (batch, C, C) tangent vectors at the learned reference
-
-        Note: @custom_fwd forces all float inputs to float32 and returns float32.
-              The caller's autocast context will handle casting the output back.
         """
-        C = channel_idx.shape[0]
-        I_c = torch.eye(C, device=S.device, dtype=S.dtype)
+        # ── Force entire Riemannian pipeline to float32 ──────────────
+        # eigh / matrix log are numerically sensitive and have no half-precision
+        # CUDA kernel. We upcast once here, compute everything in fp32, and
+        # cast back at the end so the rest of the network stays in mixed precision.
+        orig_dtype = S.dtype
+        S = S.float()
 
-        # Extract C×C reference for these channels
-        R = self._get_submatrix_reference(channel_idx)   # (C, C)
-        R_inv_half = self._compute_R_inv_half(R)          # (C, C)
+        C = channel_idx.shape[0]
+        I_c = torch.eye(C, device=S.device, dtype=torch.float32)
+
+        # Extract C×C reference for these channels (L_factor is fp32 param)
+        with torch.amp.autocast('cuda', enabled=False):
+            R = self._get_submatrix_reference(channel_idx)   # (C, C) fp32
+            R_inv_half = self._compute_R_inv_half(R)          # (C, C) fp32
 
         # Whiten relative to reference: M = R^{-1/2} S R^{-1/2}
         M = R_inv_half.unsqueeze(0) @ S @ R_inv_half.unsqueeze(0)  # (batch, C, C)
 
         if self.use_approx:
             # First-order approximation: log(M) ≈ M - I
-            return M - I_c.unsqueeze(0)
+            return (M - I_c.unsqueeze(0)).to(orig_dtype)
         else:
             # Full matrix logarithm via eigendecomposition
             eigvals, Q = torch.linalg.eigh(M)
             eigvals = eigvals.clamp(min=self.eps)
             log_eigvals = torch.log(eigvals)
-            return Q @ torch.diag_embed(log_eigvals) @ Q.transpose(-2, -1)
+            result = Q @ torch.diag_embed(log_eigvals) @ Q.transpose(-2, -1)
+            return result.to(orig_dtype)
 
 
 class AdaptiveRiemannianAttentionBias(nn.Module):
