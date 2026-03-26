@@ -148,6 +148,7 @@ class Pipeline:
         os.makedirs(CKPT_DIR, exist_ok=True)
 
         if pretrain:
+            print("pretrain")
             train_loader, valid_loader = self.import_data_pretrain()
             model = GNNEncoderDecoder()
 
