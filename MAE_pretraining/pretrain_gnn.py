@@ -184,7 +184,11 @@ class GNNEncoderDecoder(pl.LightningModule):
         self.norm_enc = nn.LayerNorm(enc_dim)
         self.norm_dec = nn.LayerNorm(dec_dim)
 
-        #Define the temporal embeddings (channel embeddings handled by GNN)
+        #Define the temporal and channel embeddings
+        # Note: channel_embedding_e/d are kept for checkpoint compatibility
+        # but are NOT used in forward — GNN handles channel embeddings.
+        self.channel_embedding_e = ChannelPositionalEmbed(embedding_dim=enc_dim)
+        self.channel_embedding_d = ChannelPositionalEmbed(embedding_dim=dec_dim)
         self.temporal_embedding_d = TemporalPositionalEncoding(d_model=dec_dim, max_len=max_embedding)
         self.temporal_embedding_e = TemporalPositionalEncoding(d_model=enc_dim, max_len=max_embedding)
 
@@ -212,6 +216,9 @@ class GNNEncoderDecoder(pl.LightningModule):
 
         nn.init.normal_(self.class_token, std=0.02)
         nn.init.normal_(self.mask_token, std=0.02)
+
+        nn.init.normal_(self.channel_embedding_e.channel_transformation.weight, std=0.02)
+        nn.init.normal_(self.channel_embedding_d.channel_transformation.weight, std=0.02)
 
 
     def restore_seq(self, x, num_patches, id_restore):
