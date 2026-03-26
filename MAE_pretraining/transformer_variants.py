@@ -521,12 +521,13 @@ class SPDLogMap(nn.Module):
             (..., C, C) batch of symmetric matrices in tangent space
         """
         orig_dtype = S.dtype
-        S = S.float()  # eigh has no fp16 CUDA kernel
-
-        eigenvalues, eigenvectors = safe_eigh(S)
-        eigenvalues = eigenvalues.clamp(min=self.eps)
-        log_eigenvalues = torch.log(eigenvalues)
-        result = eigenvectors @ torch.diag_embed(log_eigenvalues) @ eigenvectors.transpose(-2, -1)
+        with torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False):
+            S = S.float()
+            eigenvalues, eigenvectors = safe_eigh(S)
+            eigenvalues = eigenvalues.clamp(min=self.eps)
+            log_eigenvalues = torch.log(eigenvalues)
+            result = eigenvectors @ torch.diag_embed(log_eigenvalues) @ eigenvectors.transpose(-2, -1)
         return result.to(orig_dtype)
 
 
@@ -998,32 +999,36 @@ class AdaptiveLogMap(nn.Module):
         Returns:
             (batch, C, C) tangent vectors at the learned reference
         """
-        # ── Force entire Riemannian pipeline to float32 ──────────────
-        # eigh has no fp16/bf16 CUDA kernel, and matrix log is numerically
-        # sensitive. We cast everything to fp32 explicitly (not relying on
-        # autocast context managers or decorators, which don't help when
-        # Lightning has already cast nn.Parameters to half).
         orig_dtype = S.dtype
-        S = S.float()
 
-        C = channel_idx.shape[0]
-        I_c = torch.eye(C, device=S.device, dtype=torch.float32)
+        # ── NUCLEAR OPTION: disable autocast for entire method ───────
+        # Why: autocast re-casts .float() tensors back to fp16 for matmuls.
+        # Even if S, R, R_inv_half are all explicitly .float(), the @
+        # operator inside an autocast region will downcast them to fp16,
+        # producing an fp16 M that then hits eigh and crashes.
+        # Disabling autocast here means ALL ops run in the dtype we give
+        # them — which is float32 throughout.
+        with torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False):
 
-        # Both methods now explicitly return fp32
-        R = self._get_submatrix_reference(channel_idx)   # (C, C) fp32
-        R_inv_half = self._compute_R_inv_half(R)          # (C, C) fp32
+            S = S.float()
+            C = channel_idx.shape[0]
+            I_c = torch.eye(C, device=S.device, dtype=torch.float32)
 
-        # Whiten: M = R^{-1/2} S R^{-1/2}  — all fp32
-        M = R_inv_half.unsqueeze(0) @ S @ R_inv_half.unsqueeze(0)
+            R = self._get_submatrix_reference(channel_idx)   # (C, C) fp32
+            R_inv_half = self._compute_R_inv_half(R)          # (C, C) fp32
 
-        if self.use_approx:
-            return (M - I_c.unsqueeze(0)).to(orig_dtype)
-        else:
-            eigvals, Q = safe_eigh(M)
-            eigvals = eigvals.clamp(min=self.eps)
-            log_eigvals = torch.log(eigvals)
-            result = Q @ torch.diag_embed(log_eigvals) @ Q.transpose(-2, -1)
-            return result.to(orig_dtype)
+            # Whiten: M = R^{-1/2} S R^{-1/2}  — guaranteed fp32 now
+            M = R_inv_half.unsqueeze(0) @ S @ R_inv_half.unsqueeze(0)
+
+            if self.use_approx:
+                return (M - I_c.unsqueeze(0)).to(orig_dtype)
+            else:
+                eigvals, Q = safe_eigh(M)
+                eigvals = eigvals.clamp(min=self.eps)
+                log_eigvals = torch.log(eigvals)
+                result = Q @ torch.diag_embed(log_eigvals) @ Q.transpose(-2, -1)
+                return result.to(orig_dtype)
 
 
 class AdaptiveRiemannianAttentionBias(nn.Module):
