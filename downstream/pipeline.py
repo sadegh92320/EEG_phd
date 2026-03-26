@@ -15,6 +15,7 @@ from process_data.preprocessing import Preprocessing
 from sklearn.model_selection import train_test_split
 from MAE_pretraining.bert_riemaniann_loss import RiemannLossBert
 from MAE_pretraining.pretrain_gnn import GNNEncoderDecoder
+from MAE_pretraining.bert_parallel_adaptive_riemann import AdaptiveRiemannBert
 from MAE_pretraining.pretraining import EncoderDecoder
 import random
 import torchvision
@@ -150,7 +151,7 @@ class Pipeline:
         if pretrain:
             print("pretrain")
             train_loader, valid_loader = self.import_data_pretrain()
-            model = GNNEncoderDecoder()
+            model = AdaptiveRiemannBert()
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
@@ -158,12 +159,12 @@ class Pipeline:
                     mode="min",
                     save_top_k=5,
                     save_last=True,
-                    filename="epoch{epoch}-gnn-{val_mse:.4f}",
+                    filename="epoch{epoch}-riemann-{val_mse:.4f}",
                 )
 
             wandb_logger = WandbLogger(
                 project="eeg_foundation_model",
-                name="gnn",
+                name="riemann",
                 log_model="all"
             )
             wandb_logger.experiment.config.update({
@@ -184,7 +185,7 @@ class Pipeline:
                 gradient_clip_val=1.0,
             )
 
-            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader, ckpt_path="/content/drive/MyDrive/checkpoints_pretraining/last-v4.ckpt")
+            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
 
             # Use the best checkpoint from this run
             self.checkpoint_path = ckpt_callback.best_model_path

@@ -895,3 +895,343 @@ class RiemannianParallelCrissCrossTransformer(nn.Module):
         x = x + self.drop_path1(self.attn(self.norm1(x), num_chan))
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
         return x
+
+
+# =============================================================================
+# Improved Riemannian Attention: Adaptive Reference + Residual Stream Bias
+# =============================================================================
+#
+# Two improvements over the original Riemannian attention bias:
+#
+# 1. ADAPTIVE LOG MAP: Instead of projecting to the tangent space at the
+#    identity matrix I (Log-Euclidean), we learn a reference point R on the
+#    SPD manifold. The log map at R is:
+#        Log_R(S) = log(R^{-1/2} S R^{-1/2})
+#    This captures *deviations* from the learned typical covariance, rather
+#    than absolute covariance.
+#
+#    VARIABLE CHANNEL SUPPORT: The reference R_full is stored in the GLOBAL
+#    channel space (144×144, covering all possible EEG channels). At forward
+#    time, the batch provides channel indices and we extract the C×C submatrix
+#    R = R_full[idx, :][:, idx]. This means:
+#    - Different batches can have different numbers of channels
+#    - R learns the covariance geometry across ALL channels globally
+#    - Each batch just takes the relevant slice
+#
+#    R_full is parameterized via a Cholesky factor L where R = LL^T + εI,
+#    guaranteeing R stays SPD. Initialized at L=I so R≈I at init.
+#
+# 2. RESIDUAL STREAM BIAS: The Riemannian bias is computed from the residual
+#    stream (pre-LayerNorm) rather than the normalized input. LayerNorm
+#    destroys per-channel variance information that is critical for the
+#    covariance structure on the SPD manifold. By using the residual stream,
+#    we preserve the full scale+correlation geometry.
+#
+# Additionally, a first-order approximation mode is available:
+#    log(M) ≈ M - I    (valid when M is close to I)
+# This avoids eigendecomposition entirely. The adaptive reference R makes
+# this approximation more accurate by bringing M = R^{-1/2} S R^{-1/2}
+# closer to I as R adapts to the data distribution.
+# =============================================================================
+
+# Total number of channels in the global mapping (channel_info.yaml)
+TOTAL_GLOBAL_CHANNELS = 144
+
+
+class AdaptiveLogMap(nn.Module):
+    """
+    Log map at a learned reference point on the SPD manifold, supporting
+    variable channel counts across batches.
+
+    The reference R_full lives in the global channel space (144×144). At
+    forward time, channel indices select the relevant C×C submatrix. This
+    allows different batches to have different channel counts while sharing
+    a single learned geometric reference.
+
+    Math: Log_R(S) = log(R^{-1/2} S R^{-1/2})
+
+    Args:
+        total_channels: Size of the global channel space (default 144)
+        eps: Regularization constant for numerical stability
+        use_approx: If True, use first-order approximation log(M) ≈ M - I
+    """
+    def __init__(self, total_channels=TOTAL_GLOBAL_CHANNELS, eps=1e-5, use_approx=False):
+        super().__init__()
+        self.eps = eps
+        self.total_channels = total_channels
+        self.use_approx = use_approx
+
+        # Learn a lower-triangular factor L in the GLOBAL channel space
+        # R_full = LL^T + εI (144×144), always SPD
+        # At forward time, we extract the C×C submatrix for the batch's channels
+        self.L_factor = nn.Parameter(torch.eye(total_channels))
+
+    def _get_submatrix_reference(self, channel_idx):
+        """
+        Extract the C×C reference submatrix for the current batch's channels.
+
+        Args:
+            channel_idx: (C,) long tensor of global channel indices
+        Returns:
+            R: (C, C) SPD reference matrix for these channels
+        """
+        # Build full R = LL^T + εI
+        L = torch.tril(self.L_factor)
+        # Extract rows/cols for the active channels: L_sub is (C, total_channels)
+        L_sub = L[channel_idx, :]
+        # R_sub = L_sub @ L_sub^T + εI_C  (C×C, guaranteed SPD)
+        C = channel_idx.shape[0]
+        I_c = torch.eye(C, device=L.device, dtype=L.dtype)
+        R = L_sub @ L_sub.T + self.eps * I_c
+        return R
+
+    def _compute_R_inv_half(self, R):
+        """Compute R^{-1/2} via eigendecomposition of R (single C×C matrix)."""
+        eigvals, Q = torch.linalg.eigh(R)
+        eigvals = eigvals.clamp(min=self.eps)
+        return Q @ torch.diag(eigvals ** (-0.5)) @ Q.T
+
+    def forward(self, S, channel_idx):
+        """
+        Args:
+            S: (batch, C, C) batch of SPD matrices
+            channel_idx: (C,) long tensor — global channel indices for this batch
+        Returns:
+            (batch, C, C) tangent vectors at the learned reference
+        """
+        C = channel_idx.shape[0]
+        I_c = torch.eye(C, device=S.device, dtype=S.dtype)
+
+        # Extract C×C reference for these channels
+        R = self._get_submatrix_reference(channel_idx)   # (C, C)
+        R_inv_half = self._compute_R_inv_half(R)          # (C, C)
+
+        # Whiten relative to reference: M = R^{-1/2} S R^{-1/2}
+        M = R_inv_half.unsqueeze(0) @ S @ R_inv_half.unsqueeze(0)  # (batch, C, C)
+
+        if self.use_approx:
+            # First-order approximation: log(M) ≈ M - I
+            return M - I_c.unsqueeze(0)
+        else:
+            # Full matrix logarithm via eigendecomposition
+            eigvals, Q = torch.linalg.eigh(M)
+            eigvals = eigvals.clamp(min=self.eps)
+            log_eigvals = torch.log(eigvals)
+            return Q @ torch.diag_embed(log_eigvals) @ Q.transpose(-2, -1)
+
+
+class AdaptiveRiemannianAttentionBias(nn.Module):
+    """
+    Geometry-aware attention bias with adaptive manifold reference.
+
+    Supports variable channel counts: the reference is stored globally (144×144)
+    and the batch's channel indices select the relevant submatrix at runtime.
+
+    Args:
+        num_heads: Number of attention heads (each gets its own learned scale)
+        total_channels: Size of the global channel space (default 144)
+        eps: Regularization for SPD matrix
+        use_approx: If True, use M-I approximation instead of eigendecomposition
+    """
+    def __init__(self, num_heads, total_channels=TOTAL_GLOBAL_CHANNELS,
+                 eps=1e-5, use_approx=False):
+        super().__init__()
+        self.num_heads = num_heads
+        self.eps = eps
+        self.adaptive_log = AdaptiveLogMap(
+            total_channels=total_channels, eps=eps, use_approx=use_approx
+        )
+
+        # Per-head learnable scaling — initialized to 0 so the model starts
+        # as standard Euclidean attention and learns to use the bias
+        self.head_scales = nn.Parameter(torch.zeros(num_heads))
+
+    def forward(self, x, channel_idx):
+        """
+        Args:
+            x: (B*N, C, D) channel embeddings (from residual stream)
+            channel_idx: (C,) long tensor — global channel indices for this batch
+        Returns:
+            (B*N, num_heads, C, C) attention bias per head
+        """
+        BN, C, D = x.shape
+
+        # Step 1: Compute sample covariance → SPD matrix
+        S = torch.bmm(x, x.transpose(-2, -1)) / D
+        S = S + self.eps * torch.eye(C, device=x.device, dtype=x.dtype).unsqueeze(0)
+
+        # Step 2: Project to tangent space at learned reference (channel-aware)
+        L = self.adaptive_log(S, channel_idx)  # (B*N, C, C)
+
+        # Step 3: Per-head scaling
+        scales = self.head_scales.view(1, self.num_heads, 1, 1)
+        bias = L.unsqueeze(1) * scales
+
+        return bias
+
+
+class AdaptiveRiemannianParallelAttention(nn.Module):
+    """
+    Parallel spatial-temporal attention with adaptive Riemannian bias.
+
+    Supports variable channel counts across batches. The Riemannian reference
+    lives in the global 144-channel space; each batch's channel indices select
+    the relevant submatrix.
+
+    Args:
+        embed_dim: Total embedding dimension
+        num_heads: Number of attention heads (must be even — split 50/50)
+        total_channels: Size of global channel space (default 144)
+        dropout: Output dropout probability
+        att_dropout: Attention weight dropout probability
+        spd_eps: SPD regularization constant
+        use_approx: If True, use M-I approximation (no batch eigendecomposition)
+    """
+    def __init__(self, embed_dim, num_heads=8, total_channels=TOTAL_GLOBAL_CHANNELS,
+                 dropout=0.1, att_dropout=0.1, spd_eps=1e-5, use_approx=False):
+        super().__init__()
+        assert num_heads % 2 == 0, "num_heads must be even for parallel split"
+        assert embed_dim % num_heads == 0
+
+        self.num_heads = num_heads
+        self.heads_per_branch = num_heads // 2
+        self.dim_head = embed_dim // num_heads
+        self.embed_dim = embed_dim
+        self.half_dim = self.heads_per_branch * self.dim_head
+
+        # Shared QKV projection
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
+        # Output projection
+        self.fc = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.att_dropout = att_dropout
+
+        # Adaptive Riemannian bias for spatial heads (global channel space)
+        self.riemannian_bias = AdaptiveRiemannianAttentionBias(
+            num_heads=self.heads_per_branch,
+            total_channels=total_channels,
+            eps=spd_eps,
+            use_approx=use_approx
+        )
+
+    def forward(self, x_norm, num_chan, residual=None, channel_idx=None):
+        """
+        Args:
+            x_norm: (B, L, D) normalized input (post-LayerNorm) — used for QKV
+            num_chan: number of EEG channels C in this batch
+            residual: (B, L, D) raw residual stream (pre-LayerNorm) — used for
+                      Riemannian bias. If None, falls back to x_norm.
+            channel_idx: (C,) long tensor — global channel indices for this batch.
+                         Required for the adaptive reference submatrix extraction.
+        """
+        B, L, D = x_norm.shape
+        assert L % num_chan == 0
+        N = L // num_chan
+        H = self.num_heads
+        H2 = self.heads_per_branch
+        d = self.dim_head
+
+        # Shared QKV from normalized input
+        qkv = self.qkv(x_norm).reshape(B, L, 3, H, d).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # Split heads: first H2 for temporal, last H2 for spatial
+        q_t, q_s = q[:, :H2], q[:, H2:]
+        k_t, k_s = k[:, :H2], k[:, H2:]
+        v_t, v_s = v[:, :H2], v[:, H2:]
+
+        # ── Temporal attention (Euclidean) ──
+        q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
+        k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
+        v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
+
+        out_t = F.scaled_dot_product_attention(
+            q_t, k_t, v_t,
+            dropout_p=self.att_dropout if self.training else 0.0,
+        )
+        out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=num_chan)
+
+        # ── Spatial attention (Riemannian-biased) ──
+        q_s = rearrange(q_s, 'b h (n c) d -> (b n) h c d', c=num_chan)
+        k_s = rearrange(k_s, 'b h (n c) d -> (b n) h c d', c=num_chan)
+        v_s = rearrange(v_s, 'b h (n c) d -> (b n) h c d', c=num_chan)
+
+        # Compute Riemannian bias from RESIDUAL STREAM (pre-LayerNorm)
+        bias_source = residual if residual is not None else x_norm
+        x_space = rearrange(bias_source, 'b (n c) d -> (b n) c d', c=num_chan)
+        riem_bias = self.riemannian_bias(x_space, channel_idx)  # (B*N, H2, C, C)
+
+        # Manual attention with Riemannian bias
+        score = (q_s @ k_s.transpose(-2, -1)) / (d ** 0.5)
+        score = score + riem_bias
+        score = score.softmax(dim=-1)
+        score = F.dropout(score, p=self.att_dropout, training=self.training)
+        out_s = score @ v_s
+
+        out_s = rearrange(out_s, '(b n) h c d -> b h (n c) d', b=B, n=N)
+
+        # ── Concatenate heads and project ──
+        out = torch.cat([out_t, out_s], dim=1)
+        out = rearrange(out, 'b h l d -> b l (h d)')
+        out = self.fc(out)
+        return self.dropout(out)
+
+
+class AdaptiveRiemannianParallelTransformer(nn.Module):
+    """
+    Parallel head-split transformer with adaptive Riemannian spatial attention.
+
+    Supports variable channel counts: the learned SPD reference lives in the
+    global 144-channel space. Each batch provides its channel indices, and the
+    relevant C×C submatrix is extracted at runtime.
+
+    Args:
+        embed_dim: Total embedding dimension
+        nhead: Number of attention heads (must be even)
+        total_channels: Size of global channel space (default 144)
+        mlp_ratio: MLP hidden dimension ratio
+        drop: Dropout probability
+        att_drop: Attention dropout probability
+        drop_path: Stochastic depth probability
+        act: Activation function class
+        norm: Normalization layer class
+        spd_eps: SPD regularization constant
+        use_approx: If True, skip eigendecomposition and use M-I approximation
+    """
+    def __init__(self, embed_dim, nhead=8, total_channels=TOTAL_GLOBAL_CHANNELS,
+                 mlp_ratio=4, drop=0.0, att_drop=0.0, drop_path=0.0, act=nn.GELU,
+                 norm=nn.LayerNorm, spd_eps=1e-5, use_approx=False):
+        super().__init__()
+
+        self.attn = AdaptiveRiemannianParallelAttention(
+            embed_dim=embed_dim,
+            num_heads=nhead,
+            total_channels=total_channels,
+            dropout=drop,
+            att_dropout=att_drop,
+            spd_eps=spd_eps,
+            use_approx=use_approx,
+        )
+
+        self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+        self.drop_path2 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+
+        self.norm1 = norm(embed_dim)
+        self.norm2 = norm(embed_dim)
+
+        hidden_size = int(embed_dim * mlp_ratio)
+        self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
+
+    def forward(self, x, num_chan, channel_idx=None):
+        """
+        Args:
+            x: (B, L, D) input tensor where L = N * num_chan
+            num_chan: number of channels C in this batch
+            channel_idx: (C,) long tensor — global channel indices
+        """
+        # Pass normalized input for QKV, raw residual for Riemannian bias
+        x = x + self.drop_path1(
+            self.attn(self.norm1(x), num_chan, residual=x, channel_idx=channel_idx)
+        )
+        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+        return x
