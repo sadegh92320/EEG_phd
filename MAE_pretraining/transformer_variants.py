@@ -504,7 +504,6 @@ class SPDLogMap(nn.Module):
         super().__init__()
         self.eps = eps
 
-    @torch.amp.custom_fwd(device_type='cuda', cast_to=torch.float32)
     def forward(self, S):
         """
         Args:
@@ -512,18 +511,14 @@ class SPDLogMap(nn.Module):
         Returns:
             (..., C, C) batch of symmetric matrices in tangent space
         """
-        # eigh is guaranteed to return real eigenvalues for symmetric input
-        # and is numerically more stable than eig for symmetric matrices
+        orig_dtype = S.dtype
+        S = S.float()  # eigh has no fp16 CUDA kernel
+
         eigenvalues, eigenvectors = torch.linalg.eigh(S)
-
-        # Clamp eigenvalues for numerical stability (must stay positive for log)
         eigenvalues = eigenvalues.clamp(min=self.eps)
-
-        # log in the eigenvalue domain
         log_eigenvalues = torch.log(eigenvalues)
-
-        # Reconstruct: Q @ diag(log(λ)) @ Q^T
-        return eigenvectors @ torch.diag_embed(log_eigenvalues) @ eigenvectors.transpose(-2, -1)
+        result = eigenvectors @ torch.diag_embed(log_eigenvalues) @ eigenvectors.transpose(-2, -1)
+        return result.to(orig_dtype)
 
 
 class RiemannianAttentionBias(nn.Module):
@@ -970,25 +965,18 @@ class AdaptiveLogMap(nn.Module):
     def _get_submatrix_reference(self, channel_idx):
         """
         Extract the C×C reference submatrix for the current batch's channels.
-
-        Args:
-            channel_idx: (C,) long tensor of global channel indices
-        Returns:
-            R: (C, C) SPD reference matrix for these channels
+        Always returns float32 regardless of self.L_factor's current dtype.
         """
-        # Build full R = LL^T + εI
-        L = torch.tril(self.L_factor)
-        # Extract rows/cols for the active channels: L_sub is (C, total_channels)
+        # Explicit .float() — Lightning may have cast L_factor to fp16
+        L = torch.tril(self.L_factor.float())
         L_sub = L[channel_idx, :]
-        # R_sub = L_sub @ L_sub^T + εI_C  (C×C, guaranteed SPD)
         C = channel_idx.shape[0]
-        I_c = torch.eye(C, device=L.device, dtype=L.dtype)
+        I_c = torch.eye(C, device=L.device, dtype=torch.float32)
         R = L_sub @ L_sub.T + self.eps * I_c
-        return R
+        return R  # guaranteed fp32
 
     def _compute_R_inv_half(self, R):
-        """Compute R^{-1/2} via eigendecomposition of R (single C×C matrix).
-        Expects float32 input (forward handles the casting)."""
+        """Compute R^{-1/2} via eigendecomposition. Input must be float32."""
         eigvals, Q = torch.linalg.eigh(R)
         eigvals = eigvals.clamp(min=self.eps)
         return Q @ torch.diag(eigvals ** (-0.5)) @ Q.T
@@ -1002,28 +990,26 @@ class AdaptiveLogMap(nn.Module):
             (batch, C, C) tangent vectors at the learned reference
         """
         # ── Force entire Riemannian pipeline to float32 ──────────────
-        # eigh / matrix log are numerically sensitive and have no half-precision
-        # CUDA kernel. We upcast once here, compute everything in fp32, and
-        # cast back at the end so the rest of the network stays in mixed precision.
+        # eigh has no fp16/bf16 CUDA kernel, and matrix log is numerically
+        # sensitive. We cast everything to fp32 explicitly (not relying on
+        # autocast context managers or decorators, which don't help when
+        # Lightning has already cast nn.Parameters to half).
         orig_dtype = S.dtype
         S = S.float()
 
         C = channel_idx.shape[0]
         I_c = torch.eye(C, device=S.device, dtype=torch.float32)
 
-        # Extract C×C reference for these channels (L_factor is fp32 param)
-        with torch.amp.autocast('cuda', enabled=False):
-            R = self._get_submatrix_reference(channel_idx)   # (C, C) fp32
-            R_inv_half = self._compute_R_inv_half(R)          # (C, C) fp32
+        # Both methods now explicitly return fp32
+        R = self._get_submatrix_reference(channel_idx)   # (C, C) fp32
+        R_inv_half = self._compute_R_inv_half(R)          # (C, C) fp32
 
-        # Whiten relative to reference: M = R^{-1/2} S R^{-1/2}
-        M = R_inv_half.unsqueeze(0) @ S @ R_inv_half.unsqueeze(0)  # (batch, C, C)
+        # Whiten: M = R^{-1/2} S R^{-1/2}  — all fp32
+        M = R_inv_half.unsqueeze(0) @ S @ R_inv_half.unsqueeze(0)
 
         if self.use_approx:
-            # First-order approximation: log(M) ≈ M - I
             return (M - I_c.unsqueeze(0)).to(orig_dtype)
         else:
-            # Full matrix logarithm via eigendecomposition
             eigvals, Q = torch.linalg.eigh(M)
             eigvals = eigvals.clamp(min=self.eps)
             log_eigvals = torch.log(eigvals)
