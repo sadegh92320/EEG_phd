@@ -513,7 +513,10 @@ class SPDLogMap(nn.Module):
         """
         # eigh is guaranteed to return real eigenvalues for symmetric input
         # and is numerically more stable than eig for symmetric matrices
-        eigenvalues, eigenvectors = torch.linalg.eigh(S)
+        # Cast to float32 — eigh is not implemented for half precision on CUDA
+        orig_dtype = S.dtype
+        S_f32 = S.float()
+        eigenvalues, eigenvectors = torch.linalg.eigh(S_f32)
 
         # Clamp eigenvalues for numerical stability (must stay positive for log)
         eigenvalues = eigenvalues.clamp(min=self.eps)
@@ -522,7 +525,8 @@ class SPDLogMap(nn.Module):
         log_eigenvalues = torch.log(eigenvalues)
 
         # Reconstruct: Q @ diag(log(λ)) @ Q^T
-        return eigenvectors @ torch.diag_embed(log_eigenvalues) @ eigenvectors.transpose(-2, -1)
+        result = eigenvectors @ torch.diag_embed(log_eigenvalues) @ eigenvectors.transpose(-2, -1)
+        return result.to(orig_dtype)
 
 
 class RiemannianAttentionBias(nn.Module):
@@ -987,9 +991,13 @@ class AdaptiveLogMap(nn.Module):
 
     def _compute_R_inv_half(self, R):
         """Compute R^{-1/2} via eigendecomposition of R (single C×C matrix)."""
-        eigvals, Q = torch.linalg.eigh(R)
+        # Cast to float32 — eigh is not implemented for half precision on CUDA
+        orig_dtype = R.dtype
+        R_f32 = R.float()
+        eigvals, Q = torch.linalg.eigh(R_f32)
         eigvals = eigvals.clamp(min=self.eps)
-        return Q @ torch.diag(eigvals ** (-0.5)) @ Q.T
+        result = Q @ torch.diag(eigvals ** (-0.5)) @ Q.T
+        return result.to(orig_dtype)
 
     def forward(self, S, channel_idx):
         """
@@ -1014,10 +1022,14 @@ class AdaptiveLogMap(nn.Module):
             return M - I_c.unsqueeze(0)
         else:
             # Full matrix logarithm via eigendecomposition
-            eigvals, Q = torch.linalg.eigh(M)
+            # Cast to float32 — eigh is not implemented for half precision on CUDA
+            orig_dtype = M.dtype
+            M_f32 = M.float()
+            eigvals, Q = torch.linalg.eigh(M_f32)
             eigvals = eigvals.clamp(min=self.eps)
             log_eigvals = torch.log(eigvals)
-            return Q @ torch.diag_embed(log_eigvals) @ Q.transpose(-2, -1)
+            result = Q @ torch.diag_embed(log_eigvals) @ Q.transpose(-2, -1)
+            return result.to(orig_dtype)
 
 
 class AdaptiveRiemannianAttentionBias(nn.Module):
