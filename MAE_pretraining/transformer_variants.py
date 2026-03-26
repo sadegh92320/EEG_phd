@@ -4,6 +4,15 @@ import torch.nn.functional as F
 from einops import rearrange
 
 
+# ─── fp32-safe eigendecomposition ────────────────────────────────────────────
+# torch.linalg.eigh has NO fp16/bf16 CUDA kernel.  This wrapper guarantees
+# float32 computation regardless of autocast / Lightning precision casting.
+def safe_eigh(M):
+    """torch.linalg.eigh that always runs in float32 and returns float32."""
+    return torch.linalg.eigh(M.float())
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 class RotaryEmbedding(nn.Module):
     """
         Implementation of the Rotary embedding which attributes to each token
@@ -514,7 +523,7 @@ class SPDLogMap(nn.Module):
         orig_dtype = S.dtype
         S = S.float()  # eigh has no fp16 CUDA kernel
 
-        eigenvalues, eigenvectors = torch.linalg.eigh(S)
+        eigenvalues, eigenvectors = safe_eigh(S)
         eigenvalues = eigenvalues.clamp(min=self.eps)
         log_eigenvalues = torch.log(eigenvalues)
         result = eigenvectors @ torch.diag_embed(log_eigenvalues) @ eigenvectors.transpose(-2, -1)
@@ -977,7 +986,7 @@ class AdaptiveLogMap(nn.Module):
 
     def _compute_R_inv_half(self, R):
         """Compute R^{-1/2} via eigendecomposition. Input must be float32."""
-        eigvals, Q = torch.linalg.eigh(R)
+        eigvals, Q = safe_eigh(R)
         eigvals = eigvals.clamp(min=self.eps)
         return Q @ torch.diag(eigvals ** (-0.5)) @ Q.T
 
@@ -1010,7 +1019,7 @@ class AdaptiveLogMap(nn.Module):
         if self.use_approx:
             return (M - I_c.unsqueeze(0)).to(orig_dtype)
         else:
-            eigvals, Q = torch.linalg.eigh(M)
+            eigvals, Q = safe_eigh(M)
             eigvals = eigvals.clamp(min=self.eps)
             log_eigvals = torch.log(eigvals)
             result = Q @ torch.diag_embed(log_eigvals) @ Q.transpose(-2, -1)
