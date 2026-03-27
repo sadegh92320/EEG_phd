@@ -150,7 +150,7 @@ class Pipeline:
         os.makedirs(CKPT_DIR, exist_ok=True)
 
         if pretrain:
-            print("thats's")
+            print("new's")
             train_loader, valid_loader = self.import_data_pretrain()
             model = AdaptiveRiemannBert()
 

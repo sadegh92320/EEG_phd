@@ -17,7 +17,7 @@ import math
 import random
 import os
 import torch.nn.init as init
-from MAE_pretraining.transformer_variants import TransformerLayerViT
+from MAE_pretraining.transformer_variants import TransformerLayerViT, pade_matrix_log
 
 
 def seed_everything(seed=42):
@@ -180,20 +180,15 @@ class RiemannLossBert(pl.LightningModule):
     def _spd_log(self, S):
         """Project SPD matrix to tangent space via matrix logarithm.
 
-        Protected against fp16 — forces float32 for eigendecomposition.
+        Uses Padé (scaling-and-squaring + Taylor) — no eigendecomposition,
+        so no degenerate-eigenvalue NaN in backward pass.
 
         Args:
             S: (B, C, C) SPD covariance matrix
         Returns:
             S_log: (B, C, C) log-mapped matrix in tangent space
         """
-        with torch.amp.autocast('cuda', enabled=False), \
-             torch.amp.autocast('cpu', enabled=False):
-            S_f32 = S.float()
-            eigvals, Q = torch.linalg.eigh(S_f32)
-            eigvals = eigvals.clamp(min=1e-7)
-            S_log = Q @ torch.diag_embed(torch.log(eigvals)) @ Q.transpose(-1, -2)
-        return S_log.to(S.dtype)
+        return pade_matrix_log(S, num_squarings=4, pade_order=6)
 
     def _geodesic_distance(self, S1, S2):
         """Log-Euclidean geodesic distance between two SPD matrices.
