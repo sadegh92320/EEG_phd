@@ -130,13 +130,13 @@ class AdaptiveRiemannBert(pl.LightningModule):
         self.num_channels = num_channels
 
         # Adaptive Riemannian parallel transformer layers
-        # log_mode='pade' → Padé matrix log via scaling-and-squaring (all matmuls,
-        #   GPU-fast, fp16-compatible, no eigendecomposition)
-        # Alternatives: 'eigh' (exact but slow), 'approx' (M-I, fastest)
-        # No num_channels needed — reference lives in global 144-channel space
+        # log_mode='approx' → first-order tangent space: S - I
+        #   Zero solve/eigh calls, NaN-proof, fastest mode.
+        #   head_scales (init=0) learn to calibrate the bias magnitude.
+        # Alternatives: 'pade' (accurate but slow+fragile), 'eigh' (exact but slow)
         self.encoder = nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
-                enc_dim, nhead=8, mlp_ratio=4, log_mode='pade'
+                enc_dim, nhead=8, mlp_ratio=4, log_mode='approx'
             ) for _ in range(depth_e)
         ])
 
@@ -271,6 +271,12 @@ class AdaptiveRiemannBert(pl.LightningModule):
                 "interval": "step",
             }
         }
+
+    def configure_gradient_clipping(self, optimizer, gradient_clip_val=None,
+                                      gradient_clip_algorithm=None):
+        """Clip gradients to prevent NaN from rare fp16 overflow."""
+        self.clip_gradients(optimizer, gradient_clip_val=1.0,
+                           gradient_clip_algorithm='norm')
 
     def training_step(self, batch, batch_idx):
         data, channel_list = batch

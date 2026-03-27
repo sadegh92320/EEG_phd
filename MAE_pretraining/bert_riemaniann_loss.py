@@ -17,7 +17,7 @@ import math
 import random
 import os
 import torch.nn.init as init
-from MAE_pretraining.transformer_variants import TransformerLayerViT, pade_matrix_log
+from MAE_pretraining.transformer_variants import TransformerLayerViT
 
 
 def seed_everything(seed=42):
@@ -177,32 +177,26 @@ class RiemannLossBert(pl.LightningModule):
         S = S + 1e-5 * torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
         return S
 
-    def _spd_log(self, S):
-        """Project SPD matrix to tangent space via matrix logarithm.
+    def _spd_spectral_distance(self, S1, S2):
+        """Log-spectral distance between two SPD covariance matrices.
 
-        Uses Padé (scaling-and-squaring + Taylor) — no eigendecomposition,
-        so no degenerate-eigenvalue NaN in backward pass.
+        d(S1, S2) = || log(eigvals(S1)) - log(eigvals(S2)) ||_2
 
-        Args:
-            S: (B, C, C) SPD covariance matrix
-        Returns:
-            S_log: (B, C, C) log-mapped matrix in tangent space
-        """
-        return pade_matrix_log(S, num_squarings=4, pade_order=6)
-
-    def _geodesic_distance(self, S1, S2):
-        """Log-Euclidean geodesic distance between two SPD matrices.
-
-        d(S1, S2) = || log(S1) - log(S2) ||_F
+        Uses eigvalsh (eigenvalues only, no eigenvectors). This is NaN-safe
+        because eigvalsh backward does NOT involve the 1/(λ_i - λ_j) terms
+        that cause NaN with degenerate eigenvalues — those only appear in the
+        eigenvector gradient of eigh.
 
         Args:
             S1, S2: (B, C, C) SPD covariance matrices
         Returns:
-            scalar: mean Frobenius distance across the batch
+            scalar: mean spectral distance across the batch
         """
-        S1_log = self._spd_log(S1)
-        S2_log = self._spd_log(S2)
-        return (S1_log - S2_log).norm(p='fro', dim=(-2, -1)).mean()
+        with torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False):
+            eig1 = torch.linalg.eigvalsh(S1.float()).clamp(min=1e-7)
+            eig2 = torch.linalg.eigvalsh(S2.float()).clamp(min=1e-7)
+        return (torch.log(eig1) - torch.log(eig2)).pow(2).sum(dim=-1).sqrt().mean()
 
     def encoder_forward(self, x, channel_list):
         B, C, T = x.shape
@@ -232,8 +226,6 @@ class RiemannLossBert(pl.LightningModule):
         # This is the clean channel covariance from the input embeddings.
         # Each encoder layer should preserve this connectivity structure.
         S_0 = self._compute_channel_covariance(x, C, N)
-        # Pre-compute log(S_0) once — reused across all layers
-        S_0_log = self._spd_log(S_0)
 
         # Mask the eeg patches (BERT-style)
         x, mask = self.mask_bert(x)
@@ -243,16 +235,15 @@ class RiemannLossBert(pl.LightningModule):
         class_token = class_token.expand(B, 1, -1)
         x = torch.cat([class_token, x], dim=1)
 
-        # ── Pass through encoder, measuring geodesic distance to S_0 at each layer ──
+        # ── Pass through encoder, measuring spectral distance to S_0 at each layer ──
         spd_losses = []
         for transformer in self.encoder:
             x = transformer(x)
             # Strip class token and compute layer covariance
             x_patches = x[:, 1:, :]  # (B, N*C, D)
             S_l = self._compute_channel_covariance(x_patches, C, N)
-            S_l_log = self._spd_log(S_l)
-            # Log-Euclidean geodesic distance to the clean input covariance
-            d = (S_l_log - S_0_log).norm(p='fro', dim=(-2, -1)).mean()
+            # Log-spectral distance from this layer to the clean input covariance
+            d = self._spd_spectral_distance(S_l, S_0)
             spd_losses.append(d)
 
         spd_loss = torch.stack(spd_losses).mean()
@@ -327,6 +318,12 @@ class RiemannLossBert(pl.LightningModule):
             }
         }
     
+    def configure_gradient_clipping(self, optimizer, gradient_clip_val=None,
+                                      gradient_clip_algorithm=None):
+        """Clip gradients to prevent NaN from rare fp16 overflow."""
+        self.clip_gradients(optimizer, gradient_clip_val=1.0,
+                           gradient_clip_algorithm='norm')
+
     def training_step(self, batch, batch_idx):
         data, channel_list = batch
         total_loss, pred, mask, loss, spd_loss = self(data, channel_list)

@@ -1110,23 +1110,24 @@ class AdaptiveLogMap(nn.Module):
         orig_dtype = S.dtype
         C = channel_idx.shape[0]
 
-        # R and R_inv_half: small (C×C), recomputed each forward (no caching —
-        # caching breaks autograd because the graph is freed after backward)
+        if self.log_mode == 'approx':
+            # ── FAST PATH: no R_inv_half, no solve, no eigh ──
+            # S is already SPD and captures channel covariance.
+            # S - I is the first-order tangent-space approximation at identity.
+            # head_scales (init=0) learn to calibrate magnitude automatically.
+            # This path uses ONLY matmul/add — zero NaN risk.
+            I_c = torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
+            return (S - I_c).to(orig_dtype)
+
+        # ── FULL PATH: whiten with learned reference R ──
         R = self._get_submatrix_reference(channel_idx)       # (C, C) fp32
         R_inv_half = self._compute_R_inv_half(R)              # (C, C) fp32
 
-        # Whitening: M = R^{-1/2} S R^{-1/2}
-        # Ensure M is SPD with epsilon regularization (S may lose positive-definiteness
-        # in fp16 or during early training when representations are near-zero)
+        # M = R^{-1/2} S R^{-1/2}, regularized for SPD
         M = R_inv_half.unsqueeze(0) @ S.float() @ R_inv_half.unsqueeze(0)
         M = M + self.eps * torch.eye(C, device=M.device, dtype=M.dtype).unsqueeze(0)
 
-        if self.log_mode == 'approx':
-            I_c = torch.eye(C, device=M.device, dtype=M.dtype)
-            return (M - I_c.unsqueeze(0)).to(orig_dtype)
-
-        elif self.log_mode == 'pade':
-            # Padé matrix log — proper Denman-Beavers sqrt + Taylor series
+        if self.log_mode == 'pade':
             result = pade_matrix_log(M, num_squarings=4, sqrt_iters=6, pade_order=6)
             return result.to(orig_dtype)
 
