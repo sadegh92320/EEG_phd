@@ -634,10 +634,13 @@ class RiemannianAttentionBias(nn.Module):
         """
         BN, C, D = x.shape
 
-        # Step 1: Compute sample covariance → SPD matrix
-        # S = (1/D) X X^T + εI ∈ R^{C×C}
-        S = torch.bmm(x, x.transpose(-2, -1)) / D
-        S = S + self.eps * torch.eye(C, device=x.device, dtype=x.dtype).unsqueeze(0)
+        # Step 1: Compute sample covariance → SPD matrix in float32
+        # x @ x^T can overflow fp16 when residual stream has large values
+        with torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False):
+            x_f32 = x.float()
+            S = torch.bmm(x_f32, x_f32.transpose(-2, -1)) / D
+            S = S + self.eps * torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
 
         # Step 2: Project to tangent space via matrix log
         L = self.spd_log(S)  # (B*N, C, C)
@@ -918,12 +921,14 @@ class RiemannianParallelAttention(nn.Module):
         x_space = rearrange(x, 'b (n c) d -> (b n) c d', c=num_chan)
         riem_bias = self.riemannian_bias(x_space)  # (B*N, H2, C, C)
 
-        # Manual attention with Riemannian bias
-        score = (q_s @ k_s.transpose(-2, -1)) / (d ** 0.5)
-        score = score + riem_bias
-        score = score.softmax(dim=-1)
+        # Manual spatial attention with Riemannian bias — float32 for stability
+        with torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False):
+            score = (q_s.float() @ k_s.float().transpose(-2, -1)) / (d ** 0.5)
+            score = score + riem_bias.float()
+            score = score.softmax(dim=-1)
         score = F.dropout(score, p=self.att_dropout, training=self.training)
-        out_s = score @ v_s  # (B*N, H2, C, d)
+        out_s = score.to(v_s.dtype) @ v_s  # (B*N, H2, C, d)
 
         # Back to (B, H2, N*C, d)
         out_s = rearrange(out_s, '(b n) h c d -> b h (n c) d', b=B, n=N)
@@ -1180,8 +1185,13 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         BN, C, D = x.shape
 
         # Step 1: Compute sample covariance → SPD matrix
-        S = torch.bmm(x, x.transpose(-2, -1)) / D
-        S = S + self.eps * torch.eye(C, device=x.device, dtype=x.dtype).unsqueeze(0)
+        # MUST be float32 — the residual stream x can have large values after
+        # many layers, and x @ x^T overflows fp16 (max 65504) → inf → NaN.
+        with torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False):
+            x_f32 = x.float()
+            S = torch.bmm(x_f32, x_f32.transpose(-2, -1)) / D
+            S = S + self.eps * torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
 
         # Step 2: Project to tangent space at learned reference (channel-aware)
         L = self.adaptive_log(S, channel_idx)  # (B*N, C, C)
@@ -1287,12 +1297,15 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         x_space = rearrange(bias_source, 'b (n c) d -> (b n) c d', c=num_chan)
         riem_bias = self.riemannian_bias(x_space, channel_idx)  # (B*N, H2, C, C)
 
-        # Manual attention with Riemannian bias
-        score = (q_s @ k_s.transpose(-2, -1)) / (d ** 0.5)
-        score = score + riem_bias
-        score = score.softmax(dim=-1)
+        # Manual spatial attention with Riemannian bias
+        # Compute score+softmax in float32 to prevent fp16 overflow
+        with torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False):
+            score = (q_s.float() @ k_s.float().transpose(-2, -1)) / (d ** 0.5)
+            score = score + riem_bias.float()
+            score = score.softmax(dim=-1)
         score = F.dropout(score, p=self.att_dropout, training=self.training)
-        out_s = score @ v_s
+        out_s = score.to(v_s.dtype) @ v_s
 
         out_s = rearrange(out_s, '(b n) h c d -> b h (n c) d', b=B, n=N)
 

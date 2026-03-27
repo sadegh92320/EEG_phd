@@ -130,13 +130,13 @@ class AdaptiveRiemannBert(pl.LightningModule):
         self.num_channels = num_channels
 
         # Adaptive Riemannian parallel transformer layers
-        # log_mode='approx' → first-order tangent space: S - I
-        #   Zero solve/eigh calls, NaN-proof, fastest mode.
-        #   head_scales (init=0) learn to calibrate the bias magnitude.
-        # Alternatives: 'pade' (accurate but slow+fragile), 'eigh' (exact but slow)
+        # log_mode='pade' → Padé matrix log via scaling-and-squaring
+        #   Accurate, all matmuls + solve (no eigh), GPU-friendly.
+        #   NaN-safe: covariance bmm and attention scores forced to float32.
+        # Alternatives: 'approx' (S-I, fastest), 'eigh' (exact but slow)
         self.encoder = nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
-                enc_dim, nhead=8, mlp_ratio=4, log_mode='approx'
+                enc_dim, nhead=8, mlp_ratio=4, log_mode='pade'
             ) for _ in range(depth_e)
         ])
 

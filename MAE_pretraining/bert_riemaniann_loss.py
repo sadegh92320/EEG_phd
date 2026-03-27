@@ -173,8 +173,12 @@ class RiemannLossBert(pl.LightningModule):
         B = x.shape[0]
         x_re = rearrange(x, 'b (n c) d -> b n c d', c=C)
         x_pool = x_re.mean(dim=1)  # (B, C, D) — pool over time
-        S = torch.bmm(x_pool, x_pool.transpose(-1, -2)) / self.enc_dim
-        S = S + 1e-5 * torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
+        # Force float32 — x @ x^T overflows fp16 when activations are large
+        with torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False):
+            x_pool_f32 = x_pool.float()
+            S = torch.bmm(x_pool_f32, x_pool_f32.transpose(-1, -2)) / self.enc_dim
+            S = S + 1e-5 * torch.eye(C, device=S.device, dtype=torch.float32).unsqueeze(0)
         return S
 
     def _spd_spectral_distance(self, S1, S2):
