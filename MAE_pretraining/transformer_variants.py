@@ -1043,6 +1043,11 @@ class AdaptiveLogMap(nn.Module):
         )
         self.L_factor = nn.Parameter(init_L)
 
+        # Cache for R_inv_half to avoid redundant Denman-Beavers iterations
+        # within the same forward pass (R depends only on L_factor + channel_idx)
+        self._cache_key = None      # (L_factor data_ptr, channel_idx tuple)
+        self._cached_R_inv_half = None
+
     def _get_submatrix_reference(self, channel_idx):
         """
         Extract the C×C reference submatrix for the current batch's channels.
@@ -1056,15 +1061,14 @@ class AdaptiveLogMap(nn.Module):
         R = L_sub @ L_sub.T + self.eps * I_c
         return R  # guaranteed fp32
 
-    def _compute_R_inv_half(self, R, num_iters=12):
+    def _compute_R_inv_half(self, R, num_iters=8):
         """
         Compute R^{-1/2} via Denman-Beavers iteration (no eigendecomposition).
 
         Uses only matmuls and torch.linalg.solve — both have clean backward
         passes with no degenerate-eigenvalue NaN issue (unlike eigh).
 
-        Converges quadratically: 12 iterations give ~machine-precision accuracy
-        for any SPD matrix.
+        Converges quadratically: 8 iterations handle R drifting from I during training.
         """
         with torch.amp.autocast('cuda', enabled=False), \
              torch.amp.autocast('cpu', enabled=False):
@@ -1096,9 +1100,17 @@ class AdaptiveLogMap(nn.Module):
         C = channel_idx.shape[0]
 
         # R and R_inv_half are small (C×C, single matrix, not batched)
-        # — these are fast even in fp32, and eigh requires fp32.
-        R = self._get_submatrix_reference(channel_idx)       # (C, C) fp32
-        R_inv_half = self._compute_R_inv_half(R)              # (C, C) fp32
+        # Cache R_inv_half: it only depends on L_factor and channel_idx,
+        # so it stays valid across all layers in a single forward pass.
+        # Version counter increments on every in-place update (optimizer step)
+        cache_key = (self.L_factor._version, tuple(channel_idx.tolist()))
+        if self._cache_key == cache_key and self._cached_R_inv_half is not None:
+            R_inv_half = self._cached_R_inv_half
+        else:
+            R = self._get_submatrix_reference(channel_idx)       # (C, C) fp32
+            R_inv_half = self._compute_R_inv_half(R)              # (C, C) fp32
+            self._cache_key = cache_key
+            self._cached_R_inv_half = R_inv_half
 
         # Whitening matmul: let autocast handle this — it's a batched matmul
         # which benefits from fp16.  Result dtype = whatever autocast picks.
@@ -1110,8 +1122,9 @@ class AdaptiveLogMap(nn.Module):
             return (M - I_c.unsqueeze(0)).to(orig_dtype)
 
         elif self.log_mode == 'pade':
-            # Padé matrix log — all batched matmuls, fp16-compatible, GPU-fast
-            return pade_matrix_log(M).to(orig_dtype)
+            # Padé matrix log — all batched matmuls, GPU-fast
+            # 4 squarings ensures M^{1/16} ≈ I even when eigenvalues span wide range
+            return pade_matrix_log(M, num_squarings=4, pade_order=6).to(orig_dtype)
 
         else:  # 'eigh'
             # Exact eigendecomposition — slowest but most accurate
