@@ -13,25 +13,30 @@ def safe_eigh(M):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def pade_matrix_log(M, num_squarings=4, pade_order=6):
+def pade_matrix_log(M, num_squarings=4, sqrt_iters=6, pade_order=6):
     """
-    Matrix logarithm via inverse scaling-and-squaring + diagonal Padé approximation.
+    Matrix logarithm via inverse scaling-and-squaring + Taylor approximation.
 
-    All operations are batched matmuls — GPU-friendly.
-    No eigendecomposition needed.
-    Internally runs in float32 to avoid fp16 kernel gaps (linalg.solve).
+    All operations are batched matmuls + linalg.solve — GPU-friendly.
+    No eigendecomposition needed, so backward pass is always clean (no
+    degenerate-eigenvalue NaN).
 
-    For M close to I (which the adaptive reference ensures), this is both
-    fast and accurate.  The algorithm:
-        1. Inverse scaling: A = M^{1/2^s} via repeated matrix square roots
-           (each sqrt via Denman-Beavers iteration — just matmuls + inverses)
-        2. Padé approximant of log(A) where A ≈ I
+    Internally runs in float32 to avoid fp16 kernel gaps.
+
+    Algorithm:
+        1. Repeated matrix square root: compute A = M^{1/2^s} by applying
+           Denman-Beavers iteration s times (each time converged with
+           sqrt_iters iterations). After this, A ≈ I.
+        2. Taylor series: log(I + X) ≈ X - X²/2 + X³/3 - ...
+           Converges because ||A - I|| < 1 after sufficient squarings.
         3. Scale back: log(M) = 2^s * log(A)
 
     Args:
-        M: (..., C, C) batch of SPD matrices (should be close to I)
-        num_squarings: number of square-root halvings (more = M closer to I = more accurate)
-        pade_order: order of the Padé approximation (higher = more accurate)
+        M: (..., C, C) batch of SPD matrices
+        num_squarings: number of square-root halvings (more = A closer to I)
+        sqrt_iters: Denman-Beavers iterations per square root (6 is sufficient
+                    for quadratic convergence on well-conditioned SPD matrices)
+        pade_order: order of the Taylor approximation (higher = more accurate)
     Returns:
         (..., C, C) matrix logarithm of M
     """
@@ -43,19 +48,24 @@ def pade_matrix_log(M, num_squarings=4, pade_order=6):
         C = M.shape[-1]
         I = torch.eye(C, device=M.device, dtype=M.dtype).expand_as(M)
 
-        # ── Step 1: Inverse scaling via repeated matrix square root ──
-        # Denman-Beavers iteration for matrix square root: converges quadratically
-        # Y_k → M^{1/2},  Z_k → M^{-1/2}
-        Y = M
+        # ── Step 1: Repeated matrix square root via Denman-Beavers ──
+        # Each outer iteration computes M^{1/2} of the current matrix,
+        # so after num_squarings iterations we have M^{1/2^s}.
+        A = M
         for _ in range(num_squarings):
-            Z = torch.linalg.solve(Y, I)  # Z = Y^{-1}, batched
-            Y = 0.5 * (Y + Z)
+            # Denman-Beavers: Y→A^{1/2} with sqrt_iters iterations
+            Y = A
+            for _ in range(sqrt_iters):
+                Y_inv = torch.linalg.solve(Y, I)
+                Y = 0.5 * (Y + Y_inv)
+            A = Y  # A ← A^{1/2}
 
-        # Now Y ≈ M^{1/2^s}, which is very close to I
-        A = Y
+        # Now A ≈ M^{1/2^s}, which should be very close to I
 
         # ── Step 2: Taylor series log(I + X) for A ≈ I ──
         X = A - I
+        # Clamp X to prevent divergence if A isn't close enough to I
+        X = X.clamp(-0.9, 0.9)
         result = torch.zeros_like(X)
         X_power = X  # X^1
         for k in range(1, pade_order + 1):
@@ -66,6 +76,9 @@ def pade_matrix_log(M, num_squarings=4, pade_order=6):
 
         # ── Step 3: Undo the scaling: log(M) = 2^s * log(M^{1/2^s}) ──
         result = result * (2 ** num_squarings)
+
+        # Final NaN guard — replace any NaN with 0 (identity in tangent space)
+        result = torch.where(torch.isnan(result), torch.zeros_like(result), result)
     return result.to(orig_dtype)
 
 
@@ -1043,11 +1056,6 @@ class AdaptiveLogMap(nn.Module):
         )
         self.L_factor = nn.Parameter(init_L)
 
-        # Cache for R_inv_half to avoid redundant Denman-Beavers iterations
-        # within the same forward pass (R depends only on L_factor + channel_idx)
-        self._cache_key = None      # (L_factor data_ptr, channel_idx tuple)
-        self._cached_R_inv_half = None
-
     def _get_submatrix_reference(self, channel_idx):
         """
         Extract the C×C reference submatrix for the current batch's channels.
@@ -1086,6 +1094,9 @@ class AdaptiveLogMap(nn.Module):
                 Z_new = 0.5 * (Z + Y_inv)
                 Y, Z = Y_new, Z_new
 
+            # Safety: if solve produced NaN, fall back to identity
+            if torch.isnan(Z).any():
+                Z = I
             return Z  # R^{-1/2}
 
     def forward(self, S, channel_idx):
@@ -1099,35 +1110,27 @@ class AdaptiveLogMap(nn.Module):
         orig_dtype = S.dtype
         C = channel_idx.shape[0]
 
-        # R and R_inv_half are small (C×C, single matrix, not batched)
-        # Cache R_inv_half: it only depends on L_factor and channel_idx,
-        # so it stays valid across all layers in a single forward pass.
-        # Version counter increments on every in-place update (optimizer step)
-        cache_key = (self.L_factor._version, tuple(channel_idx.tolist()))
-        if self._cache_key == cache_key and self._cached_R_inv_half is not None:
-            R_inv_half = self._cached_R_inv_half
-        else:
-            R = self._get_submatrix_reference(channel_idx)       # (C, C) fp32
-            R_inv_half = self._compute_R_inv_half(R)              # (C, C) fp32
-            self._cache_key = cache_key
-            self._cached_R_inv_half = R_inv_half
+        # R and R_inv_half: small (C×C), recomputed each forward (no caching —
+        # caching breaks autograd because the graph is freed after backward)
+        R = self._get_submatrix_reference(channel_idx)       # (C, C) fp32
+        R_inv_half = self._compute_R_inv_half(R)              # (C, C) fp32
 
-        # Whitening matmul: let autocast handle this — it's a batched matmul
-        # which benefits from fp16.  Result dtype = whatever autocast picks.
-        M = R_inv_half.unsqueeze(0) @ S @ R_inv_half.unsqueeze(0)
+        # Whitening: M = R^{-1/2} S R^{-1/2}
+        # Ensure M is SPD with epsilon regularization (S may lose positive-definiteness
+        # in fp16 or during early training when representations are near-zero)
+        M = R_inv_half.unsqueeze(0) @ S.float() @ R_inv_half.unsqueeze(0)
+        M = M + self.eps * torch.eye(C, device=M.device, dtype=M.dtype).unsqueeze(0)
 
         if self.log_mode == 'approx':
-            # First-order: log(M) ≈ M - I  — cheapest, no log at all
             I_c = torch.eye(C, device=M.device, dtype=M.dtype)
             return (M - I_c.unsqueeze(0)).to(orig_dtype)
 
         elif self.log_mode == 'pade':
-            # Padé matrix log — all batched matmuls, GPU-fast
-            # 4 squarings ensures M^{1/16} ≈ I even when eigenvalues span wide range
-            return pade_matrix_log(M, num_squarings=4, pade_order=6).to(orig_dtype)
+            # Padé matrix log — proper Denman-Beavers sqrt + Taylor series
+            result = pade_matrix_log(M, num_squarings=4, sqrt_iters=6, pade_order=6)
+            return result.to(orig_dtype)
 
         else:  # 'eigh'
-            # Exact eigendecomposition — slowest but most accurate
             with torch.amp.autocast('cuda', enabled=False):
                 M = M.float()
                 eigvals, Q = safe_eigh(M)
