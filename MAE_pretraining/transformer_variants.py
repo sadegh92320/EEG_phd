@@ -17,8 +17,9 @@ def pade_matrix_log(M, num_squarings=4, pade_order=6):
     """
     Matrix logarithm via inverse scaling-and-squaring + diagonal Padé approximation.
 
-    All operations are batched matmuls — GPU-friendly and fp16-compatible.
+    All operations are batched matmuls — GPU-friendly.
     No eigendecomposition needed.
+    Internally runs in float32 to avoid fp16 kernel gaps (linalg.solve).
 
     For M close to I (which the adaptive reference ensures), this is both
     fast and accurate.  The algorithm:
@@ -34,39 +35,38 @@ def pade_matrix_log(M, num_squarings=4, pade_order=6):
     Returns:
         (..., C, C) matrix logarithm of M
     """
-    C = M.shape[-1]
-    I = torch.eye(C, device=M.device, dtype=M.dtype).expand_as(M)
+    orig_dtype = M.dtype
+    # Force float32 — torch.linalg.solve has no fp16/bf16 CUDA kernel
+    with torch.amp.autocast('cuda', enabled=False), \
+         torch.amp.autocast('cpu', enabled=False):
+        M = M.float()
+        C = M.shape[-1]
+        I = torch.eye(C, device=M.device, dtype=M.dtype).expand_as(M)
 
-    # ── Step 1: Inverse scaling via repeated matrix square root ──
-    # Denman-Beavers iteration for matrix square root: converges quadratically
-    # Y_k → M^{1/2},  Z_k → M^{-1/2}
-    Y = M
-    for _ in range(num_squarings):
-        # Each iteration: Y_new = (Y + Y^{-1}) / 2  (converges to sqrt)
-        # Using a few Newton iterations for the square root
-        Z = torch.linalg.solve(Y, I)  # Z = Y^{-1}, batched
-        Y = 0.5 * (Y + Z)
+        # ── Step 1: Inverse scaling via repeated matrix square root ──
+        # Denman-Beavers iteration for matrix square root: converges quadratically
+        # Y_k → M^{1/2},  Z_k → M^{-1/2}
+        Y = M
+        for _ in range(num_squarings):
+            Z = torch.linalg.solve(Y, I)  # Z = Y^{-1}, batched
+            Y = 0.5 * (Y + Z)
 
-    # Now Y ≈ M^{1/2^s}, which is very close to I
-    A = Y
+        # Now Y ≈ M^{1/2^s}, which is very close to I
+        A = Y
 
-    # ── Step 2: Padé approximant of log(A) for A ≈ I ──
-    # log(A) = log(I + X) where X = A - I is small
-    # Using the [p/p] diagonal Padé approximant via partial fractions
-    # For moderate orders, the simple Taylor series is equivalent in accuracy
-    # and faster: log(I + X) ≈ X - X²/2 + X³/3 - X⁴/4 + ...
-    X = A - I
-    result = torch.zeros_like(X)
-    X_power = X  # X^1
-    for k in range(1, pade_order + 1):
-        sign = 1.0 if k % 2 == 1 else -1.0
-        result = result + (sign / k) * X_power
-        if k < pade_order:
-            X_power = X_power @ X  # X^{k+1}
+        # ── Step 2: Taylor series log(I + X) for A ≈ I ──
+        X = A - I
+        result = torch.zeros_like(X)
+        X_power = X  # X^1
+        for k in range(1, pade_order + 1):
+            sign = 1.0 if k % 2 == 1 else -1.0
+            result = result + (sign / k) * X_power
+            if k < pade_order:
+                X_power = X_power @ X  # X^{k+1}
 
-    # ── Step 3: Undo the scaling: log(M) = 2^s * log(M^{1/2^s}) ──
-    result = result * (2 ** num_squarings)
-    return result
+        # ── Step 3: Undo the scaling: log(M) = 2^s * log(M^{1/2^s}) ──
+        result = result * (2 ** num_squarings)
+    return result.to(orig_dtype)
 
 
 class RotaryEmbedding(nn.Module):
@@ -1066,7 +1066,8 @@ class AdaptiveLogMap(nn.Module):
         Converges quadratically: 12 iterations give ~machine-precision accuracy
         for any SPD matrix.
         """
-        with torch.amp.autocast('cuda', enabled=False):
+        with torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False):
             R = R.float()
             C = R.shape[0]
             I = torch.eye(C, device=R.device, dtype=R.dtype)
