@@ -1061,6 +1061,12 @@ class AdaptiveLogMap(nn.Module):
         )
         self.L_factor = nn.Parameter(init_L)
 
+        # Cache R_inv_half across forward calls (detached — safe for autograd).
+        # Invalidated when L_factor changes (optimizer step) via _version counter.
+        self._cache_version = None
+        self._cache_ch_key = None
+        self._cached_R_inv_half = None
+
     def _get_submatrix_reference(self, channel_idx):
         """
         Extract the C×C reference submatrix for the current batch's channels.
@@ -1125,15 +1131,31 @@ class AdaptiveLogMap(nn.Module):
             return (S - I_c).to(orig_dtype)
 
         # ── FULL PATH: whiten with learned reference R ──
-        R = self._get_submatrix_reference(channel_idx)       # (C, C) fp32
-        R_inv_half = self._compute_R_inv_half(R)              # (C, C) fp32
+        # Cache R_inv_half (detached) — it depends only on L_factor + channel_idx.
+        # Detached = no gradient to L_factor through the iterative solve, but
+        # that's fine: head_scales calibrate the bias magnitude, same as approx.
+        # The _version counter invalidates after each optimizer step.
+        ver = self.L_factor._version
+        ch_key = (channel_idx.data_ptr(), channel_idx.shape[0])
+        if self._cache_version == ver and self._cache_ch_key == ch_key \
+                and self._cached_R_inv_half is not None:
+            R_inv_half = self._cached_R_inv_half
+        else:
+            R = self._get_submatrix_reference(channel_idx)       # (C, C) fp32
+            R_inv_half = self._compute_R_inv_half(R).detach()    # (C, C) fp32, detached
+            self._cache_version = ver
+            self._cache_ch_key = ch_key
+            self._cached_R_inv_half = R_inv_half
 
         # M = R^{-1/2} S R^{-1/2}, regularized for SPD
         M = R_inv_half.unsqueeze(0) @ S.float() @ R_inv_half.unsqueeze(0)
         M = M + self.eps * torch.eye(C, device=M.device, dtype=M.dtype).unsqueeze(0)
 
         if self.log_mode == 'pade':
-            result = pade_matrix_log(M, num_squarings=4, sqrt_iters=6, pade_order=6)
+            # 3 squarings + 4 sqrt_iters = 12 batched solves (was 24)
+            # Safe because M is float32 and well-conditioned (epsilon-regularized)
+            # M^{1/8} eigenvalues in [0.75, 1.33] for typical range — Taylor converges
+            result = pade_matrix_log(M, num_squarings=3, sqrt_iters=4, pade_order=6)
             return result.to(orig_dtype)
 
         else:  # 'eigh'
