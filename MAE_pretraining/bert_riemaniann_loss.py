@@ -160,69 +160,111 @@ class RiemannLossBert(pl.LightningModule):
         return x, mask
 
     
-    def encoder_forward(self,x, channel_list):
+    def _compute_channel_covariance(self, x, C, N):
+        """Compute channel covariance (B, C, C) from flattened token sequence.
+
+        Args:
+            x: (B, N*C, D) token embeddings (no class token)
+            C: number of channels
+            N: number of temporal patches
+        Returns:
+            S: (B, C, C) SPD covariance matrix with epsilon regularization
+        """
+        B = x.shape[0]
+        x_re = rearrange(x, 'b (n c) d -> b n c d', c=C)
+        x_pool = x_re.mean(dim=1)  # (B, C, D) — pool over time
+        S = torch.bmm(x_pool, x_pool.transpose(-1, -2)) / self.enc_dim
+        S = S + 1e-5 * torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
+        return S
+
+    def _spd_log(self, S):
+        """Project SPD matrix to tangent space via matrix logarithm.
+
+        Protected against fp16 — forces float32 for eigendecomposition.
+
+        Args:
+            S: (B, C, C) SPD covariance matrix
+        Returns:
+            S_log: (B, C, C) log-mapped matrix in tangent space
+        """
+        with torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False):
+            S_f32 = S.float()
+            eigvals, Q = torch.linalg.eigh(S_f32)
+            eigvals = eigvals.clamp(min=1e-7)
+            S_log = Q @ torch.diag_embed(torch.log(eigvals)) @ Q.transpose(-1, -2)
+        return S_log.to(S.dtype)
+
+    def _geodesic_distance(self, S1, S2):
+        """Log-Euclidean geodesic distance between two SPD matrices.
+
+        d(S1, S2) = || log(S1) - log(S2) ||_F
+
+        Args:
+            S1, S2: (B, C, C) SPD covariance matrices
+        Returns:
+            scalar: mean Frobenius distance across the batch
+        """
+        S1_log = self._spd_log(S1)
+        S2_log = self._spd_log(S2)
+        return (S1_log - S2_log).norm(p='fro', dim=(-2, -1)).mean()
+
+    def encoder_forward(self, x, channel_list):
         B, C, T = x.shape
         device = x.device
         channel_list = torch.tensor(channel_list, dtype=torch.long, device=device)
-    
-        #Return the patch eeg with shape (b, n, c, d)
+
+        # Patch the EEG: (B, C, T) → (B, N, C, D) → (B, N*C, D)
         x = self.patch(x)
         N = x.shape[1]
         L = x.shape[1] * x.shape[2]
-        x = x.reshape(B,L,-1)
+        x = x.reshape(B, L, -1)
 
-        #Define the embeddings
+        # Add channel embeddings
         if channel_list.dim() == 1:
-            channel_list = channel_list.unsqueeze(0).expand(B, -1) # Make it (B, C)
-            
-        # (B, C) -> (B, 1, C) -> (B, N, C) -> (B, N*C)
+            channel_list = channel_list.unsqueeze(0).expand(B, -1)
         chan_id = channel_list.unsqueeze(1).repeat(1, N, 1).view(B, L)
         chan_embedding = self.channel_embedding_e(chan_id)
-        
-        x += chan_embedding 
+        x += chan_embedding
 
-       
-        seq_idx = torch.arange(0, N, device=device, dtype=torch.long)  # use 0..Seq-1 (or 1..Seq if your ref does)
+        # Add temporal embeddings
+        seq_idx = torch.arange(0, N, device=device, dtype=torch.long)
         eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
-
-        tp = self.temporal_embedding_e(eeg_seq_indices) 
+        tp = self.temporal_embedding_e(eeg_seq_indices)
         x += tp
 
-        #Mask the eeg patches
-        x, mask = self.mask_bert(x)
-        #Concatenate the class token to the eeg
-        class_token = self.class_token + self.temporal_embedding_e.get_class_token()
-        class_token = class_token.expand(B,1,-1)
-        x = torch.cat([class_token, x], dim = 1)
+        # ── Compute anchor covariance S_0 BEFORE masking ──
+        # This is the clean channel covariance from the input embeddings.
+        # Each encoder layer should preserve this connectivity structure.
+        S_0 = self._compute_channel_covariance(x, C, N)
+        # Pre-compute log(S_0) once — reused across all layers
+        S_0_log = self._spd_log(S_0)
 
-        #Pass the sequence through the encoder layers
-        prev_spd = None
+        # Mask the eeg patches (BERT-style)
+        x, mask = self.mask_bert(x)
+
+        # Concatenate the class token
+        class_token = self.class_token + self.temporal_embedding_e.get_class_token()
+        class_token = class_token.expand(B, 1, -1)
+        x = torch.cat([class_token, x], dim=1)
+
+        # ── Pass through encoder, measuring geodesic distance to S_0 at each layer ──
         spd_losses = []
         for transformer in self.encoder:
             x = transformer(x)
-            # Strip class token, reshape to grid, pool over time
+            # Strip class token and compute layer covariance
             x_patches = x[:, 1:, :]  # (B, N*C, D)
-            x_re = rearrange(x_patches, 'b (n c) d -> b n c d', c=C)
-            x_pool = x_re.mean(dim=1)  # (B, C, D) — pool over time
-            # Compute channel covariance (B, C, C)
-            S = torch.bmm(x_pool.transpose(-1, -2), x_pool) / self.enc_dim
-            # Project to tangent space via matrix log
-            with torch.amp.autocast('cuda', enabled=False), \
-                 torch.amp.autocast('cpu', enabled=False):
-                S_f32 = S.float()
-                eigvals, Q = torch.linalg.eigh(S_f32)
-                eigvals = eigvals.clamp(min=1e-7)
-                S_log = Q @ torch.diag_embed(torch.log(eigvals)) @ Q.transpose(-1, -2)
-            S_log = S_log.to(S.dtype)
-            if prev_spd is not None:
-                d = (S_log - prev_spd).norm(p='fro', dim=(-2, -1)).mean()
-                spd_losses.append(d)
-            prev_spd = S_log
+            S_l = self._compute_channel_covariance(x_patches, C, N)
+            S_l_log = self._spd_log(S_l)
+            # Log-Euclidean geodesic distance to the clean input covariance
+            d = (S_l_log - S_0_log).norm(p='fro', dim=(-2, -1)).mean()
+            spd_losses.append(d)
+
         spd_loss = torch.stack(spd_losses).mean()
 
         x = self.norm_enc(x)
-        cls_token = x[:,:1,:]
-        x = x[:,1:,:]
+        cls_token = x[:, :1, :]
+        x = x[:, 1:, :]
         x = self.fc(x)
 
         return x, mask, spd_loss

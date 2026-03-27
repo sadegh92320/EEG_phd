@@ -70,7 +70,7 @@ FIXED_HP = {
         "warmup_epochs": 10,         # Table F.2(a): 10
         "label_smoothing": 0.1,      # Table F.2(a): 0.1
         "scheduler": "cosine",
-        "early_stopping_patience": 20,
+        "early_stopping_patience": 30,
     },
     "classic_nn": {  # Classic NN models (EEGNet, Conformer, CTNet, DeepConvNet)
         "learning_rate": 3e-3,       # Table F.10(a): 3e-3

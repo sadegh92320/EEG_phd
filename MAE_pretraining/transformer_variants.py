@@ -1035,7 +1035,13 @@ class AdaptiveLogMap(nn.Module):
         # Learn a lower-triangular factor L in the GLOBAL channel space
         # R_full = LL^T + εI (144×144), always SPD
         # At forward time, we extract the C×C submatrix for the batch's channels
-        self.L_factor = nn.Parameter(torch.eye(total_channels))
+        # NOTE: small noise breaks eigenvalue degeneracy in R at init.
+        # Without it, R = (1+ε)I has all-identical eigenvalues, and eigh's
+        # backward produces NaN via 0/0 in the (λ_i - λ_j) denominator.
+        init_L = torch.eye(total_channels) + 0.02 * torch.tril(
+            torch.randn(total_channels, total_channels)
+        )
+        self.L_factor = nn.Parameter(init_L)
 
     def _get_submatrix_reference(self, channel_idx):
         """
@@ -1050,15 +1056,32 @@ class AdaptiveLogMap(nn.Module):
         R = L_sub @ L_sub.T + self.eps * I_c
         return R  # guaranteed fp32
 
-    def _compute_R_inv_half(self, R):
-        """Compute R^{-1/2} via eigendecomposition. Input must be float32."""
-        # Narrow autocast disable — only around eigh + the matmuls that
-        # use its output, so the rest of the network stays in fp16.
+    def _compute_R_inv_half(self, R, num_iters=12):
+        """
+        Compute R^{-1/2} via Denman-Beavers iteration (no eigendecomposition).
+
+        Uses only matmuls and torch.linalg.solve — both have clean backward
+        passes with no degenerate-eigenvalue NaN issue (unlike eigh).
+
+        Converges quadratically: 12 iterations give ~machine-precision accuracy
+        for any SPD matrix.
+        """
         with torch.amp.autocast('cuda', enabled=False):
             R = R.float()
-            eigvals, Q = safe_eigh(R)
-            eigvals = eigvals.clamp(min=self.eps)
-            return Q @ torch.diag(eigvals ** (-0.5)) @ Q.T
+            C = R.shape[0]
+            I = torch.eye(C, device=R.device, dtype=R.dtype)
+
+            Y = R.clone()   # converges to R^{1/2}
+            Z = I.clone()   # converges to R^{-1/2}
+
+            for _ in range(num_iters):
+                Y_inv = torch.linalg.solve(Y, I)
+                Z_inv = torch.linalg.solve(Z, I)
+                Y_new = 0.5 * (Y + Z_inv)
+                Z_new = 0.5 * (Z + Y_inv)
+                Y, Z = Y_new, Z_new
+
+            return Z  # R^{-1/2}
 
     def forward(self, S, channel_idx):
         """

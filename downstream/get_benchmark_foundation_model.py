@@ -401,6 +401,8 @@ def run_population(model, model_name, loader, config):
 def run_per_subject(model, model_name, loader, config):
     """Protocol 2 & 3: Per-subject self + transfer evaluation."""
     for pid in loader.participant_ids:
+        if pid not in [8,9]:
+            continue
         train_sub, val_sub, test_sub = loader.per_subject(pid)
         transfer_test = loader.get_subject_transfer(pid)
 
