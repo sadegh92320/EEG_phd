@@ -116,7 +116,8 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
     def __init__(self, config=None, num_channels=64,
                  max_embedding=2000, enc_dim=512, depth_e=8,
                  mask_prob=0.5, patch_size=16, norm_pix_loss=False,
-                 ema_momentum=0.99, spd_alpha=0.01, spd_warmup_epochs=3):
+                 ema_momentum=0.99, spd_alpha=0.01, spd_warmup_epochs=3,
+                 ema_update_every=10, spd_loss_layers=None):
         super().__init__()
 
         self.config = config
@@ -124,6 +125,14 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
         self.num_channels = num_channels
         self.spd_alpha = spd_alpha
         self.spd_warmup_epochs = spd_warmup_epochs
+        self.ema_update_every = ema_update_every
+        self._step_counter = 0
+
+        # Which encoder layers to compute SPD loss on.
+        # Default: first, middle, last — covers the full depth with 3 measurements.
+        if spd_loss_layers is None:
+            spd_loss_layers = {0, depth_e // 2, depth_e - 1}
+        self.spd_loss_layers = set(spd_loss_layers)
 
         # Adaptive Riemannian parallel transformer layers
         self.encoder = nn.ModuleList([
@@ -236,8 +245,11 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
                 )
 
         # Update EMA graph with pre-masking covariance (clean signal)
+        # Only update every K steps to reduce overhead (EMA is stable with m=0.99)
         channel_idx = channel_list[0]  # (C,) global channel indices
-        self.ema_graph.update(S_0, channel_idx)
+        self._step_counter += 1
+        if self.training and (self._step_counter % self.ema_update_every == 0):
+            self.ema_graph.update(S_0, channel_idx)
 
         # Get population-level EMA bias for spatial attention
         ema_bias = self.ema_graph.get_bias(channel_idx)  # (1, H_spatial, C, C)
@@ -246,15 +258,16 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
         x, mask = self.mask_bert(x)
 
         # ── Pass through encoder with EMA bias, measuring SPD distance ──
+        # Only compute SPD loss at selected layers (default: first, middle, last)
         spd_losses = []
-        for transformer in self.encoder:
+        for i, transformer in enumerate(self.encoder):
             x = transformer(x, C, channel_idx=channel_idx, ema_bias=ema_bias)
-            # Compute layer covariance and spectral distance to S_0
-            S_l = self._compute_channel_covariance(x, C, N)
-            d = self._spd_spectral_distance(S_l, log_eig_0)
-            spd_losses.append(d)
+            if i in self.spd_loss_layers:
+                S_l = self._compute_channel_covariance(x, C, N)
+                d = self._spd_spectral_distance(S_l, log_eig_0)
+                spd_losses.append(d)
 
-        spd_loss = torch.stack(spd_losses).mean()
+        spd_loss = torch.stack(spd_losses).mean() if spd_losses else torch.tensor(0.0, device=x.device)
 
         x = self.norm_enc(x)
         x = self.fc(x)
