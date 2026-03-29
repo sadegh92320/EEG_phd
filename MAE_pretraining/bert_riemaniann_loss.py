@@ -181,26 +181,25 @@ class RiemannLossBert(pl.LightningModule):
             S = S + 1e-5 * torch.eye(C, device=S.device, dtype=torch.float32).unsqueeze(0)
         return S
 
-    def _spd_spectral_distance(self, S1, S2):
-        """Log-spectral distance between two SPD covariance matrices.
+    def _spd_spectral_distance(self, S_l, log_eig_anchor):
+        """Log-spectral distance between layer covariance and precomputed anchor.
 
-        d(S1, S2) = || log(eigvals(S1)) - log(eigvals(S2)) ||_2
+        d(S_l, S_0) = || log(eigvals(S_l)) - log_eig_anchor ||_2
 
-        Uses eigvalsh (eigenvalues only, no eigenvectors). This is NaN-safe
-        because eigvalsh backward does NOT involve the 1/(λ_i - λ_j) terms
-        that cause NaN with degenerate eigenvalues — those only appear in the
-        eigenvector gradient of eigh.
+        Only computes eigvalsh on S_l (the layer output). The anchor's
+        log-eigenvalues are precomputed once and detached — no redundant
+        eigendecompositions and no gradients through the anchor.
 
         Args:
-            S1, S2: (B, C, C) SPD covariance matrices
+            S_l: (B, C, C) layer covariance matrix (requires grad)
+            log_eig_anchor: (B, C) precomputed log-eigenvalues of S_0 (detached)
         Returns:
             scalar: mean spectral distance across the batch
         """
         with torch.amp.autocast('cuda', enabled=False), \
              torch.amp.autocast('cpu', enabled=False):
-            eig1 = torch.linalg.eigvalsh(S1.float()).clamp(min=1e-7)
-            eig2 = torch.linalg.eigvalsh(S2.float()).clamp(min=1e-7)
-        return (torch.log(eig1) - torch.log(eig2)).pow(2).sum(dim=-1).sqrt().mean()
+            eig_l = torch.linalg.eigvalsh(S_l.float()).clamp(min=1e-7)
+        return (torch.log(eig_l) - log_eig_anchor).pow(2).sum(dim=-1).sqrt().mean()
 
     def encoder_forward(self, x, channel_list):
         B, C, T = x.shape
@@ -231,6 +230,16 @@ class RiemannLossBert(pl.LightningModule):
         # Each encoder layer should preserve this connectivity structure.
         S_0 = self._compute_channel_covariance(x, C, N)
 
+        # Precompute anchor log-eigenvalues ONCE and detach.
+        # S_0 is the target — no gradients should flow through it
+        # (same principle as the target in contrastive learning).
+        with torch.no_grad():
+            with torch.amp.autocast('cuda', enabled=False), \
+                 torch.amp.autocast('cpu', enabled=False):
+                log_eig_0 = torch.log(
+                    torch.linalg.eigvalsh(S_0.float()).clamp(min=1e-7)
+                )  # (B, C) — detached, computed once
+
         # Mask the eeg patches (BERT-style)
         x, mask = self.mask_bert(x)
 
@@ -247,7 +256,7 @@ class RiemannLossBert(pl.LightningModule):
             x_patches = x[:, 1:, :]  # (B, N*C, D)
             S_l = self._compute_channel_covariance(x_patches, C, N)
             # Log-spectral distance from this layer to the clean input covariance
-            d = self._spd_spectral_distance(S_l, S_0)
+            d = self._spd_spectral_distance(S_l, log_eig_0)
             spd_losses.append(d)
 
         spd_loss = torch.stack(spd_losses).mean()
