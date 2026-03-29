@@ -1174,13 +1174,15 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         # as standard Euclidean attention and learns to use the bias
         self.head_scales = nn.Parameter(torch.zeros(num_heads))
 
-    def forward(self, x, channel_idx):
+    def forward(self, x, channel_idx, return_covariance=False):
         """
         Args:
             x: (B*N, C, D) channel embeddings (from residual stream)
             channel_idx: (C,) long tensor — global channel indices for this batch
+            return_covariance: if True, also return the raw covariance S
         Returns:
-            (B*N, num_heads, C, C) attention bias per head
+            bias: (B*N, num_heads, C, C) attention bias per head
+            S (optional): (B*N, C, C) raw covariance (only if return_covariance=True)
         """
         BN, C, D = x.shape
 
@@ -1200,6 +1202,8 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         scales = self.head_scales.view(1, self.num_heads, 1, 1)
         bias = L.unsqueeze(1) * scales
 
+        if return_covariance:
+            return bias, S
         return bias
 
 
@@ -1250,7 +1254,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             use_approx=use_approx
         )
 
-    def forward(self, x_norm, num_chan, residual=None, channel_idx=None):
+    def forward(self, x_norm, num_chan, residual=None, channel_idx=None, ema_bias=None):
         """
         Args:
             x_norm: (B, L, D) normalized input (post-LayerNorm) — used for QKV
@@ -1259,6 +1263,8 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
                       Riemannian bias. If None, falls back to x_norm.
             channel_idx: (C,) long tensor — global channel indices for this batch.
                          Required for the adaptive reference submatrix extraction.
+            ema_bias: optional (1, H_spatial, C, C) population-level EMA bias.
+                      Added to spatial attention scores alongside per-sample bias.
         """
         B, L, D = x_norm.shape
         assert L % num_chan == 0
@@ -1297,12 +1303,15 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         x_space = rearrange(bias_source, 'b (n c) d -> (b n) c d', c=num_chan)
         riem_bias = self.riemannian_bias(x_space, channel_idx)  # (B*N, H2, C, C)
 
-        # Manual spatial attention with Riemannian bias
+        # Manual spatial attention with Riemannian bias + optional EMA bias
         # Compute score+softmax in float32 to prevent fp16 overflow
         with torch.amp.autocast('cuda', enabled=False), \
              torch.amp.autocast('cpu', enabled=False):
             score = (q_s.float() @ k_s.float().transpose(-2, -1)) / (d ** 0.5)
             score = score + riem_bias.float()
+            # Add population-level EMA bias (broadcasts across B*N)
+            if ema_bias is not None:
+                score = score + ema_bias.float()
             score = score.softmax(dim=-1)
         score = F.dropout(score, p=self.att_dropout, training=self.training)
         out_s = score.to(v_s.dtype) @ v_s
@@ -1363,16 +1372,104 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
         hidden_size = int(embed_dim * mlp_ratio)
         self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
 
-    def forward(self, x, num_chan, channel_idx=None):
+    def forward(self, x, num_chan, channel_idx=None, ema_bias=None):
         """
         Args:
             x: (B, L, D) input tensor where L = N * num_chan
             num_chan: number of channels C in this batch
             channel_idx: (C,) long tensor — global channel indices
+            ema_bias: optional (1, H_spatial, C, C) population-level attention bias
         """
         # Pass normalized input for QKV, raw residual for Riemannian bias
         x = x + self.drop_path1(
-            self.attn(self.norm1(x), num_chan, residual=x, channel_idx=channel_idx)
+            self.attn(self.norm1(x), num_chan, residual=x,
+                      channel_idx=channel_idx, ema_bias=ema_bias)
         )
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
         return x
+
+
+# ════════════════════════════════════════════════════════════════
+# EMA Geometric Graph — population-level channel connectivity
+# ════════════════════════════════════════════════════════════════
+
+class EMAGeometricGraph(nn.Module):
+    """
+    Maintains a running EMA of channel-channel covariance across the entire
+    training corpus. Lives in the global 144-channel space — each batch updates
+    the submatrix corresponding to its channel set.
+
+    The EMA graph captures population-level spatial structure that individual
+    per-sample covariances cannot: averaged over thousands of segments, subjects,
+    and datasets, it converges to the true population covariance pattern.
+
+    Used as an additional attention bias alongside the per-sample Riemannian bias:
+        score = QK^T/sqrt(d) + riem_bias (per-sample) + beta * G_ema_sub (population)
+
+    Args:
+        total_channels: Size of global channel space (default 144)
+        momentum: EMA decay factor (higher = slower update, more stable)
+        num_heads: Number of spatial attention heads (for per-head beta scaling)
+    """
+    def __init__(self, total_channels=TOTAL_GLOBAL_CHANNELS, momentum=0.99,
+                 num_heads=4):
+        super().__init__()
+        self.total_channels = total_channels
+        self.momentum = momentum
+
+        # Running EMA of channel covariance — initialized to identity
+        # (uninformative prior: all channels equally connected)
+        self.register_buffer(
+            'G_ema', torch.eye(total_channels, dtype=torch.float32)
+        )
+        # Track how many updates each channel pair has seen
+        self.register_buffer(
+            'update_count', torch.zeros(total_channels, dtype=torch.long)
+        )
+
+        # Per-head learnable scaling for the EMA bias — initialized near zero
+        # so the model starts without population bias and learns to use it
+        self.head_scales = nn.Parameter(torch.zeros(num_heads))
+
+    @torch.no_grad()
+    def update(self, S_batch, channel_idx):
+        """
+        Update the EMA graph with a batch of covariance matrices.
+
+        Args:
+            S_batch: (B*N, C, C) or (B, C, C) per-sample covariance matrices
+            channel_idx: (C,) long tensor — global channel indices for this batch
+        """
+        if not self.training:
+            return
+
+        # Average across batch dimension → single (C, C) population estimate
+        S_mean = S_batch.float().mean(dim=0)  # (C, C)
+
+        # Update the relevant submatrix of G_ema
+        idx = channel_idx.long()
+        m = self.momentum
+        sub = self.G_ema[idx][:, idx]  # (C, C) current EMA for these channels
+        self.G_ema[idx.unsqueeze(1), idx.unsqueeze(0)] = m * sub + (1 - m) * S_mean
+        self.update_count[idx] += 1
+
+    def get_bias(self, channel_idx):
+        """
+        Extract the EMA submatrix for the current channel set and apply
+        per-head scaling.
+
+        Args:
+            channel_idx: (C,) long tensor — global channel indices
+        Returns:
+            (1, num_heads, C, C) attention bias from population graph
+        """
+        idx = channel_idx.long()
+        G_sub = self.G_ema[idx][:, idx]  # (C, C)
+
+        # Center around identity so the bias represents deviation from uniform
+        I_c = torch.eye(len(idx), device=G_sub.device, dtype=G_sub.dtype)
+        bias = G_sub - I_c  # (C, C)
+
+        # Per-head scaling
+        scales = self.head_scales.view(1, -1, 1, 1)  # (1, H, 1, 1)
+        return bias.unsqueeze(0).unsqueeze(0) * scales  # (1, H, C, C)

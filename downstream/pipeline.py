@@ -18,6 +18,7 @@ from MAE_pretraining.bert_parallel_approx_riemann import ApproxAdaptiveRiemannBe
 from MAE_pretraining.pretrain_gnn import GNNEncoderDecoder
 from MAE_pretraining.bert_parallel_adaptive_riemann import AdaptiveRiemannBert
 from MAE_pretraining.pretraining import EncoderDecoder
+from MAE_pretraining.bert_adaptive_ema import AdaptiveRiemannEMABert
 import random
 import torchvision
 from torch.utils.data import random_split
@@ -152,7 +153,7 @@ class Pipeline:
         if pretrain:
             print("new's")
             train_loader, valid_loader = self.import_data_pretrain()
-            model = RiemannLossBert()
+            model = AdaptiveRiemannEMABert()
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
