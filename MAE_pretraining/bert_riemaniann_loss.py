@@ -96,13 +96,16 @@ class TemporalPositionalEncoding(nn.Module):
 
 class RiemannLossBert(pl.LightningModule):
     """Basic encoder decoder model following the ViT model"""
-    def __init__(self, config = None, num_channels = 64, 
-                 max_embedding = 2000, enc_dim = 512, depth_e = 8, 
-                  mask_prob = 0.5, patch_size = 16, norm_pix_loss = False):
+    def __init__(self, config = None, num_channels = 64,
+                 max_embedding = 2000, enc_dim = 512, depth_e = 8,
+                  mask_prob = 0.5, patch_size = 16, norm_pix_loss = False,
+                  spd_alpha = 0.01, spd_warmup_epochs = 3):
         super().__init__()
 
         self.config = config
         self.enc_dim = enc_dim
+        self.spd_alpha = spd_alpha
+        self.spd_warmup_epochs = spd_warmup_epochs
 
 
         #Define the encoder and decoder layers
@@ -282,7 +285,16 @@ class RiemannLossBert(pl.LightningModule):
             target = (target - mean) / (var + 1.e-6)**.5                 
         loss_per_patch = ((pred - target) ** 2).mean(dim=-1)    # (B, L)
         loss = (loss_per_patch * mask).sum() / mask.sum().clamp_min(1.0)
-        alpha = 0.1
+
+        # Linear warmup: SPD loss is 0 for the first spd_warmup_epochs,
+        # then linearly ramps to full spd_alpha over the next spd_warmup_epochs.
+        current_epoch = self.current_epoch if self.training else self.spd_warmup_epochs * 2
+        if current_epoch < self.spd_warmup_epochs:
+            alpha = 0.0
+        else:
+            ramp = min(1.0, (current_epoch - self.spd_warmup_epochs) / max(self.spd_warmup_epochs, 1))
+            alpha = self.spd_alpha * ramp
+
         total_loss = loss + alpha * spd_loss
         return total_loss, pred, mask, loss, spd_loss
 
