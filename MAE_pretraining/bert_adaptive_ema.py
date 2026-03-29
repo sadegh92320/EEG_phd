@@ -1,13 +1,13 @@
 """
-Adaptive Riemannian BERT with EMA Geometric Graph + SPD Loss
+Adaptive Riemannian BERT with EMA Geometric Graph as Reference + SPD Loss
 
 Builds on bert_parallel_adaptive_riemann.py with two additions:
 
 1. EMA Geometric Graph: A persistent 144×144 buffer that accumulates
    channel-channel covariance structure across the entire training corpus
-   via exponential moving average. Provides a population-level attention
-   bias alongside the per-sample Riemannian bias. Cross-dataset knowledge
-   transfer happens through this shared global graph.
+   via exponential moving average. Used as the REFERENCE POINT for the
+   adaptive log map: S - G_ema instead of S - I. The Riemannian bias
+   measures per-sample deviation from population average.
 
 2. SPD Spectral Loss: Auxiliary regularizer that penalizes drift in channel
    covariance structure through the encoder layers (anchored to pre-masking
@@ -16,8 +16,8 @@ Builds on bert_parallel_adaptive_riemann.py with two additions:
 
 Three levels of spatial information:
     - nn.Embedding: channel identity ("I am Cz")
-    - Per-sample Riemannian bias: instance-level geometry (this EEG segment)
-    - EMA graph bias: population-level geometry (all training data)
+    - Per-sample Riemannian bias: instance-level geometry relative to population
+    - EMA graph: population-level geometry (tangent space reference)
 """
 import numpy as np
 import torch
@@ -263,16 +263,16 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
                             torch.linalg.eigvalsh(S_0.float()).clamp(min=1e-7)
                         )
 
-        # Get population-level EMA bias for spatial attention
-        ema_bias = self.ema_graph.get_bias(channel_idx)  # (1, H_spatial, C, C)
+        # Get population-level EMA reference for tangent space projection
+        ema_ref = self.ema_graph.get_ref(channel_idx)  # (C, C)
 
         # BERT-style masking
         x, mask = self.mask_bert(x)
 
-        # ── Pass through encoder with EMA bias ──
+        # ── Pass through encoder with EMA reference ──
         spd_losses = []
         for i, transformer in enumerate(self.encoder):
-            x = transformer(x, C, channel_idx=channel_idx, ema_bias=ema_bias)
+            x = transformer(x, C, channel_idx=channel_idx, ema_ref=ema_ref)
             # Only compute SPD loss at selected layers when alpha > 0
             if spd_active and i in self.spd_loss_layers:
                 S_l = self._compute_channel_covariance(x, C, N)
@@ -357,13 +357,6 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
             self.log(f"head_scale_std/layer_{i}", scales.std(), on_step=False, on_epoch=True)
             for h in range(scales.numel()):
                 self.log(f"head_scale/layer_{i}_head_{h}", scales[h], on_step=False, on_epoch=True)
-
-        # Log EMA graph head scales (mean, std, and individual)
-        ema_scales = self.ema_graph.head_scales.detach()
-        self.log("ema_scale_mean", ema_scales.mean(), on_step=False, on_epoch=True)
-        self.log("ema_scale_std", ema_scales.std(), on_step=False, on_epoch=True)
-        for h in range(ema_scales.numel()):
-            self.log(f"ema_scale/head_{h}", ema_scales[h], on_step=False, on_epoch=True)
 
         return total_loss
 

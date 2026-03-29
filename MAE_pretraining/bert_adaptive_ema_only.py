@@ -1,18 +1,21 @@
 """
-Adaptive Riemannian BERT with EMA Geometric Graph
+Adaptive Riemannian BERT with EMA Geometric Graph as Reference Point
 
 Builds on bert_parallel_adaptive_riemann.py with one addition:
 
 EMA Geometric Graph: A persistent 144×144 buffer that accumulates
 channel-channel covariance structure across the entire training corpus
-via exponential moving average. Provides a population-level attention
-bias alongside the per-sample Riemannian bias. Cross-dataset knowledge
-transfer happens through this shared global graph.
+via exponential moving average. Used as the REFERENCE POINT for the
+adaptive log map tangent space projection: S - G_ema instead of S - I.
+
+This means the Riemannian attention bias measures per-sample DEVIATION
+from the population average, not absolute covariance. Cross-dataset
+knowledge transfer happens through this shared global graph.
 
 Three levels of spatial information:
     - nn.Embedding: channel identity ("I am Cz")
-    - Per-sample Riemannian bias: instance-level geometry (this EEG segment)
-    - EMA graph bias: population-level geometry (all training data)
+    - Per-sample Riemannian bias: instance-level geometry relative to population
+    - EMA graph: population-level geometry (tangent space reference)
 """
 import numpy as np
 import torch
@@ -204,15 +207,15 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
             S_0 = self._compute_channel_covariance(x, C, N)
             self.ema_graph.update(S_0, channel_idx)
 
-        # Get population-level EMA bias
-        ema_bias = self.ema_graph.get_bias(channel_idx)
+        # Get population-level EMA reference for tangent space projection
+        ema_ref = self.ema_graph.get_ref(channel_idx)  # (C, C)
 
         # BERT-style masking
         x, mask = self.mask_bert(x)
 
-        # Encoder
+        # Encoder — ema_ref changes the log map from S-I to S-G_ema
         for transformer in self.encoder:
-            x = transformer(x, C, channel_idx=channel_idx, ema_bias=ema_bias)
+            x = transformer(x, C, channel_idx=channel_idx, ema_ref=ema_ref)
 
         x = self.norm_enc(x)
         x = self.fc(x)
@@ -285,13 +288,6 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
             self.log(f"head_scale_std/layer_{i}", scales.std(), on_step=False, on_epoch=True)
             for h in range(scales.numel()):
                 self.log(f"head_scale/layer_{i}_head_{h}", scales[h], on_step=False, on_epoch=True)
-
-        # Log EMA graph head scales
-        ema_scales = self.ema_graph.head_scales.detach()
-        self.log("ema_scale_mean", ema_scales.mean(), on_step=False, on_epoch=True)
-        self.log("ema_scale_std", ema_scales.std(), on_step=False, on_epoch=True)
-        for h in range(ema_scales.numel()):
-            self.log(f"ema_scale/head_{h}", ema_scales[h], on_step=False, on_epoch=True)
 
         return loss
 

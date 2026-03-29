@@ -1019,21 +1019,25 @@ TOTAL_GLOBAL_CHANNELS = 144
 
 class AdaptiveLogMap(nn.Module):
     """
-    Log map at a learned reference point on the SPD manifold, supporting
+    Log map at a reference point on the SPD manifold, supporting
     variable channel counts across batches.
 
-    The reference R_full lives in the global channel space (144×144). At
-    forward time, channel indices select the relevant C×C submatrix. This
-    allows different batches to have different channel counts while sharing
-    a single learned geometric reference.
+    The reference can be either:
+    - Learned (L_factor): a 144×144 lower-triangular parameter (for pade/eigh modes)
+    - External (EMA): passed at forward time from EMAGeometricGraph (for approx mode)
 
-    Math: Log_R(S) = log(R^{-1/2} S R^{-1/2})
+    In approx mode with an EMA reference, the projection becomes:
+        S - G_ema_sub
+    which measures "how does this sample's channel covariance deviate from the
+    population average." Without an EMA reference, falls back to S - I.
+
+    Math (full modes): Log_R(S) = log(R^{-1/2} S R^{-1/2})
 
     Args:
         total_channels: Size of the global channel space (default 144)
         eps: Regularization constant for numerical stability
         log_mode: How to compute the matrix logarithm:
-            'approx' — first-order: log(M) ≈ M - I  (fastest, no eigh)
+            'approx' — first-order: S - ref  (fastest, no eigh)
             'pade'   — Padé via scaling-and-squaring  (fast, all matmuls, fp16-ok)
             'eigh'   — exact eigendecomposition       (slow, requires fp32)
         use_approx: DEPRECATED — kept for backward compat. If True, sets log_mode='approx'.
@@ -1050,16 +1054,14 @@ class AdaptiveLogMap(nn.Module):
         else:
             self.log_mode = log_mode
 
-        # Learn a lower-triangular factor L in the GLOBAL channel space
-        # R_full = LL^T + εI (144×144), always SPD
-        # At forward time, we extract the C×C submatrix for the batch's channels
-        # NOTE: small noise breaks eigenvalue degeneracy in R at init.
-        # Without it, R = (1+ε)I has all-identical eigenvalues, and eigh's
-        # backward produces NaN via 0/0 in the (λ_i - λ_j) denominator.
-        init_L = torch.eye(total_channels) + 0.02 * torch.tril(
-            torch.randn(total_channels, total_channels)
-        )
-        self.L_factor = nn.Parameter(init_L)
+        # Only allocate L_factor for modes that actually use it (pade/eigh).
+        # In approx mode, the reference is either identity or an external EMA —
+        # no learned parameter needed.
+        if self.log_mode != 'approx':
+            init_L = torch.eye(total_channels) + 0.02 * torch.tril(
+                torch.randn(total_channels, total_channels)
+            )
+            self.L_factor = nn.Parameter(init_L)
 
     def _get_submatrix_reference(self, channel_idx):
         """
@@ -1104,25 +1106,29 @@ class AdaptiveLogMap(nn.Module):
                 Z = I
             return Z  # R^{-1/2}
 
-    def forward(self, S, channel_idx):
+    def forward(self, S, channel_idx, ema_ref=None):
         """
         Args:
             S: (batch, C, C) batch of SPD matrices
             channel_idx: (C,) long tensor — global channel indices for this batch
+            ema_ref: optional (C, C) population covariance from EMAGeometricGraph.
+                     Used as the reference point in approx mode instead of identity.
         Returns:
-            (batch, C, C) tangent vectors at the learned reference
+            (batch, C, C) tangent vectors at the reference point
         """
         orig_dtype = S.dtype
         C = channel_idx.shape[0]
 
         if self.log_mode == 'approx':
             # ── FAST PATH: no R_inv_half, no solve, no eigh ──
-            # S is already SPD and captures channel covariance.
-            # S - I is the first-order tangent-space approximation at identity.
-            # head_scales (init=0) learn to calibrate magnitude automatically.
-            # This path uses ONLY matmul/add — zero NaN risk.
-            I_c = torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
-            return (S - I_c).to(orig_dtype)
+            # First-order tangent-space approximation: S - ref
+            # If EMA reference provided: deviation from population average
+            # Otherwise: deviation from identity (original behavior)
+            if ema_ref is not None:
+                ref = ema_ref.unsqueeze(0).to(dtype=S.dtype, device=S.device)
+            else:
+                ref = torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
+            return (S - ref).to(orig_dtype)
 
         # ── FULL PATH: whiten with learned reference R ──
         R = self._get_submatrix_reference(channel_idx)       # (C, C) fp32
@@ -1174,12 +1180,13 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         # as standard Euclidean attention and learns to use the bias
         self.head_scales = nn.Parameter(torch.zeros(num_heads))
 
-    def forward(self, x, channel_idx, return_covariance=False):
+    def forward(self, x, channel_idx, return_covariance=False, ema_ref=None):
         """
         Args:
             x: (B*N, C, D) channel embeddings (from residual stream)
             channel_idx: (C,) long tensor — global channel indices for this batch
             return_covariance: if True, also return the raw covariance S
+            ema_ref: optional (C, C) population covariance from EMAGeometricGraph
         Returns:
             bias: (B*N, num_heads, C, C) attention bias per head
             S (optional): (B*N, C, C) raw covariance (only if return_covariance=True)
@@ -1195,8 +1202,8 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
             S = torch.bmm(x_f32, x_f32.transpose(-2, -1)) / D
             S = S + self.eps * torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
 
-        # Step 2: Project to tangent space at learned reference (channel-aware)
-        L = self.adaptive_log(S, channel_idx)  # (B*N, C, C)
+        # Step 2: Project to tangent space at reference (EMA population or identity)
+        L = self.adaptive_log(S, channel_idx, ema_ref=ema_ref)  # (B*N, C, C)
 
         # Step 3: Per-head scaling
         scales = self.head_scales.view(1, self.num_heads, 1, 1)
@@ -1254,7 +1261,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             use_approx=use_approx
         )
 
-    def forward(self, x_norm, num_chan, residual=None, channel_idx=None, ema_bias=None):
+    def forward(self, x_norm, num_chan, residual=None, channel_idx=None, ema_ref=None):
         """
         Args:
             x_norm: (B, L, D) normalized input (post-LayerNorm) — used for QKV
@@ -1263,8 +1270,8 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
                       Riemannian bias. If None, falls back to x_norm.
             channel_idx: (C,) long tensor — global channel indices for this batch.
                          Required for the adaptive reference submatrix extraction.
-            ema_bias: optional (1, H_spatial, C, C) population-level EMA bias.
-                      Added to spatial attention scores alongside per-sample bias.
+            ema_ref: optional (C, C) population covariance from EMAGeometricGraph.
+                     Used as the tangent space reference point in approx mode.
         """
         B, L, D = x_norm.shape
         assert L % num_chan == 0
@@ -1299,19 +1306,17 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         v_s = rearrange(v_s, 'b h (n c) d -> (b n) h c d', c=num_chan)
 
         # Compute Riemannian bias from RESIDUAL STREAM (pre-LayerNorm)
+        # ema_ref changes the tangent space reference from identity to population average
         bias_source = residual if residual is not None else x_norm
         x_space = rearrange(bias_source, 'b (n c) d -> (b n) c d', c=num_chan)
-        riem_bias = self.riemannian_bias(x_space, channel_idx)  # (B*N, H2, C, C)
+        riem_bias = self.riemannian_bias(x_space, channel_idx, ema_ref=ema_ref)  # (B*N, H2, C, C)
 
-        # Manual spatial attention with Riemannian bias + optional EMA bias
+        # Manual spatial attention with Riemannian bias
         # Compute score+softmax in float32 to prevent fp16 overflow
         with torch.amp.autocast('cuda', enabled=False), \
              torch.amp.autocast('cpu', enabled=False):
             score = (q_s.float() @ k_s.float().transpose(-2, -1)) / (d ** 0.5)
             score = score + riem_bias.float()
-            # Add population-level EMA bias (broadcasts across B*N)
-            if ema_bias is not None:
-                score = score + ema_bias.float()
             score = score.softmax(dim=-1)
         score = F.dropout(score, p=self.att_dropout, training=self.training)
         out_s = score.to(v_s.dtype) @ v_s
@@ -1372,18 +1377,20 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
         hidden_size = int(embed_dim * mlp_ratio)
         self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
 
-    def forward(self, x, num_chan, channel_idx=None, ema_bias=None):
+    def forward(self, x, num_chan, channel_idx=None, ema_ref=None):
         """
         Args:
             x: (B, L, D) input tensor where L = N * num_chan
             num_chan: number of channels C in this batch
             channel_idx: (C,) long tensor — global channel indices
-            ema_bias: optional (1, H_spatial, C, C) population-level attention bias
+            ema_ref: optional (C, C) population covariance from EMAGeometricGraph.
+                     Used as the tangent space reference point in approx mode.
+                     If None, falls back to identity (S - I).
         """
         # Pass normalized input for QKV, raw residual for Riemannian bias
         x = x + self.drop_path1(
             self.attn(self.norm1(x), num_chan, residual=x,
-                      channel_idx=channel_idx, ema_bias=ema_bias)
+                      channel_idx=channel_idx, ema_ref=ema_ref)
         )
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
         return x
@@ -1403,13 +1410,17 @@ class EMAGeometricGraph(nn.Module):
     per-sample covariances cannot: averaged over thousands of segments, subjects,
     and datasets, it converges to the true population covariance pattern.
 
-    Used as an additional attention bias alongside the per-sample Riemannian bias:
-        score = QK^T/sqrt(d) + riem_bias (per-sample) + beta * G_ema_sub (population)
+    Used as the REFERENCE POINT for the adaptive log map tangent space projection:
+        tangent = S_sample - G_ema_sub  (instead of S_sample - I)
+
+    This means the Riemannian bias measures per-sample DEVIATION from population
+    average, not absolute covariance. More informative: identity treats all
+    channels as uncorrelated, but EEG channels are always correlated.
 
     Args:
         total_channels: Size of global channel space (default 144)
         momentum: EMA decay factor (higher = slower update, more stable)
-        num_heads: Number of spatial attention heads (for per-head beta scaling)
+        num_heads: DEPRECATED — kept for backward compat, no longer used.
     """
     def __init__(self, total_channels=TOTAL_GLOBAL_CHANNELS, momentum=0.99,
                  num_heads=4):
@@ -1419,6 +1430,7 @@ class EMAGeometricGraph(nn.Module):
 
         # Running EMA of channel covariance — initialized to identity
         # (uninformative prior: all channels equally connected)
+        # At init, get_ref returns identity → S - I (same as before EMA warms up)
         self.register_buffer(
             'G_ema', torch.eye(total_channels, dtype=torch.float32)
         )
@@ -1426,10 +1438,6 @@ class EMAGeometricGraph(nn.Module):
         self.register_buffer(
             'update_count', torch.zeros(total_channels, dtype=torch.long)
         )
-
-        # Per-head learnable scaling for the EMA bias — initialized near zero
-        # so the model starts without population bias and learns to use it
-        self.head_scales = nn.Parameter(torch.zeros(num_heads))
 
     @torch.no_grad()
     def update(self, S_batch, channel_idx):
@@ -1453,23 +1461,22 @@ class EMAGeometricGraph(nn.Module):
         self.G_ema[idx.unsqueeze(1), idx.unsqueeze(0)] = m * sub + (1 - m) * S_mean
         self.update_count[idx] += 1
 
-    def get_bias(self, channel_idx):
+    def get_ref(self, channel_idx):
         """
-        Extract the EMA submatrix for the current channel set and apply
-        per-head scaling.
+        Extract the EMA submatrix for the current channel set as the tangent
+        space reference point.
 
-        No identity subtraction — the raw covariance structure IS the signal.
-        Diagonal entries encode per-channel variance (informative), off-diagonal
-        encode correlations. head_scales init to 0 handles the cold start.
+        Returns the raw (C, C) population covariance — no scaling, no reshaping.
+        The per-sample Riemannian bias's own head_scales handle magnitude.
+
+        At init (before any updates), G_ema = I → tangent = S - I (standard).
+        As training progresses, G_ema converges to population average →
+        tangent = S - G_pop (measures per-sample deviation).
 
         Args:
             channel_idx: (C,) long tensor — global channel indices
         Returns:
-            (1, num_heads, C, C) attention bias from population graph
+            (C, C) population covariance submatrix
         """
         idx = channel_idx.long()
-        G_sub = self.G_ema[idx.unsqueeze(1), idx.unsqueeze(0)]  # (C, C)
-
-        # Per-head scaling (head_scales init to 0 → no contribution at start)
-        scales = self.head_scales.view(1, -1, 1, 1)  # (1, H, 1, 1)
-        return G_sub.unsqueeze(0).unsqueeze(0) * scales  # (1, H, C, C)
+        return self.G_ema[idx.unsqueeze(1), idx.unsqueeze(0)]  # (C, C)

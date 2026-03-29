@@ -769,7 +769,7 @@ class TrainerDownstream:
 
         # --- FINAL TEST EVALUATION RUN ---
         wandb.init(
-            project="per_subject_eval_3",
+            project="per_subject_eval_4",
             name=f"per_subject_{participant_number}_{name_project}",
             reinit=True,
             config={"learning_rate": hp["learning_rate"], "batch_size": hp["batch_size"],
