@@ -18,7 +18,7 @@ from MAE_pretraining.bert_parallel_approx_riemann import ApproxAdaptiveRiemannBe
 from MAE_pretraining.pretrain_gnn import GNNEncoderDecoder
 from MAE_pretraining.bert_parallel_adaptive_riemann import AdaptiveRiemannBert
 from MAE_pretraining.pretraining import EncoderDecoder
-from MAE_pretraining.bert_adaptive_ema import AdaptiveRiemannEMABert
+
 import random
 import torchvision
 from torch.utils.data import random_split
@@ -34,6 +34,7 @@ from downstream.downstream_model import Downstream
 from pytorch_lightning.loggers import WandbLogger
 from MAE_pretraining.load_data import get_dataloader
 from downstream.split_data_downstream import DownstreamDataLoader
+from MAE_pretraining.bert_adaptive_ema_only import AdaptiveRiemannEMABert
 
 
 def seed_everything(seed=42):
