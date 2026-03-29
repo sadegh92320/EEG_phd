@@ -12,6 +12,7 @@ from MAE_pretraining.transformer_variants import (
     TransformerLayerViT,
     RiemannianCrissCrossTransformer,
     RiemannianParallelCrissCrossTransformer,
+    AdaptiveRiemannianParallelTransformer,
 )
 
 
@@ -304,23 +305,64 @@ class DownstreamRiemannLoss(Downstream):
 
 class DownstreamRiemannTransformerPara(Downstream):
     """
-    Encoder: RiemannianParallelCrissCrossTransformer (head-split spatial-temporal
-    attention with Riemannian bias on spatial heads).
+    Encoder: AdaptiveRiemannianParallelTransformer (head-split spatial-temporal
+    attention with adaptive Riemannian bias on spatial heads, approx log map).
     Channel encoding: nn.Embedding (inherited from base).
+
+    The adaptive transformer needs global channel indices (channel_idx) to
+    extract the correct submatrix from the learned 144×144 SPD reference.
+    These are passed from forward() → _run_encoder().
     """
 
     @staticmethod
     def _build_encoder(enc_dim, depth_e):
         return nn.ModuleList([
-            RiemannianParallelCrissCrossTransformer(enc_dim, nhead=8, mlp_ratio=4)
-            for _ in range(depth_e)
+            AdaptiveRiemannianParallelTransformer(
+                enc_dim, nhead=8, mlp_ratio=4, log_mode='approx'
+            ) for _ in range(depth_e)
         ])
 
-    def _run_encoder(self, x, C):
-        """Riemannian parallel transformer needs num_chan."""
+    def _run_encoder(self, x, C, channel_idx=None):
+        """Adaptive Riemannian parallel transformer needs num_chan + channel_idx."""
         for transformer in self.encoder:
-            x = transformer(x, num_chan=C)
+            x = transformer(x, num_chan=C, channel_idx=channel_idx)
         return x
+
+    def forward(self, x, channel_list):
+        B, C, T = x.shape
+        device = x.device
+
+        # Patch embed
+        x = self.patch(x)
+        N = x.shape[1]
+        x = rearrange(x, "b n c d -> b (n c) d")
+        L = x.shape[1]
+
+        # Channel embedding
+        if channel_list.dim() == 1:
+            channel_list = channel_list.unsqueeze(0).expand(B, -1)
+        x = x + self._get_channel_embedding(channel_list, N, B, L)
+
+        # Temporal embedding
+        seq_idx = torch.arange(0, N, device=device).unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
+        x = x + self.temporal_embedding(seq_idx)
+
+        # NOTE: No class token before encoder — the adaptive Riemannian
+        # attention requires L = N * C (asserts L % num_chan == 0).
+        # The pretraining code also omits the class token.
+
+        # Extract global channel indices for the adaptive Riemannian reference
+        # Within a batch all samples share the same channel set (same dataset)
+        channel_idx = channel_list[0]  # (C,) global channel indices
+
+        # Encoder (no class token — sequence is exactly N*C)
+        x = self._run_encoder(x, C, channel_idx=channel_idx)
+        x = self.norm_enc(x)
+
+        # Head: cls_out unused for avg pooling, pass None-like placeholder
+        cls_out = x[:, :1, :]   # first patch token as dummy CLS
+        patch_out = x            # all tokens are patch tokens
+        return self.head(cls_out, patch_out)
 
 
 # ════════════════════════════════════════════════════════════════

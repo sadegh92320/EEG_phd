@@ -114,6 +114,7 @@ def build_riemann_loss(num_classes, checkpoint_path, num_channels, data_length, 
     return model
 
 def build_riemann_transformer_para(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
+    """Adaptive Riemannian parallel transformer (approx log map, learned SPD reference)."""
     model = DownstreamRiemannTransformerPara(num_classes=num_classes, checkpoint_path=checkpoint_path)
     return model
 
@@ -367,6 +368,7 @@ MODEL_BUILDERS = {
     "encoder_gnn": build_gnn_embedding,
     "riemann_loss": build_riemann_loss,
     "riemann_para": build_riemann_transformer_para,
+    "riemann_adaptive": build_riemann_transformer_para,  # alias — same model
     "riemann_seq": build_riemann_transformer_seq,
 }
 
@@ -401,7 +403,7 @@ def run_population(model, model_name, loader, config):
 def run_per_subject(model, model_name, loader, config):
     """Protocol 2 & 3: Per-subject self + transfer evaluation."""
     for pid in loader.participant_ids:
-        if pid not in [8,9]:
+        if pid not in [6,7]:
             continue
         train_sub, val_sub, test_sub = loader.per_subject(pid)
         transfer_test = loader.get_subject_transfer(pid)
