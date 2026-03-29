@@ -333,16 +333,20 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
         self.log("reconstruction_loss", recon_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log("spd_loss", spd_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
-        # Log per-layer head scales (Riemannian attention)
+        # Log per-layer Riemannian attention head scales (mean, std, and individual)
         for i, layer in enumerate(self.encoder):
             scales = layer.attn.riemannian_bias.head_scales.detach()
             self.log(f"head_scale_mean/layer_{i}", scales.mean(), on_step=False, on_epoch=True)
             self.log(f"head_scale_std/layer_{i}", scales.std(), on_step=False, on_epoch=True)
+            for h in range(scales.numel()):
+                self.log(f"head_scale/layer_{i}_head_{h}", scales[h], on_step=False, on_epoch=True)
 
-        # Log EMA graph scales
+        # Log EMA graph head scales (mean, std, and individual)
         ema_scales = self.ema_graph.head_scales.detach()
         self.log("ema_scale_mean", ema_scales.mean(), on_step=False, on_epoch=True)
         self.log("ema_scale_std", ema_scales.std(), on_step=False, on_epoch=True)
+        for h in range(ema_scales.numel()):
+            self.log(f"ema_scale/head_{h}", ema_scales[h], on_step=False, on_epoch=True)
 
         return total_loss
 

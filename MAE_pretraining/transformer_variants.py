@@ -1449,7 +1449,7 @@ class EMAGeometricGraph(nn.Module):
         # Update the relevant submatrix of G_ema
         idx = channel_idx.long()
         m = self.momentum
-        sub = self.G_ema[idx][:, idx]  # (C, C) current EMA for these channels
+        sub = self.G_ema[idx.unsqueeze(1), idx.unsqueeze(0)]  # (C, C)
         self.G_ema[idx.unsqueeze(1), idx.unsqueeze(0)] = m * sub + (1 - m) * S_mean
         self.update_count[idx] += 1
 
@@ -1458,18 +1458,18 @@ class EMAGeometricGraph(nn.Module):
         Extract the EMA submatrix for the current channel set and apply
         per-head scaling.
 
+        No identity subtraction — the raw covariance structure IS the signal.
+        Diagonal entries encode per-channel variance (informative), off-diagonal
+        encode correlations. head_scales init to 0 handles the cold start.
+
         Args:
             channel_idx: (C,) long tensor — global channel indices
         Returns:
             (1, num_heads, C, C) attention bias from population graph
         """
         idx = channel_idx.long()
-        G_sub = self.G_ema[idx][:, idx]  # (C, C)
+        G_sub = self.G_ema[idx.unsqueeze(1), idx.unsqueeze(0)]  # (C, C)
 
-        # Center around identity so the bias represents deviation from uniform
-        I_c = torch.eye(len(idx), device=G_sub.device, dtype=G_sub.dtype)
-        bias = G_sub - I_c  # (C, C)
-
-        # Per-head scaling
+        # Per-head scaling (head_scales init to 0 → no contribution at start)
         scales = self.head_scales.view(1, -1, 1, 1)  # (1, H, 1, 1)
-        return bias.unsqueeze(0).unsqueeze(0) * scales  # (1, H, C, C)
+        return G_sub.unsqueeze(0).unsqueeze(0) * scales  # (1, H, C, C)

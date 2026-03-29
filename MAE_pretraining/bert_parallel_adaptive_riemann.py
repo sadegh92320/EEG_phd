@@ -284,11 +284,13 @@ class AdaptiveRiemannBert(pl.LightningModule):
         self.log("lr", lr, on_step=True, prog_bar=False)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
-        # Log the learned head scales across layers for analysis
+        # Log per-layer Riemannian attention head scales (mean, std, and individual)
         for i, layer in enumerate(self.encoder):
             scales = layer.attn.riemannian_bias.head_scales.detach()
             self.log(f"head_scale_mean/layer_{i}", scales.mean(), on_step=False, on_epoch=True)
             self.log(f"head_scale_std/layer_{i}", scales.std(), on_step=False, on_epoch=True)
+            for h in range(scales.numel()):
+                self.log(f"head_scale/layer_{i}_head_{h}", scales[h], on_step=False, on_epoch=True)
 
         return loss
 
