@@ -161,12 +161,12 @@ class Pipeline:
                     mode="min",
                     save_top_k=5,
                     save_last=True,
-                    filename="epoch{epoch}-loss-rie-{val_mse:.4f}",
+                    filename="epoch{epoch}-rie-ema-{val_mse:.4f}",
                 )
 
             wandb_logger = WandbLogger(
                 project="eeg_foundation_model",
-                name="riemann-loss",
+                name="riemann-ema",
                 log_model="all"
             )
             wandb_logger.experiment.config.update({
