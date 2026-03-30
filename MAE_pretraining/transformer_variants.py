@@ -1057,14 +1057,15 @@ class AdaptiveLogMap(nn.Module):
         else:
             self.log_mode = log_mode
 
-        # Only allocate L_factor for modes that actually use it (pade/eigh).
-        # In approx mode, the reference is either identity or an external EMA —
-        # no learned parameter needed.
-        if self.log_mode != 'approx':
-            init_L = torch.eye(total_channels) + 0.02 * torch.tril(
-                torch.randn(total_channels, total_channels)
-            )
-            self.L_factor = nn.Parameter(init_L)
+        # Learn a lower-triangular factor L in the GLOBAL channel space
+        # R_full = LL^T + εI (144×144), always SPD
+        # At forward time, we extract the C×C submatrix for the batch's channels
+        # NOTE: L_factor is only used by pade/eigh modes, but we always allocate
+        # it to keep torch's random state consistent across modes (seed reproducibility).
+        init_L = torch.eye(total_channels) + 0.02 * torch.tril(
+            torch.randn(total_channels, total_channels)
+        )
+        self.L_factor = nn.Parameter(init_L)
 
     def _get_submatrix_reference(self, channel_idx):
         """
