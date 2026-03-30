@@ -26,14 +26,14 @@ def get_batch_size(num_channel):
     """
     More channels = smaller batch size
     to maintain a constant VRAM footprint.
-    Tuned for A100 80GB with mixed precision.
+    Tuned for A100 80GB with mixed precision + Riemannian covariance.
     """
     if num_channel >= 64:
-        return 64   # Was 32
+        return 48   # Was 32 — conservative due to B*N*C*C covariance tensors
     elif num_channel >= 32:
-        return 128   # Was 64
+        return 96   # Was 64
     else:
-        return 256   # Was 128
+        return 192   # Was 128
 
 
 def get_dataloader(config):
