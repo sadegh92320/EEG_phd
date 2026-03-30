@@ -99,48 +99,46 @@ FIXED_HP = {
 }
 
 # ── Per-model HP overrides for linear_probe mode ──
-# Each paper has its own optimal training recipe.
-# These override FIXED_HP["linear_probe"] when model_name matches.
-# Keys not present here fall back to FIXED_HP["linear_probe"].
+# UNIFIED: All foundation models now use FIXED_HP["linear_probe"] for fair comparison.
+# Per-model overrides are commented out. Uncomment to restore paper-specific recipes
+# (e.g. for supplementary tables showing "best possible" per model).
 MODEL_HP_OVERRIDES = {
-    "eegpt": {  # EEGPT paper: OneCycleLR, lower lr, no smoothing
-        "learning_rate": 4e-4,
-        "weight_decay": 0.01,
-        "label_smoothing": 0.0,
-        "scheduler": "onecycle",     # OneCycleLR stepped per batch
-        "warmup_epochs": 0,          # OneCycleLR handles its own warmup via pct_start
-        "num_epochs_eval": 100,
-        "early_stopping_patience": 30,
-    },
-    "cbramod": {  # CBraMod paper: similar recipe
-        "learning_rate": 1e-3,
-        "weight_decay": 0.01,
-        "label_smoothing": 0.0,
-        "scheduler": "onecycle",
-        "warmup_epochs": 0,
-        "num_epochs_eval": 100,
-        "early_stopping_patience": 30,
-    },
-    "labram": {  # LaBraM: from their released code
-        "learning_rate": 4e-4,
-        "weight_decay": 0.01,
-        "label_smoothing": 0.0,
-        "scheduler": "onecycle",
-        "warmup_epochs": 0,
-        "num_epochs_eval": 100,
-        "early_stopping_patience": 30,
-    },
-    "biot": {
-        "learning_rate": 1e-3,
-        "weight_decay": 0.01,
-        "label_smoothing": 0.0,
-        "scheduler": "onecycle",
-        "warmup_epochs": 0,
-        "num_epochs_eval": 100,
-        "early_stopping_patience": 30,
-    },
-    # steegformer: no override → uses FIXED_HP["linear_probe"] as-is (ST-EEGFormer paper settings)
-    # baseline/classic_nn: no override
+    # "eegpt": {  # EEGPT paper: OneCycleLR, lower lr, no smoothing
+    #     "learning_rate": 4e-4,
+    #     "weight_decay": 0.01,
+    #     "label_smoothing": 0.0,
+    #     "scheduler": "onecycle",
+    #     "warmup_epochs": 0,
+    #     "num_epochs_eval": 100,
+    #     "early_stopping_patience": 30,
+    # },
+    # "cbramod": {
+    #     "learning_rate": 1e-3,
+    #     "weight_decay": 0.01,
+    #     "label_smoothing": 0.0,
+    #     "scheduler": "onecycle",
+    #     "warmup_epochs": 0,
+    #     "num_epochs_eval": 100,
+    #     "early_stopping_patience": 30,
+    # },
+    # "labram": {
+    #     "learning_rate": 4e-4,
+    #     "weight_decay": 0.01,
+    #     "label_smoothing": 0.0,
+    #     "scheduler": "onecycle",
+    #     "warmup_epochs": 0,
+    #     "num_epochs_eval": 100,
+    #     "early_stopping_patience": 30,
+    # },
+    # "biot": {
+    #     "learning_rate": 1e-3,
+    #     "weight_decay": 0.01,
+    #     "label_smoothing": 0.0,
+    #     "scheduler": "onecycle",
+    #     "warmup_epochs": 0,
+    #     "num_epochs_eval": 100,
+    #     "early_stopping_patience": 30,
+    # },
 }
 
 def seed_worker(worker_id):
@@ -709,13 +707,12 @@ class TrainerDownstream:
             metrics = self.predict(model=model, dataloader=val_loader)
             perf = metrics[self.config["metric"]]
 
-            wandb.log({"acc": perf, "epoch": epoch})
             if not step_per_batch:
                 scheduler.step()
             if perf > best:
                 best = perf
                 best_model = deepcopy(model.state_dict())
-            wandb.log({"acc_eval": perf, "epoch": epoch})
+            wandb.log({"val_acc": perf, "best_val_acc": best, "train_loss": loss, "epoch": epoch}, step=epoch)
 
             # Stop training if the val accuracy has not improved for a while
             if early_stopper.should_stop(perf):
@@ -743,9 +740,13 @@ class TrainerDownstream:
             name=name_project,
             reinit=True,
             config={"learning_rate": hp["learning_rate"], "batch_size": hp["batch_size"],
-                     "optimizer": hp["optimizer"], "weight_decay": hp["weight_decay"]}
+                     "optimizer": hp["optimizer"], "weight_decay": hp["weight_decay"],
+                     "evaluation_scheme": "population"}
         )
-        wandb.log({"evaluation_scheme": "population"})
+        wandb.define_metric("epoch")
+        wandb.define_metric("val_acc", step_metric="epoch")
+        wandb.define_metric("best_val_acc", step_metric="epoch")
+        wandb.define_metric("train_loss", step_metric="epoch")
 
         metrics = self.evaluate_model(
             learning_rate=hp["learning_rate"],

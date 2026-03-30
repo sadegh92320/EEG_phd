@@ -1013,7 +1013,8 @@ class LitEEGPTModel(nn.Module):
         # we always use the internal codebook IDs resolved from the dataset.
         B, C, T = x.shape
         x = self.chan_conv(x)                          # (B, dataset_chans, T) → (B, proj_chans, T)
-        self.target_encoder.eval()
+        # Note: train/eval mode is managed by the training loop (train_one_epoch)
+        # which sets frozen encoder children to eval and trainable ones to train.
         z = self.target_encoder(x, self.chans_id)      # uses EEGPT's own channel IDs
         h = z.flatten(2)
         h = self.linear_probe1(self.drop(h))

@@ -124,6 +124,7 @@ def build_riemann_transformer_para(num_classes, checkpoint_path, num_channels, d
 
 def build_riemann_transformer_seq(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
     model = DownstreamRiemannTransformerSeq(num_classes=num_classes, checkpoint_path=checkpoint_path)
+    return model
 
 def build_riemann_ema(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
     """Adaptive Riemannian parallel transformer + EMA population covariance as reference."""
@@ -300,15 +301,14 @@ def build_cbramod(num_classes, checkpoint_path, num_channels, data_length, **kwa
         p.requires_grad = False
 
     if training_mode == "linear_probe":
-        # Replace the paper's MLP head (~14M params) with a standardized
-        # linear probe for fair comparison across all foundation models.
-        # Original head is preserved in CBraModClassifier for fine-tuning.
-        in_features = num_channels * n_patches * 200
+        # Fair linear probe: mean-pool over channels and patches → (B, 200),
+        # then LayerNorm + Linear. Same embed dim as LaBraM (200) for clean comparison.
+        model.pool_mode = "mean"
         model.feed_forward = nn.Sequential(
-            nn.LayerNorm(in_features),
-            nn.Linear(in_features, num_classes),
+            nn.LayerNorm(200),
+            nn.Linear(200, num_classes),
         )
-    # else: keep the paper's original 3-layer MLP head for fine-tuning
+    # else: keep the paper's original 3-layer MLP head with flatten pooling
 
     if training_mode == "full":
         # Unfreeze backbone for full fine-tuning

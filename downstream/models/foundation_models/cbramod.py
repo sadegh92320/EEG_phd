@@ -328,7 +328,10 @@ class CBraModClassifier(nn.Module):
         )
         self.backbone.load_state_dict(torch.load(pretrained_dir, map_location='cpu'))
         self.backbone.proj_out = nn.Identity()
-        
+
+        # Pool mode: "flatten" (original paper) or "mean" (fair linear probe)
+        self.pool_mode = "flatten"
+
         self.feed_forward = nn.Sequential(
             nn.Linear(num_channel*data_length, data_length),
             nn.ELU(),
@@ -338,16 +341,22 @@ class CBraModClassifier(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(200, num_class),
         )
-        
+
     #@autocast(device_type='cuda', enabled=True)
     def forward(self, x):
         # input: (batch, channel, time) => transform to (batch_size, num_of_channels, time_segments, points_per_patch) e.g., (8, 22, 4, 200)
-        #print(f"input size: {x.shape}")
         x_windows = x.unfold(dimension=2, size=200, step=200)
-        
+
         bz, ch_num, seq_len, patch_size = x_windows.shape
-        feats = self.backbone(x_windows)
-        feats = feats.contiguous().view(bz, ch_num*seq_len*200)
+        feats = self.backbone(x_windows)  # (bz, ch_num, seq_len, 200)
+
+        if self.pool_mode == "mean":
+            # Mean-pool over channels and patches → (bz, 200)
+            feats = feats.mean(dim=(1, 2))
+        else:
+            # Original: flatten everything → (bz, ch_num * seq_len * 200)
+            feats = feats.contiguous().view(bz, ch_num * seq_len * 200)
+
         out = self.feed_forward(feats)
         return out
     

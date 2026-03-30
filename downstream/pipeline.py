@@ -160,7 +160,7 @@ class Pipeline:
         if pretrain:
             print("new's")
             train_loader, valid_loader = self.import_data_pretrain()
-            model = AdaptiveRiemannGNNBert()
+            model = ApproxAdaptiveRiemannBert()
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
