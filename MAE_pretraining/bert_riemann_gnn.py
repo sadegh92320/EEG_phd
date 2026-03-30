@@ -223,14 +223,14 @@ class AdaptiveRiemannGNNBert(pl.LightningModule):
         return x, pad
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, weight_decay=0.05)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=5e-4, weight_decay=0.05)
         total_steps = self.trainer.estimated_stepping_batches
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=1e-3,
+            max_lr=5e-4,
             total_steps=total_steps,
-            pct_start=0.20,
+            pct_start=0.15,
             anneal_strategy='cos',
             div_factor=10.0,
             final_div_factor=1000.0

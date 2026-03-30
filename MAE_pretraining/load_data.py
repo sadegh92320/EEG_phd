@@ -29,11 +29,11 @@ def get_batch_size(num_channel):
     Tuned for A100 80GB with mixed precision + Riemannian covariance.
     """
     if num_channel >= 64:
-        return 48   # Was 32 — conservative due to B*N*C*C covariance tensors
+        return 32
     elif num_channel >= 32:
-        return 96   # Was 64
+        return 64
     else:
-        return 192   # Was 128
+        return 128
 
 
 def get_dataloader(config):
