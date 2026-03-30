@@ -35,6 +35,7 @@ from pytorch_lightning.loggers import WandbLogger
 from MAE_pretraining.load_data import get_dataloader
 from downstream.split_data_downstream import DownstreamDataLoader
 from MAE_pretraining.bert_adaptive_ema_only import AdaptiveRiemannEMABert
+from MAE_pretraining.bert_ema_graph import AdaptiveRiemannEMAGraphBert
 
 
 def seed_everything(seed=42):
@@ -154,7 +155,7 @@ class Pipeline:
         if pretrain:
             print("new's")
             train_loader, valid_loader = self.import_data_pretrain()
-            model = AdaptiveRiemannEMABert()
+            model = AdaptiveRiemannEMAGraphBert()
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,

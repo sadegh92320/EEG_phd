@@ -76,7 +76,7 @@ class TemporalPositionalEncoding(nn.Module):
         return self.pe[0, seq_indices.view(-1)].view(batch_size, seq_len, -1)
 
 
-class AdaptiveRiemannEMABert(pl.LightningModule):
+class AdaptiveRiemannEMAGraphBert(pl.LightningModule):
     """
     BERT-style masked pretraining with:
     - Adaptive Riemannian parallel transformer (approx log map)
