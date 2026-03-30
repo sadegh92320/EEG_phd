@@ -185,7 +185,11 @@ def time(func):
 
 class TrainerDownstream:
     def __init__(self, model_name, model, optimizer, loss_fn, batch_size, config, early_stopper = EarlyStopper, train_data = None, val_data = None, test_data = None, training_mode = "linear_probe"):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available()
+            else "cpu"
+        )
         self.model_name = model_name
         self.model = model
         self.initial_state = deepcopy(model.state_dict())

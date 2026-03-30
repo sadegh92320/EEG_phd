@@ -36,6 +36,7 @@ from MAE_pretraining.load_data import get_dataloader
 from downstream.split_data_downstream import DownstreamDataLoader
 from MAE_pretraining.bert_adaptive_ema_only import AdaptiveRiemannEMABert
 from MAE_pretraining.bert_ema_graph import AdaptiveRiemannEMAGraphBert
+from MAE_pretraining.bert_riemann_gnn import AdaptiveRiemannGNNBert
 
 
 def seed_everything(seed=42):
@@ -71,7 +72,11 @@ class Pipeline:
         self.pretraining = pretraining
         self.model = None
         self.checkpoint_path = None
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available()
+            else "cpu"
+        )
        
     #Change in the future be careful of different size samples 
     def load_data(self, data_path):
@@ -155,7 +160,7 @@ class Pipeline:
         if pretrain:
             print("new's")
             train_loader, valid_loader = self.import_data_pretrain()
-            model = AdaptiveRiemannEMAGraphBert()
+            model = AdaptiveRiemannGNNBert()
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
@@ -163,12 +168,12 @@ class Pipeline:
                     mode="min",
                     save_top_k=5,
                     save_last=True,
-                    filename="epoch{epoch}-rie-ema-{val_mse:.4f}",
+                    filename="epoch{epoch}-rie-gnn-{val_mse:.4f}",
                 )
 
             wandb_logger = WandbLogger(
                 project="eeg_foundation_model",
-                name="riemann-ema",
+                name="riemann-gnn",
                 log_model="all"
             )
             wandb_logger.experiment.config.update({

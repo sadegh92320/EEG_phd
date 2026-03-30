@@ -43,7 +43,8 @@ def pade_matrix_log(M, num_squarings=4, sqrt_iters=6, pade_order=6):
     orig_dtype = M.dtype
     # Force float32 — torch.linalg.solve has no fp16/bf16 CUDA kernel
     with torch.amp.autocast('cuda', enabled=False), \
-         torch.amp.autocast('cpu', enabled=False):
+         torch.amp.autocast('cpu', enabled=False), \
+         torch.amp.autocast('mps', enabled=False):
         M = M.float()
         C = M.shape[-1]
         I = torch.eye(C, device=M.device, dtype=M.dtype).expand_as(M)
@@ -590,7 +591,9 @@ class SPDLogMap(nn.Module):
             (..., C, C) batch of symmetric matrices in tangent space
         """
         orig_dtype = S.dtype
-        with torch.amp.autocast('cuda', enabled=False):
+        with torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False), \
+             torch.amp.autocast('mps', enabled=False):
             S = S.float()
             eigenvalues, eigenvectors = safe_eigh(S)
             eigenvalues = eigenvalues.clamp(min=self.eps)
@@ -1143,7 +1146,9 @@ class AdaptiveLogMap(nn.Module):
             return result.to(orig_dtype)
 
         else:  # 'eigh'
-            with torch.amp.autocast('cuda', enabled=False):
+            with torch.amp.autocast('cuda', enabled=False), \
+                 torch.amp.autocast('cpu', enabled=False), \
+                 torch.amp.autocast('mps', enabled=False):
                 M = M.float()
                 eigvals, Q = safe_eigh(M)
                 eigvals = eigvals.clamp(min=self.eps)

@@ -1,21 +1,18 @@
 """
-Adaptive Riemannian BERT with EMA Geometric Graph as Reference Point
+Adaptive Riemannian BERT with GNN Channel Embedding
 
-Builds on bert_parallel_adaptive_riemann.py with one addition:
+Builds on bert_parallel_adaptive_riemann.py with one change:
 
-EMA Geometric Graph: A persistent 144×144 buffer that accumulates
-channel-channel covariance structure across the entire training corpus
-via exponential moving average. Used as the REFERENCE POINT for the
-adaptive log map tangent space projection: S - G_ema instead of S - I.
+Channel embedding: GNN (GATv2) over 3D electrode positions instead of
+nn.Embedding. The GNN runs on the full 144-channel graph built from
+standard 10-05 montage coordinates, then the batch's channel indices
+select the relevant embeddings. This gives the model anatomical spatial
+structure that nn.Embedding cannot capture — nearby channels get similar
+embeddings through message passing.
 
-This means the Riemannian attention bias measures per-sample DEVIATION
-from the population average, not absolute covariance. Cross-dataset
-knowledge transfer happens through this shared global graph.
-
-Three levels of spatial information:
-    - nn.Embedding: channel identity ("I am Cz")
-    - Per-sample Riemannian bias: instance-level geometry relative to population
-    - EMA graph: population-level geometry (tangent space reference)
+Two levels of spatial information:
+    - GNN channel embedding: anatomical geometry (physical electrode positions)
+    - Per-sample Riemannian bias: functional geometry (this EEG segment's covariance)
 """
 import numpy as np
 import torch
@@ -27,11 +24,14 @@ import torch.nn.functional as F
 import math
 import random
 import os
+from torch_geometric.data import Data
+from MAE_pretraining.graph_embedding import GraphDataset
+from MAE_pretraining.gnn import GATModel
 import torch.nn.init as init
 from MAE_pretraining.transformer_variants import (
     AdaptiveRiemannianParallelTransformer,
-    EMAGeometricGraph,
 )
+import yaml
 
 
 def seed_everything(seed=42):
@@ -66,16 +66,6 @@ class PatchEEG(nn.Module):
         return self.fc(x)
 
 
-class ChannelPositionalEmbed(nn.Module):
-    def __init__(self, embedding_dim):
-        super().__init__()
-        self.channel_transformation = nn.Embedding(144, embedding_dim)
-        init.zeros_(self.channel_transformation.weight)
-
-    def forward(self, channel_indices):
-        return self.channel_transformation(channel_indices)
-
-
 class TemporalPositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 500):
         super().__init__()
@@ -94,23 +84,20 @@ class TemporalPositionalEncoding(nn.Module):
         return self.pe[0, seq_indices.view(-1)].view(batch_size, seq_len, -1)
 
 
-class AdaptiveRiemannEMABert(pl.LightningModule):
+class AdaptiveRiemannGNNBert(pl.LightningModule):
     """
     BERT-style masked pretraining with:
     - Adaptive Riemannian parallel transformer (approx log map)
-    - EMA geometric graph (population-level channel connectivity)
+    - GNN (GATv2) channel embedding from 3D electrode positions
     """
     def __init__(self, config=None, num_channels=64,
                  max_embedding=2000, enc_dim=512, depth_e=8,
-                 mask_prob=0.5, patch_size=16, norm_pix_loss=False,
-                 ema_momentum=0.99, ema_update_every=10):
+                 mask_prob=0.5, patch_size=16, norm_pix_loss=False):
         super().__init__()
 
         self.config = config
         self.enc_dim = enc_dim
         self.num_channels = num_channels
-        self.ema_update_every = ema_update_every
-        self._step_counter = 0
 
         # Adaptive Riemannian parallel transformer layers
         self.encoder = nn.ModuleList([
@@ -119,12 +106,6 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
             ) for _ in range(depth_e)
         ])
 
-        # EMA geometric graph — population-level channel connectivity
-        # num_heads=4 because spatial heads = total_heads // 2 = 8 // 2 = 4
-        self.ema_graph = EMAGeometricGraph(
-            total_channels=144, momentum=ema_momentum, num_heads=4
-        )
-
         self.mask_prob = mask_prob
         self.patch_size = patch_size
         self.patch = PatchEEG(patch_size=patch_size, embed_dim=enc_dim)
@@ -132,7 +113,17 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
         self.fc = nn.Linear(enc_dim, patch_size)
         self.norm_enc = nn.LayerNorm(enc_dim)
 
-        self.channel_embedding_e = ChannelPositionalEmbed(embedding_dim=enc_dim)
+        # GNN channel embedding — runs on full 144-channel electrode graph
+        with open("MAE_pretraining/info_dataset/channel_info.yaml") as f:
+            ch_config = yaml.safe_load(f)
+        ch_total = ch_config["channels_mapping"]
+        ordered_channels = [k for k, v in sorted(ch_total.items(), key=lambda item: item[1])]
+        gnn_data = GraphDataset()
+        g = gnn_data.create_graph(ch_names=ordered_channels, radius=0.4)
+        self.register_buffer("g_x", g.x)
+        self.register_buffer("g_edge_index", g.edge_index)
+        self.gnn_enc = GATModel(num_head=3, enc_dim=enc_dim)
+
         self.temporal_embedding_e = TemporalPositionalEncoding(d_model=enc_dim, max_len=max_embedding)
 
         self.class_token = nn.Parameter(torch.zeros(1, 1, enc_dim))
@@ -154,7 +145,6 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
         nn.init.xavier_uniform_(w.view(w.shape[0], -1))
         nn.init.normal_(self.class_token, std=0.02)
         nn.init.normal_(self.mask_token, std=0.02)
-        nn.init.normal_(self.channel_embedding_e.channel_transformation.weight, std=0.02)
 
     def mask_bert(self, x):
         device = x.device
@@ -164,18 +154,6 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
         mask_float = mask.unsqueeze(-1).float()
         x = x * (1 - mask_float) + mask_token * mask_float
         return x, mask
-
-    def _compute_channel_covariance(self, x, C, N):
-        """Compute channel covariance (B, C, C) from flattened token sequence."""
-        x_re = rearrange(x, 'b (n c) d -> b n c d', c=C)
-        x_pool = x_re.mean(dim=1)  # (B, C, D)
-        with torch.amp.autocast('cuda', enabled=False), \
-             torch.amp.autocast('cpu', enabled=False), \
-             torch.amp.autocast('mps', enabled=False):
-            x_pool_f32 = x_pool.float()
-            S = torch.bmm(x_pool_f32, x_pool_f32.transpose(-1, -2)) / self.enc_dim
-            S = S + 1e-5 * torch.eye(C, device=S.device, dtype=torch.float32).unsqueeze(0)
-        return S
 
     def encoder_forward(self, x, channel_list):
         B, C, T = x.shape
@@ -190,33 +168,30 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
         L = x.shape[1] * x.shape[2]
         x = x.reshape(B, L, -1)
 
-        # Channel embeddings
+        # Extract channel_idx
         if channel_list.dim() == 1:
             channel_list = channel_list.unsqueeze(0).expand(B, -1)
-        chan_id = channel_list.unsqueeze(1).repeat(1, N, 1).view(B, L)
-        x += self.channel_embedding_e(chan_id)
+        channel_idx = channel_list[0]  # (C,) global channel indices
+
+        # GNN channel embedding — run on full graph, index by batch channels
+        g_device = Data(x=self.g_x, edge_index=self.g_edge_index)
+        chan_total = self.gnn_enc(g_device)  # (144, enc_dim)
+        chan_emb = chan_total[channel_idx]    # (C, enc_dim)
+        chan_emb = chan_emb.unsqueeze(0).expand(B, -1, -1)
+        chan_emb = chan_emb.unsqueeze(1).repeat(1, N, 1, 1).view(B, L, -1)
+        x += chan_emb
 
         # Temporal embeddings
         seq_idx = torch.arange(0, N, device=device, dtype=torch.long)
         eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
         x += self.temporal_embedding_e(eeg_seq_indices)
 
-        # EMA update (every K steps, from pre-masking clean signal)
-        channel_idx = channel_list[0]
-        self._step_counter += 1
-        if self.training and (self._step_counter % self.ema_update_every == 0):
-            S_0 = self._compute_channel_covariance(x, C, N)
-            self.ema_graph.update(S_0, channel_idx)
-
-        # Get population-level EMA reference for tangent space projection
-        ema_ref = self.ema_graph.get_ref(channel_idx)  # (C, C)
-
         # BERT-style masking
         x, mask = self.mask_bert(x)
 
-        # Encoder — ema_ref changes the log map from S-I to S-G_ema
+        # Encoder (Riemannian attention with approx log map, no EMA reference)
         for transformer in self.encoder:
-            x = transformer(x, C, channel_idx=channel_idx, ema_ref=ema_ref)
+            x = transformer(x, C, channel_idx=channel_idx)
 
         x = self.norm_enc(x)
         x = self.fc(x)
@@ -253,9 +228,9 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=1e-3,           # was 5e-4 — scaled ~2× for larger effective batch
+            max_lr=1e-3,
             total_steps=total_steps,
-            pct_start=0.20,        # was 0.15 — slightly more warmup for stability
+            pct_start=0.20,
             anneal_strategy='cos',
             div_factor=10.0,
             final_div_factor=1000.0
