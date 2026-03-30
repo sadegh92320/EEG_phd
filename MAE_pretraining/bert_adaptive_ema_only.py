@@ -252,9 +252,9 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=5e-4,
+            max_lr=1e-3,           # was 5e-4 — scaled ~2× for larger effective batch
             total_steps=total_steps,
-            pct_start=0.15,
+            pct_start=0.20,        # was 0.15 — slightly more warmup for stability
             anneal_strategy='cos',
             div_factor=10.0,
             final_div_factor=1000.0

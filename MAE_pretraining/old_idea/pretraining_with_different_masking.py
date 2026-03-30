@@ -5,15 +5,13 @@ from einops import rearrange, reduce, repeat
 from typing import Any
 from pytorch_lightning.utilities.types import STEP_OUTPUT, OptimizerLRScheduler
 from lightning.pytorch.callbacks import ModelCheckpoint
-import torch.nn as nn
-import torch
 import lightning.pytorch as pl
 from torchmetrics import Accuracy
 from lightning.pytorch.loggers.tensorboard import TensorBoardLogger
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from torchmetrics import Accuracy, Recall, Precision, F1Score, ConfusionMatrix, AUROC
 from torchmetrics.classification import CohenKappa
-from MAE_pretraining.data_lightning import EEGData
+from MAE_pretraining.old_idea.data_lightning import EEGData
 import lightning as L
 from lightning.pytorch import Trainer
 import torch.nn.functional as F
@@ -24,6 +22,9 @@ from MAE_pretraining.gnn import GATModel
 import random
 import os
 import torch.nn.init as init
+from timm.models.vision_transformer import PatchEmbed, Block
+from torch_geometric.data import Batch
+from MAE_pretraining.transformer_variants import TransformerLayerViT
 
 
 def seed_everything(seed=42):
@@ -35,9 +36,6 @@ def seed_everything(seed=42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-from timm.models.vision_transformer import PatchEmbed, Block
-from torch_geometric.data import Batch
-from MAE_pretraining.transformer_variants import TransformerLayerViT
 
 
 channel_list = ["Fp1","Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]
@@ -229,47 +227,159 @@ class EncoderDecoder(pl.LightningModule):
         x_full.scatter_(dim = 1, index=keep_id, src = x)
         return x_full
     
+    def mask_chan_without_restore(self, x, list_chan, drop_prob):
+        num_chan = list_chan.shape[1]
+        B, N, C, D = x.shape
+        device = x.device
+
+        assert C == num_chan
+
+        
+        assert drop_prob < 1
+        assert drop_prob > 0
+
+        #Compute the number of channel to remove 
+        num_remove = int(drop_prob * num_chan)
+
+        #Get the index of ch to remove and get the new list of chan
+        shuffle_ch = torch.rand(C, device=device)
+        shuffle_ch = torch.argsort(shuffle_ch)
+       
+
+        #keep and remove_idx with shape (B,C)
+        keep = shuffle_ch[num_remove:]
+       
+        keep_expand = repeat(keep, "c -> b n c d", b = B,n = N, d = D)
+        x_drop = torch.gather(x, dim = 2, index=keep_expand)
+
+        return x_drop, keep
     
 
-    def mask_block(self, x):
+    def mask_chan(self,x,num_chan, drop_prob):
         B, L, D = x.shape
         device = x.device
-        assert L%4 == 0
-        x = rearrange(x, "b (n b) d -> b n b d", b = self.block_size)
-        B, N, b, D = x.shape
-        noise = torch.randn((B, N), device = device)
-        l_keep = int(N*(1-self.mask_prob))
-        shuffle_id = torch.argsort(noise)
-        restore_id = torch.argsort(shuffle_id)
-        keep_id = shuffle_id[:,:l_keep]
-        keep_id = repeat(keep_id,"b n -> b n b d", b = self.block_size, d = D)
-        x_mask = torch.gather(input = x, dim = 1, index=keep_id)
 
-        #Size B,n -> B,n,b
-        restore_id_extended = restore_id.unsqueeze(-1).repeat(1,1,self.block_size) * self.block_size
-        offset = torch.arange(self.block_size, device = device).view(1,1,self.block_size)
-        restore_id_extended = (restore_id_extended + offset).view(B,L)
+        #Retrieve the number of channels
 
-        mask = torch.ones(B,N, device = device)
+        assert L % num_chan == 0
+        assert drop_prob < 1
+        assert drop_prob > 0
+
+        #Compute the number of channel to remove 
+        num_remove = int(drop_prob * num_chan)
+
+        #Get dim b n c d
+        x = rearrange(x, "b (n c) d -> b n c d", c = num_chan)
+
+        #Get the index of ch to remove and get the new list of chan
+        shuffle_ch = torch.rand(B, num_chan, device=device)
+        shuffle_ch = torch.argsort(shuffle_ch, dim=1)
+        restore_ch = torch.argsort(shuffle_ch)
+
+        #keep and remove_idx with shape (B,C)
+        keep = shuffle_ch[:,num_remove:]
+        
+        N = x.shape[1]
+
+        keep_expand = repeat(keep, "b c -> b n c d", n = N, d = D)
+        x_masked = torch.gather(x, dim = 2, index=keep_expand)
+        x_masked = x_masked.reshape(B,-1,D)
+
+        mask = torch.ones(B,N,num_chan, device=device)
+        mask[:,:,num_remove:] = 0
+        restore_ch = repeat(restore_ch, "b c -> b n c", n = N)
+        mask = torch.gather(mask, dim = 2, index = restore_ch)
+
+
+        mask = mask.reshape(B,-1)
+
+        return x_masked, keep, mask
+        
+    def mask_temp(self,x, drop_prob, num_chan):
+        B, L, D = x.shape
+        device = x.device
+
+        x = rearrange(x, "b (n c) d -> b n c d", c = num_chan)
+
+        N = x.shape[1]
+        num_remove = int(drop_prob * N)
+
+        shuffle_ti = torch.rand(B, N, device=device)
+        shuffle_ti = torch.argsort(shuffle_ti, dim=1)
+        restore_ti = torch.argsort(shuffle_ti)
+
+        keep = shuffle_ti[:,num_remove:]
+        keep_expand = repeat(keep, "b n -> b n c d", c = num_chan, d = D)
+        x_masked = torch.gather(x, dim = 1, index=keep_expand)
+        x_masked = x_masked.reshape(B,-1,D)
+
+        mask = torch.ones(B,N,num_chan, device=device)
+        mask[:,num_remove:, :] = 0
+        restore_ti = repeat(restore_ti, "b n -> b n c", c = num_chan)
+        mask = torch.gather(mask, dim = 1, index=restore_ti)
+        
+        mask = mask.reshape(B, -1)
+
+        return x_masked, keep, mask
+
+
+
+    def masking_vit(self, x):
+        B, L, D = x.shape
+        device = x.device
+        noise = torch.rand(B,L, device=device)
+        l_keep = int(L*(1-self.mask_prob))
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+        id_keep = ids_shuffle[:,:l_keep]
+        id_keep = repeat(id_keep, "b n -> b n d", d = D)
+        x_masked = torch.gather(x, dim=1, index=id_keep)
+        mask = torch.ones([B,L], device=device)
         mask[:,:l_keep] = 0
-        mask = torch.gather(mask, dim = 1, index = restore_id)
-        mask = mask.repeat_interleave(self.block_size, dim = 1)
-        x_mask = rearrange(x_mask, "b n b d -> b (n b) d")
-        return x_mask, restore_id, mask
+        mask = torch.gather(mask, dim = 1, index=ids_restore)
 
 
+        return x_masked, ids_restore, mask
+    
+    def restore_seq_chan(self, x, keep, num_patches):
+        #keep has dim (B, C_keep)
+        B, L_keep, D = x.shape
+        seq = self.mask_token.repeat(B, num_patches, 1).to(dtype=x.dtype, device=x.device).clone()
+        x = rearrange(x, "b (n c) d -> b n c d", c = keep.shape[1])
+        N = x.shape[1]
+        seq = rearrange(seq, "b (n c) d -> b n c d", n = N)
+        C = seq.shape[2]
+        keep = repeat(keep, "b c -> b n c d", n = N, d = D)
+        seq = seq.scatter_(dim = 2, index = keep, src=x)
+        seq = seq.reshape(B,-1,D)
+
+        return seq
+    
+    def restore_seq_time(self, x, keep, num_patches):
+        
+        B, L_keep, D = x.shape
+        seq = self.mask_token.repeat(B, num_patches, 1).to(dtype=x.dtype, device=x.device).clone()
+        x = rearrange(x, "b (n c) d -> b n c d", n = keep.shape[1])
+        C = x.shape[2]
+        seq = rearrange(seq, "b (n c) d -> b n c d", c = C)
+        N = seq.shape[1]
+        keep = repeat(keep, "b n -> b n c d", c = C, d = D)
+        seq = seq.scatter_(dim = 1, index = keep, src=x)
+        seq = seq.reshape(B,-1,D)
+
+        return seq
+        
     
     def encoder_forward(self,x, channel_list):
         B, C, T = x.shape
         device = x.device
-       
     
         #Return the patch eeg with shape (b, n, c, d)
         x = self.patch(x)
         original = x
         N = x.shape[1]
         L = x.shape[1] * x.shape[2]
-        x = x.reshape(B,L,-1)
+        x = x.view(B,L,-1)
 
         #Define the embeddings
         if channel_list.dim() == 1:
@@ -285,11 +395,19 @@ class EncoderDecoder(pl.LightningModule):
             seq_idx = torch.arange(0, N, device=device, dtype=torch.long)  # use 0..Seq-1 (or 1..Seq if your ref does)
             eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
 
-            tp = self.temporal_embedding_e(eeg_seq_indices) 
+            tp = self.temporal_embedding_e(eeg_seq_indices) if isinstance(self.temporal_embedding_e, TemporalPositionalEncoding) \
+            else self.temporal_embedding_e(seq_length=L, num_channel=C).to(device).expand(B, -1, -1)
             x += tp
 
         #Mask the eeg patches
-        x, ids_restore, mask = self.mask_block(x)
+        choice_m = random.choices([0, 1, 2], weights=[0.5, 0.25, 0.25], k=1)[0]
+        if choice_m == 0:
+            x, ids_restore, mask = self.masking_vit(x)
+        if choice_m == 1:
+            x, ids_restore, mask = self.mask_chan(x, num_chan=C, drop_prob=0.7)
+        if choice_m == 2:
+            x, ids_restore, mask = self.mask_temp(x, num_chan=C, drop_prob=0.7)
+
 
         #Concatenate the class token to the eeg
         class_token = self.class_token + self.temporal_embedding_e.get_class_token()
@@ -302,9 +420,9 @@ class EncoderDecoder(pl.LightningModule):
 
         x = self.norm_enc(x)
 
-        return x, ids_restore, mask, original
+        return x, ids_restore, mask, original, choice_m
 
-    def decoder_forward(self, x, ids_restore, mask, original, channel_list):
+    def decoder_forward(self, x, ids_restore, mask, original, channel_list, choice_m):
         B, N, C, D = original.shape
         L = N*C
         device = x.device
@@ -315,7 +433,15 @@ class EncoderDecoder(pl.LightningModule):
 
         
         #Get the original ordering of patches
-        x = self.restore_seq(x = x, num_patches=L, id_restore=ids_restore)
+        if choice_m == 0:
+            x = self.restore_seq(x = x, num_patches=L, id_restore=ids_restore)
+
+        if choice_m == 1:
+            x = self.restore_seq_chan(x = x, keep=ids_restore,num_patches=L)
+
+        if choice_m == 2:
+            x = self.restore_seq_time(x = x, keep=ids_restore,num_patches=L)
+
         
 
         #Get embeddings for decoding
@@ -335,7 +461,9 @@ class EncoderDecoder(pl.LightningModule):
             seq_idx = torch.arange(0, N, device=device, dtype=torch.long)  # use 0..Seq-1 (or 1..Seq if your ref does)
             eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
 
-            tp = self.temporal_embedding_d(eeg_seq_indices) 
+            tp = self.temporal_embedding_d(eeg_seq_indices) if isinstance(self.temporal_embedding_e, TemporalPositionalEncoding) \
+            else self.temporal_embedding_d(seq_length=L, num_channel=C).to(device).expand(B, -1, -1)
+
             x = x + tp
 
         
@@ -360,8 +488,8 @@ class EncoderDecoder(pl.LightningModule):
 
     def forward(self, eeg, channel_list):
 
-        x, ids_restore, mask, original = self.encoder_forward(eeg, channel_list)
-        pred, mask = self.decoder_forward(x, ids_restore, mask, original, channel_list)
+        x, ids_restore, mask, original, choice_m = self.encoder_forward(eeg, channel_list)
+        pred, mask = self.decoder_forward(x, ids_restore, mask, original, channel_list, choice_m)
         target, pad = self.patchify_1d(eeg, self.patch_size)   
         B, Seq, Ch, P = target.shape
         target = target.view(B, Seq * Ch, P)
@@ -371,22 +499,17 @@ class EncoderDecoder(pl.LightningModule):
             target = (target - mean) / (var + 1.e-6)**.5                 
         loss_per_patch = ((pred - target) ** 2).mean(dim=-1)    # (B, L)
         loss = (loss_per_patch * mask).sum() / mask.sum().clamp_min(1.0)
+        return loss, pred, mask
 
-        full_pred = target.clone()
-        mask_bool = mask.bool()
-        full_pred[mask_bool] = pred[mask_bool]
-        full_pred = full_pred.view(B,Seq,Ch,P).permute(0,2,1,3).reshape(B,Ch,-1)
-        full_target = target.view(B,Seq,Ch,P).permute(0,2,1,3).reshape(B,Ch,-1)
+    
+    def create_batch_graphs(self,eeg_batch):
+        graph_list = []
+        for eeg, chn_list in eeg_batch:
+            g = self.graph_gen.create_graph(chn_list)
+            graph_list.append(g)
+        graph_batch = Batch(graph_list)
+        return graph_batch
 
-        fft_pred = torch.abs(torch.fft.rfft(full_pred, dim = -1))
-        fft_target = torch.abs(torch.fft.rfft(full_target, dim = -1))
-
-        loss_freq = torch.nn.functional.l1_loss(fft_target, fft_pred)
-
-        alpha = 0.2
-        total_loss = loss + alpha * loss_freq
-
-        return total_loss, loss, loss_freq, pred, mask
 
     def patchify_1d(self, x, patch_size: int):
         """Segment the target eeg signal in patch and pad if necessary"""
@@ -433,24 +556,21 @@ class EncoderDecoder(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         data, channel_list = batch
-        loss, loss_time, loss_freq, pred, mask = self(data, channel_list)
+        loss, pred, mask = self(data, channel_list)
         lr = self.trainer.optimizers[0].param_groups[0]["lr"]
         self.log("lr", lr, on_step = True, prog_bar = False)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("train_loss_time", loss_time, on_step=False, on_epoch=True)
-        self.log("train_loss_freq", loss_freq, on_step=False, on_epoch=True)
-        
         return loss
 
     def validation_step(self, batch, batch_idx):
         data, channel_list = batch
-        mse, loss_time, loss_freq, pred, mask = self(data, channel_list)
+        mse, pred, mask = self(data, channel_list)
         
         rmse = torch.sqrt(mse + 1e-8)
         pred_std = pred.std()
 
         self.log_dict(
-        {"val_mse": mse, "val_rmse": rmse, "val_pred_std": pred_std, "time_mse": loss_time, "freq l1": loss_freq},
+        {"val_mse": mse, "val_rmse": rmse, "val_std": pred_std},
         prog_bar=True, on_step=False, on_epoch=True
     )
         
@@ -471,3 +591,23 @@ class EncoderDecoder(pl.LightningModule):
 if __name__ == "__main__":
     seed_everything(42)
     L.seed_everything(42, workers=True)
+
+    model = EncoderDecoder()
+    #data = EEGData(data_dir="MAE_pretraining/data_bis")
+    ckpt = ModelCheckpoint(
+    monitor="val_mse",
+    mode="min",
+    save_top_k=1,
+    filename="mae-{epoch:02d}-{val_mse:.4f}",
+)
+    #early = EarlyStopping(monitor="val_mse", mode="min", patience=10)
+    #trainer = Trainer(callbacks=[TQDMProgressBar(refresh_rate=20), ckpt, early], log_every_n_steps=5, max_epochs=15)
+    #trainer.fit(model, val_dataloaders=valid_loader, train_dataloaders=train_loader)
+    tensor_test = torch.rand(3,100 * 32,250)
+    #model.mask_chan(tensor_test, list_channel=range(32), drop_prob=0.3)
+    C = 32
+    B = 10
+    remove = torch.rand(B,32)
+    remove = torch.argsort(remove)
+    print(remove[:,:5])
+   

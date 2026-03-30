@@ -13,7 +13,7 @@ from lightning.pytorch.loggers.tensorboard import TensorBoardLogger
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from torchmetrics import Accuracy, Recall, Precision, F1Score, ConfusionMatrix, AUROC
 from torchmetrics.classification import CohenKappa
-from MAE_pretraining.data_lightning import EEGData
+from MAE_pretraining.old_idea.data_lightning import EEGData
 import lightning as L
 from lightning.pytorch import Trainer
 import torch.nn.functional as F
@@ -35,7 +35,7 @@ def seed_everything(seed=42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-from create_region import RegionToken, BrainMapper
+from MAE_pretraining.old_idea.create_region import RegionToken, BrainMapper
 
 channel_list = ["Fp1","Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]
 channel_list_2 = ["Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]

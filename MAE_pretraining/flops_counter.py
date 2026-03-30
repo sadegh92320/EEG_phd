@@ -483,7 +483,7 @@ def compare_all_models(num_channels=32, seq_length=512, batch_size=2,
 
     # ── 3. BERT + SPD loss ──
     try:
-        from MAE_pretraining.bert_riemaniann_loss import EncoderDecoder as BERT_SPD
+        from MAE_pretraining.old_idea.bert_riemaniann_loss import EncoderDecoder as BERT_SPD
         model = BERT_SPD(
             num_channels=num_channels, enc_dim=enc_dim,
             depth_e=depth_e, mask_prob=0.5, patch_size=patch_size
@@ -498,7 +498,7 @@ def compare_all_models(num_channels=32, seq_length=512, batch_size=2,
 
     # ── 4. BERT + Sequential Riemannian CrissCross ──
     try:
-        from MAE_pretraining.bert_seq_riemaniann_transformer import EncoderDecoder as BERT_SEQ
+        from MAE_pretraining.old_idea.bert_seq_riemaniann_transformer import EncoderDecoder as BERT_SEQ
         model = BERT_SEQ(
             num_channels=num_channels, enc_dim=enc_dim,
             depth_e=depth_e, mask_prob=0.5, patch_size=patch_size

@@ -8,7 +8,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 import lightning.pytorch as pl
 from lightning.pytorch.loggers.tensorboard import TensorBoardLogger
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
-from MAE_pretraining.data_lightning import EEGData
+from MAE_pretraining.old_idea.data_lightning import EEGData
 import lightning as L
 from lightning.pytorch import Trainer
 import torch.nn.functional as F

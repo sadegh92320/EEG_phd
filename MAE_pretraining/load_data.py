@@ -24,16 +24,16 @@ def collate_fn(batch):
 
 def get_batch_size(num_channel):
     """
-    More channels = smaller batch size 
+    More channels = smaller batch size
     to maintain a constant VRAM footprint.
-    Adjust these numbers based on your GPU's capacity (e.g., 24GB vs 80GB).
+    Tuned for A100 80GB with mixed precision.
     """
     if num_channel >= 64:
-        return 32  # Heavy datasets get smaller batches
+        return 64   # Was 32
     elif num_channel >= 32:
-        return 64
+        return 128   # Was 64
     else:
-        return 128 # Light datasets (e.g., 19-channel) get larger batches
+        return 256   # Was 128
 
 
 def get_dataloader(config):

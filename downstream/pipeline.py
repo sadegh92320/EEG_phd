@@ -13,7 +13,7 @@ import numpy as np
 import optuna
 from process_data.preprocessing import Preprocessing
 from sklearn.model_selection import train_test_split
-from MAE_pretraining.bert_riemaniann_loss import RiemannLossBert
+from MAE_pretraining.old_idea.bert_riemaniann_loss import RiemannLossBert
 from MAE_pretraining.bert_parallel_approx_riemann import ApproxAdaptiveRiemannBert
 from MAE_pretraining.pretrain_gnn import GNNEncoderDecoder
 from MAE_pretraining.bert_parallel_adaptive_riemann import AdaptiveRiemannBert
@@ -186,6 +186,7 @@ class Pipeline:
                 max_epochs=200,
                 precision="16-mixed",
                 gradient_clip_val=1.0,
+                accumulate_grad_batches=5,
             )
 
             trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
