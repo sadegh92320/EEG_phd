@@ -1025,24 +1025,13 @@ class AdaptiveLogMap(nn.Module):
     Log map at a reference point on the SPD manifold, supporting
     variable channel counts across batches.
 
-    The reference can be either:
-    - Learned (L_factor): a 144×144 lower-triangular parameter (for pade/eigh modes)
-    - External (EMA): passed at forward time from EMAGeometricGraph (for approx mode)
-
-    In approx mode with an EMA reference, the projection becomes:
-        S - G_ema_sub
-    which measures "how does this sample's channel covariance deviate from the
-    population average." Without an EMA reference, falls back to S - I.
-
-    Math (full modes): Log_R(S) = log(R^{-1/2} S R^{-1/2})
+    Uses first-order tangent-space approximation: S - I.
 
     Args:
         total_channels: Size of the global channel space (default 144)
         eps: Regularization constant for numerical stability
         log_mode: How to compute the matrix logarithm:
-            'approx' — first-order: S - ref  (fastest, no eigh)
-            'pade'   — Padé via scaling-and-squaring  (fast, all matmuls, fp16-ok)
-            'eigh'   — exact eigendecomposition       (slow, requires fp32)
+            'approx' — first-order: S - I  (fastest, no eigh)
         use_approx: DEPRECATED — kept for backward compat. If True, sets log_mode='approx'.
     """
     def __init__(self, total_channels=TOTAL_GLOBAL_CHANNELS, eps=1e-5,
@@ -1057,104 +1046,19 @@ class AdaptiveLogMap(nn.Module):
         else:
             self.log_mode = log_mode
 
-        # Learn a lower-triangular factor L in the GLOBAL channel space
-        # R_full = LL^T + εI (144×144), always SPD
-        # At forward time, we extract the C×C submatrix for the batch's channels
-        # NOTE: L_factor is only used by pade/eigh modes, but we always allocate
-        # it to keep torch's random state consistent across modes (seed reproducibility).
-        init_L = torch.eye(total_channels) + 0.02 * torch.tril(
-            torch.randn(total_channels, total_channels)
-        )
-        self.L_factor = nn.Parameter(init_L)
-
-    def _get_submatrix_reference(self, channel_idx):
-        """
-        Extract the C×C reference submatrix for the current batch's channels.
-        Always returns float32 regardless of self.L_factor's current dtype.
-        """
-        # Explicit .float() — Lightning may have cast L_factor to fp16
-        L = torch.tril(self.L_factor.float())
-        L_sub = L[channel_idx, :]
-        C = channel_idx.shape[0]
-        I_c = torch.eye(C, device=L.device, dtype=torch.float32)
-        R = L_sub @ L_sub.T + self.eps * I_c
-        return R  # guaranteed fp32
-
-    def _compute_R_inv_half(self, R, num_iters=8):
-        """
-        Compute R^{-1/2} via Denman-Beavers iteration (no eigendecomposition).
-
-        Uses only matmuls and torch.linalg.solve — both have clean backward
-        passes with no degenerate-eigenvalue NaN issue (unlike eigh).
-
-        Converges quadratically: 8 iterations handle R drifting from I during training.
-        """
-        with torch.amp.autocast('cuda', enabled=False), \
-             torch.amp.autocast('cpu', enabled=False):
-            R = R.float()
-            C = R.shape[0]
-            I = torch.eye(C, device=R.device, dtype=R.dtype)
-
-            Y = R.clone()   # converges to R^{1/2}
-            Z = I.clone()   # converges to R^{-1/2}
-
-            for _ in range(num_iters):
-                Y_inv = torch.linalg.solve(Y, I)
-                Z_inv = torch.linalg.solve(Z, I)
-                Y_new = 0.5 * (Y + Z_inv)
-                Z_new = 0.5 * (Z + Y_inv)
-                Y, Z = Y_new, Z_new
-
-            # Safety: if solve produced NaN, fall back to identity
-            if torch.isnan(Z).any():
-                Z = I
-            return Z  # R^{-1/2}
-
     def forward(self, S, channel_idx, ema_ref=None):
         """
         Args:
             S: (batch, C, C) batch of SPD matrices
             channel_idx: (C,) long tensor — global channel indices for this batch
-            ema_ref: optional (C, C) population covariance from EMAGeometricGraph.
-                     Used as the reference point in approx mode instead of identity.
+            ema_ref: unused, kept for API compatibility
         Returns:
-            (batch, C, C) tangent vectors at the reference point
+            (batch, C, C) tangent vectors at identity
         """
         orig_dtype = S.dtype
-        C = channel_idx.shape[0]
-
-        if self.log_mode == 'approx':
-            # ── FAST PATH: first-order tangent-space approximation ──
-            # S - R where R is the learned SPD reference (from L_factor).
-            # At init R ≈ I (since L_factor ≈ I), so this starts as S - I.
-            # During training, R adapts to the data distribution, making the
-            # approximation more accurate (S is closer to R than to I).
-            R = self._get_submatrix_reference(channel_idx)  # (C, C) fp32
-            R = R.unsqueeze(0).to(dtype=S.dtype, device=S.device)
-            return (S - R).to(orig_dtype)
-
-        # ── FULL PATH: whiten with learned reference R ──
-        R = self._get_submatrix_reference(channel_idx)       # (C, C) fp32
-        R_inv_half = self._compute_R_inv_half(R)              # (C, C) fp32
-
-        # M = R^{-1/2} S R^{-1/2}, regularized for SPD
-        M = R_inv_half.unsqueeze(0) @ S.float() @ R_inv_half.unsqueeze(0)
-        M = M + self.eps * torch.eye(C, device=M.device, dtype=M.dtype).unsqueeze(0)
-
-        if self.log_mode == 'pade':
-            result = pade_matrix_log(M, num_squarings=4, sqrt_iters=6, pade_order=6)
-            return result.to(orig_dtype)
-
-        else:  # 'eigh'
-            with torch.amp.autocast('cuda', enabled=False), \
-                 torch.amp.autocast('cpu', enabled=False), \
-                 torch.amp.autocast('mps', enabled=False):
-                M = M.float()
-                eigvals, Q = safe_eigh(M)
-                eigvals = eigvals.clamp(min=self.eps)
-                log_eigvals = torch.log(eigvals)
-                result = Q @ torch.diag_embed(log_eigvals) @ Q.transpose(-2, -1)
-            return result.to(orig_dtype)
+        C = S.shape[-1]
+        ref = torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
+        return (S - ref).to(orig_dtype)
 
 
 class AdaptiveRiemannianAttentionBias(nn.Module):

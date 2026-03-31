@@ -332,7 +332,7 @@ class CBraModClassifier(nn.Module):
     """
     def __init__(self, num_class, num_channel, data_length, pretrained_dir):
         super(CBraModClassifier, self).__init__()
-        from einops.layers.torch import Rearrange
+        from einops.layers.torch import Rearrange, Reduce
 
         self.backbone = CBraMod(
             in_dim=200, out_dim=200, d_model=200,
@@ -344,12 +344,13 @@ class CBraModClassifier(nn.Module):
 
         n_patches = data_length // 200
 
-        # Default classifier: avgpooling (overridden by build_cbramod)
+        # Default classifier: mean-pool over patches, keep channels (overridden by build_cbramod)
+        in_features = num_channel * 200
         self.classifier = nn.Sequential(
-            Rearrange('b c s d -> b d c s'),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(200, num_class),
+            Reduce('b c s d -> b c d', 'mean'),
+            Rearrange('b c d -> b (c d)'),
+            nn.LayerNorm(in_features),
+            nn.Linear(in_features, num_class),
         )
 
     def forward(self, x):

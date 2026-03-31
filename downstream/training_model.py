@@ -59,18 +59,20 @@ FIXED_HP = {
         "label_smoothing": 0.1,      # Table F.2(b): 0.1
         "scheduler": "cosine",       # cosine with warmup (ST-EEGFormer default)
         "early_stopping_patience": 20,
+        "head_lr_multiplier": 1.0,   # Only head trains, no separate lr needed
     },
-    "full": {  # Foundation model fine-tuning or baseline NN training from scratch
-        "learning_rate": 1e-4,       # Unified: 1e-4 (CBraMod paper Table 6; 5e-4 caused catastrophic forgetting)
+    "full": {  # Foundation model fine-tuning: backbone slow, head fast
+        "learning_rate": 1e-4,       # Backbone lr (CBraMod paper Table 6)
         "batch_size": 64,
         "optimizer": "adamw",
         "weight_decay": 0.05,        # CBraMod Table 6: 5e-2
         "num_epochs_cv": 100,
-        "num_epochs_eval": 100,
+        "num_epochs_eval": 50,
         "warmup_epochs": 0,          # No warmup — CBraMod Table 6 uses pure CosineAnnealingLR
         "label_smoothing": 0.1,
         "scheduler": "cosine",
         "early_stopping_patience": 50,
+        "head_lr_multiplier": 5.0,   # Head gets 5× backbone lr (CBraMod paper: multi_lr strategy)
     },
     "classic_nn": {  # Classic NN models (EEGNet, Conformer, CTNet, DeepConvNet)
         "learning_rate": 3e-3,       # Table F.10(a): 3e-3
@@ -83,6 +85,20 @@ FIXED_HP = {
         "label_smoothing": 0.1,      # Table F.10(a): 0.1
         "scheduler": "cosine",
         "early_stopping_patience": 10,
+        "head_lr_multiplier": 1.0,   # Trained from scratch, single lr
+    },
+    "lora": {  # LoRA: frozen backbone + low-rank adapters + trainable head
+        "learning_rate": 5e-4,       # LoRA adapter lr
+        "batch_size": 64,
+        "optimizer": "adamw",
+        "weight_decay": 0.05,
+        "num_epochs_cv": 100,
+        "num_epochs_eval": 100,
+        "warmup_epochs": 5,
+        "label_smoothing": 0.1,
+        "scheduler": "cosine",
+        "early_stopping_patience": 30,
+        "head_lr_multiplier": 2.0,   # Head gets 2× LoRA adapter lr
     },
     "loo_finetune": {  # LOO Fine-Tune phase 2 (Table F.4)
         "learning_rate": 5e-5,       # Table F.4: 5e-5
@@ -95,6 +111,7 @@ FIXED_HP = {
         "label_smoothing": 0.1,      # Table F.4: 0.1
         "scheduler": "cosine",
         "early_stopping_patience": 10,
+        "head_lr_multiplier": 5.0,
     },
 }
 
@@ -183,16 +200,11 @@ def time(func):
 
 class TrainerDownstream:
     def __init__(self, model_name, model, optimizer, loss_fn, batch_size, config, early_stopper = EarlyStopper, train_data = None, val_data = None, test_data = None, training_mode = "linear_probe"):
-        # Set FORCE_CPU=True to debug MPS issues
-        FORCE_CPU = False
-        if FORCE_CPU:
-            self.device = torch.device("cpu")
-        else:
-            self.device = torch.device(
-                "cuda" if torch.cuda.is_available()
-                else "mps" if torch.backends.mps.is_available()
-                else "cpu"
-            )
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available()
+            else "cpu"
+        )
         self.model_name = model_name
         self.model = model
         self.initial_state = deepcopy(model.state_dict())
@@ -204,7 +216,7 @@ class TrainerDownstream:
         self.train_data = train_data
         self.val_data = val_data
         self.test_data = test_data
-        self.training_mode = training_mode  # "linear_probe", "full", "classic_nn", "loo_finetune"
+        self.training_mode = training_mode  # "linear_probe", "lora", "full", "classic_nn", "loo_finetune"
 
         # Detect if model.forward() accepts a channel_list argument
         # Foundation model (Downstream) needs it; baselines (EEGNet, Conformer, etc.) don't
@@ -276,25 +288,83 @@ class TrainerDownstream:
         ModelClass = MODEL_REGISTRY[model_name]
         return ModelClass(**model_params)
     
+    # Substrings that identify classification-head parameters across all models.
+    # Everything else is treated as "backbone" and gets the base learning rate.
+    # IMPORTANT: "fc" is NOT included because LaBraM and EEGPT have fc1/fc2 inside
+    # backbone MLP blocks. We use "fc_norm" and "fc." (top-level only) instead.
+    HEAD_PARAM_KEYWORDS = (
+        "classifier",      # CBraMod, BIOT
+        "chan_conv",        # BIOT channel projection
+        "probe",           # EEGPT (probe_norm, probe_linear, _original_probe)
+        "lora_",           # LoRA adapter matrices (lora_A, lora_B)
+    )
+
+    @staticmethod
+    def _is_head_param(name):
+        """Return True if the named parameter belongs to the classification head."""
+        # Direct keyword match for most head modules
+        if any(kw in name for kw in TrainerDownstream.HEAD_PARAM_KEYWORDS):
+            return True
+        # "head" and "fc" need special handling to avoid backbone false positives:
+        # - "head.*" matches STEEGformer/LaBraM head but NOT attention "head_dim"
+        # - "fc_norm" and top-level "fc." match LaBraM's head but NOT blocks.*.mlp.fc1/fc2
+        parts = name.split(".")
+        if parts[0] in ("head", "fc", "fc_norm"):
+            return True
+        return False
+
     def build_optimizer(self, model, optimizer_params):
-        """Build a new optimizer instance"""
-        # Support both nested config format {"optimizer": {"adam": {"name": "adam"}}}
-        # and direct optimizer name string (e.g. "adam")
+        """
+        Build optimizer with discriminative learning rates.
+
+        Backbone params get base lr; head params get lr * head_lr_multiplier.
+        For linear_probe/lora, only requires_grad=True params are included.
+        """
+        # Resolve optimizer class
         if "optimizer" in self.config and isinstance(self.config["optimizer"], dict):
             optimizer_cfg = self.config["optimizer"][self.optimizer_name]
             optimizer_name = optimizer_cfg["name"]
         else:
             optimizer_name = self.optimizer_name
 
-        optimizer = OPTIMIZER_REGISTRY[optimizer_name]
+        optimizer_cls = OPTIMIZER_REGISTRY[optimizer_name]
 
-        # For linear_probe, only train the classification head parameters
-        if self.training_mode == "linear_probe":
-            trainable_params = [p for p in model.parameters() if p.requires_grad]
-        else:
-            trainable_params = model.parameters()
+        # Get head lr multiplier from HP config
+        hp = self._get_hp()
+        head_lr_mult = hp.get("head_lr_multiplier", 1.0)
+        base_lr = optimizer_params["lr"]
+        head_lr = base_lr * head_lr_mult
+        weight_decay = optimizer_params.get("weight_decay", 0.0)
 
-        return optimizer(trainable_params, **optimizer_params)
+        # Split parameters into backbone vs head groups
+        backbone_params = []
+        head_params = []
+
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if self._is_head_param(name):
+                head_params.append(p)
+            else:
+                backbone_params.append(p)
+
+        # Build param groups
+        param_groups = []
+        if backbone_params:
+            param_groups.append({"params": backbone_params, "lr": base_lr, "weight_decay": weight_decay})
+        if head_params:
+            param_groups.append({"params": head_params, "lr": head_lr, "weight_decay": weight_decay})
+
+        # Fallback: if splitting produced nothing (shouldn't happen), use all trainable
+        if not param_groups:
+            trainable = [p for p in model.parameters() if p.requires_grad]
+            param_groups = [{"params": trainable, "lr": base_lr, "weight_decay": weight_decay}]
+
+        if head_lr_mult != 1.0:
+            print(f"  [Optimizer] Discriminative lr: backbone={base_lr:.1e}, head={head_lr:.1e} "
+                  f"(×{head_lr_mult}), {len(backbone_params)} backbone params, {len(head_params)} head params")
+
+        return optimizer_cls(param_groups)
 
     def save_model(self, model, date):
         """Save the model to the path of interest"""
@@ -323,7 +393,7 @@ class TrainerDownstream:
           - "linear_probe": freeze encoder, only train trainable modules
           - "full": train entire model end-to-end (baseline models)
         '''
-        if self.training_mode == "linear_probe":
+        if self.training_mode in ("linear_probe", "lora"):
             # Strategy: set everything to train mode first, then set eval only
             # on children that are entirely frozen (have params but none trainable).
             # This ensures parameterless modules like Dropout in the probe head
@@ -359,7 +429,7 @@ class TrainerDownstream:
             loss = loss_fn(pred, y)
             optimizer.zero_grad()
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm=1.0)
             optimizer.step()
 
             # OneCycleLR steps per batch, not per epoch
@@ -367,13 +437,6 @@ class TrainerDownstream:
                 scheduler.step()
 
             loss_total = loss.item() + loss_total
-
-        # DEBUG: print gradient norm, lr, data stats, and prediction stats
-        current_lr = optimizer.param_groups[0]["lr"]
-        print(f"  [DEBUG] loss={loss.item():.4f}, grad_norm={grad_norm:.2e}, lr={current_lr:.2e}, "
-              f"pred_mean={pred.mean().item():.4e}, pred_std={pred.std().item():.4e}, "
-              f"x_mean={x.mean().item():.4e}, x_std={x.std().item():.4e}, "
-              f"y_dist={y.bincount().tolist()}, device={x.device}")
         return loss_total/len(dataloader)
     
 

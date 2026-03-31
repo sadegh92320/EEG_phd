@@ -143,9 +143,14 @@ def build_steegformer(num_classes, checkpoint_path, num_channels, data_length, *
     )
 
     # Model is frozen by default inside steegformer_small_downstream.
-    # For full fine-tuning, unfreeze everything.
     if training_mode == "full":
         for p in model.parameters():
+            p.requires_grad = True
+    elif training_mode == "lora":
+        # Backbone stays frozen; inject LoRA into attention layers, unfreeze head
+        from downstream.lora import inject_lora
+        inject_lora(model, rank=8, alpha=16.0)
+        for p in model.head.parameters():
             p.requires_grad = True
 
     return model
@@ -219,7 +224,15 @@ def build_labram(num_classes, checkpoint_path, num_channels, data_length, **kwar
         for name, p in model.named_parameters():
             if "head" not in name:
                 p.requires_grad = False
-    # else: all params trainable for fine-tuning
+    elif training_mode == "lora":
+        # Freeze everything, inject LoRA, unfreeze head
+        for p in model.parameters():
+            p.requires_grad = False
+        from downstream.lora import inject_lora
+        inject_lora(model, rank=8, alpha=16.0)
+        for p in model.head.parameters():
+            p.requires_grad = True
+    # else (full): all params trainable for fine-tuning
 
     return model
 
@@ -281,6 +294,12 @@ def build_biot(num_classes, checkpoint_path, num_channels, data_length, **kwargs
     if training_mode == "full":
         for p in model.biot.parameters():
             p.requires_grad = True
+    elif training_mode == "lora":
+        # Backbone frozen by default above; inject LoRA, unfreeze classifier
+        from downstream.lora import inject_lora
+        inject_lora(model.biot, rank=8, alpha=16.0)
+        for p in model.classifier.parameters():
+            p.requires_grad = True
 
     return model
 
@@ -305,36 +324,44 @@ def build_cbramod(num_classes, checkpoint_path, num_channels, data_length, **kwa
         pretrained_dir=checkpoint_path,
     )
 
-    from einops.layers.torch import Rearrange
+    from einops.layers.torch import Rearrange, Reduce
 
     # Freeze backbone by default (linear probe)
     for p in model.backbone.parameters():
         p.requires_grad = False
 
     if training_mode == "linear_probe":
-        # avgpooling_patch_reps: pool over channels & patches → Linear(200, C)
-        # Matches original repo's avgpooling_patch_reps classifier
+        # Mean-pool over channels AND patches → Linear(200, num_classes)
+        # (b, C, S, 200) → mean over C and S → (b, 200) → Linear → (b, num_classes)
+        # ~402 params for binary — minimal head that purely tests backbone quality.
         model.classifier = nn.Sequential(
-            Rearrange('b c s d -> b d c s'),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
+            Reduce('b c s d -> b d', 'mean'),
             nn.Linear(200, num_classes),
         )
     elif training_mode == "full":
-        # all_patch_reps: flatten → 3-layer MLP (paper's original head)
-        # Matches original repo's all_patch_reps classifier
-        flat_features = num_channels * n_patches * 200
+        # Pool over patches first to avoid parameter explosion on long/many-channel data.
+        # (b, C, S, 200) → mean over S → (b, C, 200) → flatten → MLP
+        in_features = num_channels * 200
         model.classifier = nn.Sequential(
-            Rearrange('b c s d -> b (c s d)'),
-            nn.Linear(flat_features, n_patches * 200),
+            Reduce('b c s d -> b c d', 'mean'),
+            Rearrange('b c d -> b (c d)'),
+            nn.LayerNorm(in_features),
+            nn.Linear(in_features, 256),
             nn.ELU(),
             nn.Dropout(0.1),
-            nn.Linear(n_patches * 200, 200),
-            nn.ELU(),
-            nn.Dropout(0.1),
-            nn.Linear(200, num_classes),
+            nn.Linear(256, num_classes),
         )
         for p in model.backbone.parameters():
+            p.requires_grad = True
+    elif training_mode == "lora":
+        # Frozen backbone + LoRA adapters + same LP head
+        from downstream.lora import inject_lora
+        model.classifier = nn.Sequential(
+            Reduce('b c s d -> b d', 'mean'),
+            nn.Linear(200, num_classes),
+        )
+        inject_lora(model.backbone, rank=8, alpha=16.0)
+        for p in model.classifier.parameters():
             p.requires_grad = True
 
     return model
@@ -345,11 +372,11 @@ def build_eegpt(num_classes, checkpoint_path, num_channels, data_length, **kwarg
     EEGPT: JEPA-based encoder with LitEEGPTModel wrapper.
     forward(x, chans_id) where x is (B, C, T).
 
-    EEGPT's published linear probe is a 2-layer design:
-        Linear(2048, 16) → flatten → Linear(16*data_length/64, num_class)
-    Total ~34K params — close enough to the other models' single-linear probes.
-    We keep the paper's probe structure for both modes since modifying it
-    would require changing the forward() method.
+    EEGPT's encoder output is (B, N_temporal, 4, 512) — channels are already
+    absorbed via summary tokens, so the probe is channel-independent.
+
+    linear_probe mode: standardized single-linear head (mean-pool + Linear(2048, C))
+    full mode: paper's original 2-layer probe (Linear(2048,16) → Linear(16*N, C))
     """
     import yaml
     from downstream.models.foundation_models.eegpt import LitEEGPTModel
@@ -374,16 +401,38 @@ def build_eegpt(num_classes, checkpoint_path, num_channels, data_length, **kwarg
         dataset_channel_list=dataset_channel_list,
     )
 
-    # Freeze encoder, only train linear probes + channel conv
+    # Freeze encoder
     for p in model.target_encoder.parameters():
         p.requires_grad = False
 
-    # EEGPT's probe (Linear(2048,16) → Linear(~256, C)) is already small (~34K params).
-    # Paper's forward() has probe logic baked in, so we keep it as-is for linear_probe.
-    # For fine-tuning, unfreeze the encoder.
-    if training_mode == "full":
+    if training_mode == "linear_probe":
+        # Standardized single-linear probe (matches other models)
+        model._use_standard_probe = True
+        # Freeze the original 2-layer probe so only the standard one trains
+        for p in model._original_probe1.parameters():
+            p.requires_grad = False
+        for p in model._original_probe2.parameters():
+            p.requires_grad = False
+    elif training_mode == "full":
+        # Paper's original 2-layer probe + unfrozen encoder
+        model._use_standard_probe = False
         for p in model.target_encoder.parameters():
             p.requires_grad = True
+        # Freeze the standard probe so only the original one trains
+        for p in model.probe_norm.parameters():
+            p.requires_grad = False
+        model.probe_linear.weight.requires_grad = False
+        model.probe_linear.bias.requires_grad = False
+    elif training_mode == "lora":
+        # Frozen encoder + LoRA adapters + standard LP head
+        model._use_standard_probe = True
+        for p in model._original_probe1.parameters():
+            p.requires_grad = False
+        for p in model._original_probe2.parameters():
+            p.requires_grad = False
+        from downstream.lora import inject_lora
+        inject_lora(model.target_encoder, rank=8, alpha=16.0)
+        # Standard probe head stays trainable (probe_norm + probe_linear)
 
     return model
 
@@ -578,9 +627,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--training_mode", type=str, default="linear_probe",
-        choices=["linear_probe", "full"],
-        help="Training mode: 'linear_probe' uses standardized single-linear head, "
-             "'full' uses each paper's original classifier head.",
+        choices=["linear_probe", "full", "lora"],
+        help="Training mode: 'linear_probe' (frozen backbone + linear head), "
+             "'full' (unfreeze everything), 'lora' (frozen backbone + low-rank adapters + head).",
     )
 
     args = parser.parse_args()

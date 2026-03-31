@@ -183,7 +183,7 @@ class Downstream(nn.Module):
 
     def _freeze_encoder(self):
         """Freeze all pretrained encoder parameters."""
-        for module in [self.patch, self.channel_embedding, self.encoder, self.norm_enc]:
+        for module in [self.patch, self.channel_embedding, self.encoder, self.norm_enc, self.temporal_embedding]:
             for p in module.parameters():
                 p.requires_grad = False
         self.class_token.requires_grad = False
@@ -337,7 +337,7 @@ class DownstreamGNN(Downstream):
 
     def _freeze_encoder(self):
         """Freeze base encoder + GNN channel encoder."""
-        for module in [self.patch, self.encoder, self.norm_enc]:
+        for module in [self.patch, self.encoder, self.norm_enc, self.temporal_embedding]:
             for p in module.parameters():
                 p.requires_grad = False
         if hasattr(self, "gnn_enc"):
@@ -378,7 +378,18 @@ class DownstreamRiemannTransformerPara(Downstream):
     The adaptive transformer needs global channel indices (channel_idx) to
     extract the correct submatrix from the learned 144×144 SPD reference.
     These are passed from forward() → _run_encoder().
+
+    NOTE: No [CLS] token — adaptive Riemannian attention requires L = N * C.
+    aggregation="class" is NOT supported; use "avg" (default).
     """
+
+    def __init__(self, *args, aggregation="avg", **kwargs):
+        if aggregation == "class":
+            raise ValueError(
+                "DownstreamRiemannTransformerPara does not use a [CLS] token. "
+                "Use aggregation='avg' instead."
+            )
+        super().__init__(*args, aggregation=aggregation, **kwargs)
 
     @staticmethod
     def _build_encoder(enc_dim, depth_e):
@@ -458,6 +469,11 @@ class DownstreamRiemannEMA(Downstream):
                  patch_size=16, aggregation="avg", num_classes=9,
                  head_dropout=0.1, head_choice='linear',
                  ema_momentum=0.99):
+        if aggregation == "class":
+            raise ValueError(
+                "DownstreamRiemannEMA does not use a [CLS] token. "
+                "Use aggregation='avg' instead."
+            )
         # Build base (delay checkpoint loading)
         super().__init__(
             checkpoint_path=None, config=config, max_embedding=max_embedding,

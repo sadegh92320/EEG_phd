@@ -54,7 +54,7 @@ DATASET_CONFIGS = {
         "data_path": "downstream/data/faced",
         "config_yaml": "downstream/info_dataset/faced.yaml",
         "num_channels": 32,
-        "data_length": 7680,  # 30s * 256Hz
+        "data_length": 2560,  # 10s * 256Hz
         "sampling_rate": 256,
     },
     "bci_comp_2a": {

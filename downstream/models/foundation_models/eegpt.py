@@ -1003,23 +1003,40 @@ class LitEEGPTModel(nn.Module):
         # Adaptive spatial filter: map dataset channels → codebook channels
         self.chan_conv = Conv1dWithConstraint(self.chans_num, self.proj_chans, 1, max_norm=1)
 
-        self.linear_probe1 = LinearWithConstraint(2048, 16, max_norm=1)
-        self.linear_probe2 = LinearWithConstraint(int(16 * data_length / 64), self.num_class, max_norm=0.25)
+        # Standardized single-linear probe: mean-pool temporal patches → Linear
+        # Encoder output: (B, N_temporal, embed_num=4, embed_dim=512)
+        # Flatten last two dims → (B, N_temporal, 2048) → mean over N → (B, 2048)
+        self.probe_norm = nn.LayerNorm(2048)
+        self.probe_drop = nn.Dropout(p=0.50)
+        self.probe_linear = nn.Linear(2048, self.num_class)
 
-        self.drop = torch.nn.Dropout(p=0.50)
+        # Keep original 2-layer probe for full fine-tuning (paper's design)
+        self._original_probe1 = LinearWithConstraint(2048, 16, max_norm=1)
+        self._original_probe2 = LinearWithConstraint(int(16 * data_length / 64), self.num_class, max_norm=0.25)
+        self._original_drop = nn.Dropout(p=0.50)
+
+        self._use_standard_probe = True  # toggled by build_eegpt based on training_mode
 
     def forward(self, x, chans_id=None):
         # chans_id argument kept for API compatibility but ignored —
         # we always use the internal codebook IDs resolved from the dataset.
         B, C, T = x.shape
         x = self.chan_conv(x)                          # (B, dataset_chans, T) → (B, proj_chans, T)
-        # Note: train/eval mode is managed by the training loop (train_one_epoch)
-        # which sets frozen encoder children to eval and trainable ones to train.
-        z = self.target_encoder(x, self.chans_id)      # uses EEGPT's own channel IDs
-        h = z.flatten(2)
-        h = self.linear_probe1(self.drop(h))
-        h = h.flatten(1)
-        h = self.linear_probe2(h)
+        z = self.target_encoder(x, self.chans_id)      # (B, N_temporal, embed_num, embed_dim)
+
+        if self._use_standard_probe:
+            # Standardized linear probe: pool over temporal patches
+            h = z.flatten(2)                           # (B, N_temporal, 2048)
+            h = h.mean(dim=1)                          # (B, 2048)
+            h = self.probe_norm(h)
+            h = self.probe_drop(h)
+            h = self.probe_linear(h)
+        else:
+            # Original 2-layer probe (for full fine-tuning)
+            h = z.flatten(2)                           # (B, N_temporal, 2048)
+            h = self._original_probe1(self._original_drop(h))
+            h = h.flatten(1)
+            h = self._original_probe2(h)
         return h
     
 if __name__=="__main__":
