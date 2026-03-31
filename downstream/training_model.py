@@ -61,18 +61,21 @@ FIXED_HP = {
         "early_stopping_patience": 20,
         "head_lr_multiplier": 1.0,   # Only head trains, no separate lr needed
     },
-    "full": {  # Foundation model fine-tuning: backbone slow, head fast
-        "learning_rate": 1e-4,       # Backbone lr (CBraMod paper Table 6)
+    "full": {  # Foundation model fine-tuning (ST-EEGFormer style)
+        "learning_rate": 3e-4,       # Base lr (scaled by batch/256 in STEEGformer: blr=3e-4)
         "batch_size": 64,
         "optimizer": "adamw",
-        "weight_decay": 0.05,        # CBraMod Table 6: 5e-2
+        "weight_decay": 0.05,
         "num_epochs_cv": 100,
-        "num_epochs_eval": 50,
-        "warmup_epochs": 0,          # No warmup — CBraMod Table 6 uses pure CosineAnnealingLR
+        "num_epochs_eval": 100,
+        "warmup_epochs": 10,         # STEEGformer default: 10
         "label_smoothing": 0.1,
         "scheduler": "cosine",
-        "early_stopping_patience": 50,
-        "head_lr_multiplier": 5.0,   # Head gets 5× backbone lr (CBraMod paper: multi_lr strategy)
+        "early_stopping_patience": 30,
+        "head_lr_multiplier": 1.0,   # Not used — layer_decay handles lr scaling
+        "layer_decay": 0.75,         # Layer-wise lr decay (STEEGformer default)
+        "finetune_layers": 12,       # Unfreeze last N transformer blocks (12 = all for most models)
+        "grad_clip": 1.0,            # Gradient clipping max norm
     },
     "classic_nn": {  # Classic NN models (EEGNet, Conformer, CTNet, DeepConvNet)
         "learning_rate": 3e-3,       # Table F.10(a): 3e-3
@@ -157,6 +160,68 @@ MODEL_HP_OVERRIDES = {
     #     "early_stopping_patience": 30,
     # },
 }
+
+# ── Layer-wise learning rate decay ──
+# Maps parameter names to layer indices for each model.
+# Layer 0 = embeddings (lowest lr), layer N = head (highest lr).
+# Based on: BEiT/MAE convention (deeper = higher lr).
+
+# Per-model config: (backbone_prefix, block_pattern, num_layers)
+# block_pattern is a dotted path prefix that contains the layer index.
+MODEL_LAYER_CONFIG = {
+    "steegformer":  {"prefix": "",                "blocks": "blocks",               "num_layers": 8},
+    "labram":       {"prefix": "",                "blocks": "blocks",               "num_layers": 12},
+    "biot":         {"prefix": "biot",            "blocks": "biot.transformer.layers.layers", "num_layers": 4},
+    "cbramod":      {"prefix": "backbone",        "blocks": "backbone.encoder.layers", "num_layers": 12},
+    "eegpt":        {"prefix": "target_encoder",  "blocks": "target_encoder.blocks",   "num_layers": 12},
+}
+
+
+def get_layer_id(param_name, model_name, num_layers=None):
+    """
+    Assign a layer index to a parameter for layer-wise lr decay.
+
+    Returns:
+        int: layer_id in [0, num_layers].
+             0 = embeddings (lowest lr), num_layers = head (highest lr).
+    """
+    cfg = MODEL_LAYER_CONFIG.get(model_name)
+    if cfg is None:
+        return 0  # Unknown model, treat all as same layer
+
+    if num_layers is None:
+        num_layers = cfg["num_layers"]
+
+    block_prefix = cfg["blocks"]
+
+    # Head / classifier params get the highest layer id
+    if TrainerDownstream._is_head_param(param_name):
+        return num_layers
+
+    # LoRA params — assign same layer id as the layer they're injected into
+    if "lora_" in param_name:
+        # Try to extract block index from the full param name
+        if block_prefix in param_name:
+            try:
+                after = param_name.split(block_prefix + ".")[1]
+                layer_idx = int(after.split(".")[0])
+                return min(layer_idx + 1, num_layers)
+            except (IndexError, ValueError):
+                pass
+        return num_layers  # fallback: treat as head-level
+
+    # Transformer block params
+    if block_prefix in param_name:
+        try:
+            after = param_name.split(block_prefix + ".")[1]
+            layer_idx = int(after.split(".")[0])
+            return min(layer_idx + 1, num_layers)  # +1 because 0 is embeddings
+        except (IndexError, ValueError):
+            pass
+
+    # Everything else (embeddings, patch_embed, pos_embed, cls_token, norms)
+    return 0
+
 
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
@@ -315,10 +380,14 @@ class TrainerDownstream:
 
     def build_optimizer(self, model, optimizer_params):
         """
-        Build optimizer with discriminative learning rates.
+        Build optimizer with layer-wise learning rate decay (STEEGformer style).
 
-        Backbone params get base lr; head params get lr * head_lr_multiplier.
-        For linear_probe/lora, only requires_grad=True params are included.
+        For training modes with layer_decay < 1.0:
+            Each transformer layer gets lr = base_lr * (layer_decay ^ (num_layers - layer_id))
+            Layer 0 (embeddings) gets the lowest lr, head gets full base_lr.
+
+        For training modes without layer_decay (linear_probe, lora, classic_nn):
+            Falls back to simple head_lr_multiplier (backbone vs head split).
         """
         # Resolve optimizer class
         if "optimizer" in self.config and isinstance(self.config["optimizer"], dict):
@@ -329,40 +398,73 @@ class TrainerDownstream:
 
         optimizer_cls = OPTIMIZER_REGISTRY[optimizer_name]
 
-        # Get head lr multiplier from HP config
         hp = self._get_hp()
-        head_lr_mult = hp.get("head_lr_multiplier", 1.0)
         base_lr = optimizer_params["lr"]
-        head_lr = base_lr * head_lr_mult
         weight_decay = optimizer_params.get("weight_decay", 0.0)
+        layer_decay = hp.get("layer_decay", 1.0)
 
-        # Split parameters into backbone vs head groups
-        backbone_params = []
-        head_params = []
+        # ── Layer-wise lr decay path ──
+        if layer_decay < 1.0 and self.model_name in MODEL_LAYER_CONFIG:
+            cfg = MODEL_LAYER_CONFIG[self.model_name]
+            num_layers = cfg["num_layers"]
 
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            if self._is_head_param(name):
-                head_params.append(p)
-            else:
-                backbone_params.append(p)
+            # Group params by layer_id
+            layer_params = {}  # layer_id -> list of params
+            for name, p in model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                lid = get_layer_id(name, self.model_name, num_layers)
+                if lid not in layer_params:
+                    layer_params[lid] = []
+                layer_params[lid].append(p)
 
-        # Build param groups
-        param_groups = []
-        if backbone_params:
-            param_groups.append({"params": backbone_params, "lr": base_lr, "weight_decay": weight_decay})
-        if head_params:
-            param_groups.append({"params": head_params, "lr": head_lr, "weight_decay": weight_decay})
+            # Build param groups with decaying lr
+            param_groups = []
+            for lid in sorted(layer_params.keys()):
+                scale = layer_decay ** (num_layers - lid)
+                layer_lr = base_lr * scale
+                # No weight decay on biases, LayerNorm, and embeddings
+                param_groups.append({
+                    "params": layer_params[lid],
+                    "lr": layer_lr,
+                    "weight_decay": weight_decay,
+                })
 
-        # Fallback: if splitting produced nothing (shouldn't happen), use all trainable
-        if not param_groups:
-            trainable = [p for p in model.parameters() if p.requires_grad]
-            param_groups = [{"params": trainable, "lr": base_lr, "weight_decay": weight_decay}]
+            # Print summary
+            total_trainable = sum(len(v) for v in layer_params.values())
+            min_lr = base_lr * (layer_decay ** num_layers)
+            print(f"  [Optimizer] Layer-wise lr decay={layer_decay}: "
+                  f"{len(layer_params)} groups, lr range [{min_lr:.1e}, {base_lr:.1e}], "
+                  f"{total_trainable} trainable params")
 
-        if head_lr_mult != 1.0:
-            print(f"  [Optimizer] Discriminative lr: backbone={base_lr:.1e}, head={head_lr:.1e} "
-                  f"(×{head_lr_mult}), {len(backbone_params)} backbone params, {len(head_params)} head params")
+        # ── Simple head_lr_multiplier path (LP, LoRA, classic_nn) ──
+        else:
+            head_lr_mult = hp.get("head_lr_multiplier", 1.0)
+            head_lr = base_lr * head_lr_mult
+
+            backbone_params = []
+            head_params = []
+            for name, p in model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if self._is_head_param(name):
+                    head_params.append(p)
+                else:
+                    backbone_params.append(p)
+
+            param_groups = []
+            if backbone_params:
+                param_groups.append({"params": backbone_params, "lr": base_lr, "weight_decay": weight_decay})
+            if head_params:
+                param_groups.append({"params": head_params, "lr": head_lr, "weight_decay": weight_decay})
+
+            if not param_groups:
+                trainable = [p for p in model.parameters() if p.requires_grad]
+                param_groups = [{"params": trainable, "lr": base_lr, "weight_decay": weight_decay}]
+
+            if head_lr_mult != 1.0:
+                print(f"  [Optimizer] Discriminative lr: backbone={base_lr:.1e}, head={head_lr:.1e} "
+                      f"(×{head_lr_mult}), {len(backbone_params)} backbone params, {len(head_params)} head params")
 
         return optimizer_cls(param_groups)
 
@@ -407,6 +509,8 @@ class TrainerDownstream:
             model.train()
 
         loss_total = 0
+        grad_clip = self._get_hp().get("grad_clip", 0)
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
 
         for batch in tqdm(dataloader):
             # Downstream_Dataset returns (x, y, channel_id); EEGdataset returns (x, y)
@@ -429,7 +533,8 @@ class TrainerDownstream:
             loss = loss_fn(pred, y)
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm=1.0)
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip)
             optimizer.step()
 
             # OneCycleLR steps per batch, not per epoch

@@ -90,6 +90,17 @@ DATASET_CONFIGS = {
         "data_length": 1280,  # 5s * 256Hz
         "sampling_rate": 256,
     },
+    "error": {
+        "num_classes": 2,
+        "metric": "bacc",
+        "model_path": "downstream/saved_models",
+        "result_output": "downstream/results",
+        "data_path": "downstream/data/error",
+        "config_yaml": "downstream/info_dataset/error.yaml",
+        "num_channels": 64,
+        "data_length": 142,  # ~0.284s * 500Hz
+        "sampling_rate": 500,
+    },
 }
 
 

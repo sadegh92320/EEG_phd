@@ -27,7 +27,7 @@ import torch.nn as nn
 
 from downstream.downstream_dataset import Downstream_Dataset
 from downstream.split_data_downstream import DownstreamDataLoader
-from downstream.training_model import TrainerDownstream, EarlyStopper
+from downstream.training_model import TrainerDownstream, EarlyStopper, FIXED_HP
 from downstream.downstream_model import (
     Downstream, DownstreamGNN, DownstreamRiemannLoss,
     DownstreamRiemannTransformerPara, DownstreamRiemannTransformerSeq,
@@ -98,6 +98,17 @@ DATASET_CONFIGS = {
         "data_length": 1280,  # 5s * 256Hz
         "sampling_rate": 256,
     },
+    "error": {
+        "num_classes": 2,
+        "metric": "bacc",
+        "model_path": "downstream/saved_models",
+        "result_output": "downstream/results",
+        "data_path": "downstream/data/error",
+        "config_yaml": "downstream/info_dataset/error.yaml",
+        "num_channels": 64,
+        "data_length": 142,  # ~0.284s * 500Hz
+        "sampling_rate": 500,
+    },
 }
 
 
@@ -131,6 +142,39 @@ def build_riemann_ema(num_classes, checkpoint_path, num_channels, data_length, *
     model = DownstreamRiemannEMA(num_classes=num_classes, checkpoint_path=checkpoint_path)
     return model
 
+def _partial_unfreeze(model, block_container, num_total_blocks, finetune_layers, head_modules):
+    """
+    STEEGformer-style partial unfreezing: freeze everything, then unfreeze
+    the last `finetune_layers` transformer blocks + head modules.
+
+    Args:
+        model: The full model.
+        block_container: nn.ModuleList of transformer blocks.
+        num_total_blocks: Total number of blocks.
+        finetune_layers: How many blocks to unfreeze from the end.
+        head_modules: List of nn.Module instances to always unfreeze (classifier head, norms).
+    """
+    # 1. Freeze everything
+    for p in model.parameters():
+        p.requires_grad = False
+
+    # 2. Unfreeze last N blocks
+    start_idx = max(0, num_total_blocks - finetune_layers)
+    for i in range(start_idx, num_total_blocks):
+        for p in block_container[i].parameters():
+            p.requires_grad = True
+
+    # 3. Unfreeze head modules
+    for mod in head_modules:
+        for p in mod.parameters():
+            p.requires_grad = True
+
+    frozen = sum(1 for p in model.parameters() if not p.requires_grad)
+    trainable = sum(1 for p in model.parameters() if p.requires_grad)
+    print(f"  [Partial unfreeze] Last {finetune_layers}/{num_total_blocks} blocks + head: "
+          f"{trainable} trainable, {frozen} frozen params")
+
+
 def build_steegformer(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
     """ST-EEGFormer: encoder-only from pretrained MAE."""
     from downstream.models.foundation_models.STEEGformer import steegformer_small_downstream
@@ -144,8 +188,12 @@ def build_steegformer(num_classes, checkpoint_path, num_channels, data_length, *
 
     # Model is frozen by default inside steegformer_small_downstream.
     if training_mode == "full":
-        for p in model.parameters():
-            p.requires_grad = True
+        finetune_layers = FIXED_HP["full"].get("finetune_layers", 8)
+        _partial_unfreeze(
+            model, model.blocks, num_total_blocks=len(model.blocks),
+            finetune_layers=finetune_layers,
+            head_modules=[model.head, model.norm],
+        )
     elif training_mode == "lora":
         # Backbone stays frozen; inject LoRA into attention layers, unfreeze head
         from downstream.lora import inject_lora
@@ -224,6 +272,16 @@ def build_labram(num_classes, checkpoint_path, num_channels, data_length, **kwar
         for name, p in model.named_parameters():
             if "head" not in name:
                 p.requires_grad = False
+    elif training_mode == "full":
+        finetune_layers = FIXED_HP["full"].get("finetune_layers", 12)
+        head_mods = [model.head]
+        if model.fc_norm is not None:
+            head_mods.append(model.fc_norm)
+        _partial_unfreeze(
+            model, model.blocks, num_total_blocks=len(model.blocks),
+            finetune_layers=finetune_layers,
+            head_modules=head_mods,
+        )
     elif training_mode == "lora":
         # Freeze everything, inject LoRA, unfreeze head
         for p in model.parameters():
@@ -232,7 +290,6 @@ def build_labram(num_classes, checkpoint_path, num_channels, data_length, **kwar
         inject_lora(model, rank=8, alpha=16.0)
         for p in model.head.parameters():
             p.requires_grad = True
-    # else (full): all params trainable for fine-tuning
 
     return model
 
@@ -292,8 +349,14 @@ def build_biot(num_classes, checkpoint_path, num_channels, data_length, **kwargs
     # else: keep paper's ClassificationHead (ELU + Linear)
 
     if training_mode == "full":
-        for p in model.biot.parameters():
-            p.requires_grad = True
+        finetune_layers = FIXED_HP["full"].get("finetune_layers", 4)
+        # BIOT uses linear_attention_transformer: blocks are in
+        # model.biot.transformer.layers (SequentialSequence).layers (nn.ModuleList)
+        block_container = model.biot.transformer.layers.layers
+        _partial_unfreeze(
+            model, block_container, len(block_container), finetune_layers,
+            head_modules=[model.classifier, model.chan_conv],
+        )
     elif training_mode == "lora":
         # Backbone frozen by default above; inject LoRA, unfreeze classifier
         from downstream.lora import inject_lora
@@ -351,8 +414,11 @@ def build_cbramod(num_classes, checkpoint_path, num_channels, data_length, **kwa
             nn.Dropout(0.1),
             nn.Linear(256, num_classes),
         )
-        for p in model.backbone.parameters():
-            p.requires_grad = True
+        finetune_layers = FIXED_HP["full"].get("finetune_layers", 12)
+        _partial_unfreeze(
+            model, model.backbone.encoder.layers, len(model.backbone.encoder.layers),
+            finetune_layers, head_modules=[model.classifier],
+        )
     elif training_mode == "lora":
         # Frozen backbone + LoRA adapters + same LP head
         from downstream.lora import inject_lora
@@ -414,10 +480,14 @@ def build_eegpt(num_classes, checkpoint_path, num_channels, data_length, **kwarg
         for p in model._original_probe2.parameters():
             p.requires_grad = False
     elif training_mode == "full":
-        # Paper's original 2-layer probe + unfrozen encoder
+        # Paper's original 2-layer probe + partially unfrozen encoder
         model._use_standard_probe = False
-        for p in model.target_encoder.parameters():
-            p.requires_grad = True
+        finetune_layers = FIXED_HP["full"].get("finetune_layers", 12)
+        _partial_unfreeze(
+            model, model.target_encoder.blocks, len(model.target_encoder.blocks),
+            finetune_layers,
+            head_modules=[model._original_probe1, model._original_probe2],
+        )
         # Freeze the standard probe so only the original one trains
         for p in model.probe_norm.parameters():
             p.requires_grad = False
