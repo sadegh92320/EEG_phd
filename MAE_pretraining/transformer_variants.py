@@ -1053,12 +1053,19 @@ class AdaptiveLogMap(nn.Module):
             channel_idx: (C,) long tensor — global channel indices for this batch
             ema_ref: unused, kept for API compatibility
         Returns:
-            (batch, C, C) tangent vectors at identity
+            (batch, C, C) tangent vectors at identity on the correlation manifold
         """
         orig_dtype = S.dtype
         C = S.shape[-1]
+
+        # Normalize covariance → correlation so eigenvalues concentrate near 1
+        # S_corr = D^{-1/2} S D^{-1/2}, diag(S_corr) = 1
+        d = torch.diagonal(S, dim1=-2, dim2=-1).clamp(min=self.eps)  # (B, C)
+        d_inv_sqrt = d.rsqrt()  # (B, C)
+        S_corr = S * d_inv_sqrt.unsqueeze(-1) * d_inv_sqrt.unsqueeze(-2)
+
         ref = torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
-        return (S - ref).to(orig_dtype)
+        return (S_corr - ref).to(orig_dtype)
 
 
 class AdaptiveRiemannianAttentionBias(nn.Module):

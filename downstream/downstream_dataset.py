@@ -15,7 +15,7 @@ MODEL_PREPROCESS_CONFIG = {
     "steegformer":  {"norm": {"method": "z_standardize"},            "sfreq": 128},
     "labram":       {"norm": {"method": "rescale", "scale": 1e-4},  "sfreq": 200},
     "biot":         {"norm": {"method": "percentile_95"},            "sfreq": 200},
-    "cbramod":      {"norm": {"method": "rescale", "scale": 1e-2},  "sfreq": 200},  # ÷100µV (CBraMod paper: "setting the unit to 100µV")
+    "cbramod":      {"norm": {"method": "none"},                     "sfreq": 200},  # No normalization — matches original repo (only resamples to 200Hz)
     "eegpt":        {"norm": {"method": "rescale", "scale": 1e-3},  "sfreq": 256},  # µV → mV (V→µV conversion handled by data_unit flag)
     "bendr":        {"norm": {"method": "minmax_neg1_1"},            "sfreq": 256},
     # Classic NN baselines run at the baseline 256 Hz with z-standardization
