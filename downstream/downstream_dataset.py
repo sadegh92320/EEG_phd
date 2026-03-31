@@ -15,7 +15,7 @@ MODEL_PREPROCESS_CONFIG = {
     "steegformer":  {"norm": {"method": "z_standardize"},            "sfreq": 128},
     "labram":       {"norm": {"method": "rescale", "scale": 1e-4},  "sfreq": 200},
     "biot":         {"norm": {"method": "percentile_95"},            "sfreq": 200},
-    "cbramod":      {"norm": {"method": "rescale", "scale": 1e-4},  "sfreq": 200},
+    "cbramod":      {"norm": {"method": "rescale", "scale": 1e-2},  "sfreq": 200},  # ÷100µV (CBraMod paper: "setting the unit to 100µV")
     "eegpt":        {"norm": {"method": "rescale", "scale": 1e-3},  "sfreq": 256},  # µV → mV (V→µV conversion handled by data_unit flag)
     "bendr":        {"norm": {"method": "minmax_neg1_1"},            "sfreq": 256},
     # Classic NN baselines run at the baseline 256 Hz with z-standardization
@@ -153,7 +153,9 @@ class Downstream_Dataset(Dataset):
         if self._needs_resample:
             trial_data = self._resample(trial_data)
 
-        trial_data = np.clip(trial_data, -500, 500)  # ±500 µV artifact rejection
+        # No hard clipping — let each model's normalization handle the scale.
+        # Previous ±500µV clip was too aggressive for datasets like Mumtaz (±3400µV range)
+        # and not used by CBraMod/EEGPT papers in their downstream evaluation.
 
         if self.normalize:
             trial_data = self._normalize(trial_data)

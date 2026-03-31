@@ -160,7 +160,7 @@ class Pipeline:
         if pretrain:
             print("new's")
             train_loader, valid_loader = self.import_data_pretrain()
-            model = AdaptiveRiemannGNNBert()
+            model = ApproxAdaptiveRiemannBert()
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
@@ -168,7 +168,7 @@ class Pipeline:
                     mode="min",
                     save_top_k=5,
                     save_last=True,
-                    filename="epoch{epoch}-rie-gnn-{val_mse:.4f}",
+                    filename="epoch{epoch}-riemann-{val_mse:.4f}",
                 )
 
             wandb_logger = WandbLogger(
@@ -189,7 +189,7 @@ class Pipeline:
                 callbacks=[TQDMProgressBar(refresh_rate=20), ckpt_callback],
                 log_every_n_steps=5,
                 logger=wandb_logger,
-                max_epochs=200,
+                max_epochs=40,
                 precision="16-mixed",
                 gradient_clip_val=1.0,
                 

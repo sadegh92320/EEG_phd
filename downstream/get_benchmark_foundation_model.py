@@ -134,11 +134,20 @@ def build_riemann_ema(num_classes, checkpoint_path, num_channels, data_length, *
 def build_steegformer(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
     """ST-EEGFormer: encoder-only from pretrained MAE."""
     from downstream.models.foundation_models.STEEGformer import steegformer_small_downstream
+    training_mode = kwargs.get("training_mode", "linear_probe")
+
     model = steegformer_small_downstream(
         num_classes=num_classes,
         checkpoint_path=checkpoint_path,
         aggregation="class",
     )
+
+    # Model is frozen by default inside steegformer_small_downstream.
+    # For full fine-tuning, unfreeze everything.
+    if training_mode == "full":
+        for p in model.parameters():
+            p.requires_grad = True
+
     return model
 
 
@@ -296,24 +305,27 @@ def build_cbramod(num_classes, checkpoint_path, num_channels, data_length, **kwa
         pretrained_dir=checkpoint_path,
     )
 
+    from einops.layers.torch import Rearrange
+
     # Freeze backbone by default (linear probe)
     for p in model.backbone.parameters():
         p.requires_grad = False
 
     if training_mode == "linear_probe":
-        # Fair linear probe: mean-pool over patches, keep channels → (B, C * 200)
-        model.pool_mode = "mean"
-        in_features = num_channels * 200
-        model.feed_forward = nn.Sequential(
-            nn.LayerNorm(in_features),
-            nn.Linear(in_features, num_classes),
+        # avgpooling_patch_reps: pool over channels & patches → Linear(200, C)
+        # Matches original repo's avgpooling_patch_reps classifier
+        model.classifier = nn.Sequential(
+            Rearrange('b c s d -> b d c s'),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(200, num_classes),
         )
     elif training_mode == "full":
-        # Fine-tuning: use original flatten + paper's 3-layer MLP head
-        # This preserves full temporal resolution so backbone + head can co-adapt
-        model.pool_mode = "flatten"
-        flat_features = num_channels * n_patches * 200  # e.g. 19 * 5 * 200 = 19,000
-        model.feed_forward = nn.Sequential(
+        # all_patch_reps: flatten → 3-layer MLP (paper's original head)
+        # Matches original repo's all_patch_reps classifier
+        flat_features = num_channels * n_patches * 200
+        model.classifier = nn.Sequential(
+            Rearrange('b c s d -> b (c s d)'),
             nn.Linear(flat_features, n_patches * 200),
             nn.ELU(),
             nn.Dropout(0.1),

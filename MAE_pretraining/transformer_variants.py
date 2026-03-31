@@ -1124,15 +1124,14 @@ class AdaptiveLogMap(nn.Module):
         C = channel_idx.shape[0]
 
         if self.log_mode == 'approx':
-            # ── FAST PATH: no R_inv_half, no solve, no eigh ──
-            # First-order tangent-space approximation: S - ref
-            # If EMA reference provided: deviation from population average
-            # Otherwise: deviation from identity (original behavior)
-            if ema_ref is not None:
-                ref = ema_ref.unsqueeze(0).to(dtype=S.dtype, device=S.device)
-            else:
-                ref = torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
-            return (S - ref).to(orig_dtype)
+            # ── FAST PATH: first-order tangent-space approximation ──
+            # S - R where R is the learned SPD reference (from L_factor).
+            # At init R ≈ I (since L_factor ≈ I), so this starts as S - I.
+            # During training, R adapts to the data distribution, making the
+            # approximation more accurate (S is closer to R than to I).
+            R = self._get_submatrix_reference(channel_idx)  # (C, C) fp32
+            R = R.unsqueeze(0).to(dtype=S.dtype, device=S.device)
+            return (S - R).to(orig_dtype)
 
         # ── FULL PATH: whiten with learned reference R ──
         R = self._get_submatrix_reference(channel_idx)       # (C, C) fp32

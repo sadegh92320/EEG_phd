@@ -319,8 +319,21 @@ def _weights_init(m):
 
 
 class CBraModClassifier(nn.Module):
+    """
+    CBraMod backbone + downstream classifier.
+
+    Classifier modes (set via build_cbramod):
+        - "avgpooling_patch_reps": AdaptiveAvgPool2d over channels & patches → Linear(200, C)
+          Used for linear probe — small, fair head.
+        - "all_patch_reps": flatten → 3-layer MLP (paper's original head)
+          Used for full fine-tuning.
+
+    Matches the structure from the original CBraMod repo (model_for_mumtaz.py).
+    """
     def __init__(self, num_class, num_channel, data_length, pretrained_dir):
         super(CBraModClassifier, self).__init__()
+        from einops.layers.torch import Rearrange
+
         self.backbone = CBraMod(
             in_dim=200, out_dim=200, d_model=200,
             dim_feedforward=800, seq_len=30,
@@ -329,37 +342,22 @@ class CBraModClassifier(nn.Module):
         self.backbone.load_state_dict(torch.load(pretrained_dir, map_location='cpu'))
         self.backbone.proj_out = nn.Identity()
 
-        # Pool mode: "flatten" (original paper) or "mean" (fair linear probe)
-        self.pool_mode = "flatten"
+        n_patches = data_length // 200
 
-        self.feed_forward = nn.Sequential(
-            nn.Linear(num_channel*data_length, data_length),
-            nn.ELU(),
-            nn.Dropout(0.1),
-            nn.Linear(data_length, 200),
-            nn.ELU(),
-            nn.Dropout(0.1),
+        # Default classifier: avgpooling (overridden by build_cbramod)
+        self.classifier = nn.Sequential(
+            Rearrange('b c s d -> b d c s'),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
             nn.Linear(200, num_class),
         )
 
-    #@autocast(device_type='cuda', enabled=True)
     def forward(self, x):
-        # input: (batch, channel, time) => transform to (batch_size, num_of_channels, time_segments, points_per_patch) e.g., (8, 22, 4, 200)
+        # input: (batch, channel, time) → window into patches of 200
         x_windows = x.unfold(dimension=2, size=200, step=200)
-
-        bz, ch_num, seq_len, patch_size = x_windows.shape
+        # x_windows: (bz, ch_num, seq_len, 200)
         feats = self.backbone(x_windows)  # (bz, ch_num, seq_len, 200)
-
-        if self.pool_mode == "mean":
-            # Mean-pool over patches (temporal), keep channels → (bz, ch_num, 200)
-            # Then flatten → (bz, ch_num * 200) so classifier sees spatial structure
-            feats = feats.mean(dim=2)  # (bz, ch_num, seq_len, 200) → (bz, ch_num, 200)
-            feats = feats.flatten(1)   # → (bz, ch_num * 200)
-        else:
-            # Original: flatten everything → (bz, ch_num * seq_len * 200)
-            feats = feats.contiguous().view(bz, ch_num * seq_len * 200)
-
-        out = self.feed_forward(feats)
+        out = self.classifier(feats)
         return out
     
 

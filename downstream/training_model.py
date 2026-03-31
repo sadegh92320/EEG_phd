@@ -64,13 +64,13 @@ FIXED_HP = {
         "learning_rate": 1e-4,       # Unified: 1e-4 (CBraMod paper Table 6; 5e-4 caused catastrophic forgetting)
         "batch_size": 64,
         "optimizer": "adamw",
-        "weight_decay": 0.05,        # Table F.2(a): 0.05
-        "num_epochs_cv": 100,        # Table F.2(a): 100
+        "weight_decay": 0.05,        # CBraMod Table 6: 5e-2
+        "num_epochs_cv": 100,
         "num_epochs_eval": 100,
-        "warmup_epochs": 10,         # Table F.2(a): 10
-        "label_smoothing": 0.1,      # Table F.2(a): 0.1
+        "warmup_epochs": 0,          # No warmup — CBraMod Table 6 uses pure CosineAnnealingLR
+        "label_smoothing": 0.1,
         "scheduler": "cosine",
-        "early_stopping_patience": 30,
+        "early_stopping_patience": 50,
     },
     "classic_nn": {  # Classic NN models (EEGNet, Conformer, CTNet, DeepConvNet)
         "learning_rate": 3e-3,       # Table F.10(a): 3e-3
@@ -183,11 +183,16 @@ def time(func):
 
 class TrainerDownstream:
     def __init__(self, model_name, model, optimizer, loss_fn, batch_size, config, early_stopper = EarlyStopper, train_data = None, val_data = None, test_data = None, training_mode = "linear_probe"):
-        self.device = torch.device(
-            "cuda" if torch.cuda.is_available()
-            else "mps" if torch.backends.mps.is_available()
-            else "cpu"
-        )
+        # Set FORCE_CPU=True to debug MPS issues
+        FORCE_CPU = False
+        if FORCE_CPU:
+            self.device = torch.device("cpu")
+        else:
+            self.device = torch.device(
+                "cuda" if torch.cuda.is_available()
+                else "mps" if torch.backends.mps.is_available()
+                else "cpu"
+            )
         self.model_name = model_name
         self.model = model
         self.initial_state = deepcopy(model.state_dict())
@@ -354,7 +359,7 @@ class TrainerDownstream:
             loss = loss_fn(pred, y)
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             # OneCycleLR steps per batch, not per epoch
@@ -362,6 +367,13 @@ class TrainerDownstream:
                 scheduler.step()
 
             loss_total = loss.item() + loss_total
+
+        # DEBUG: print gradient norm, lr, data stats, and prediction stats
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"  [DEBUG] loss={loss.item():.4f}, grad_norm={grad_norm:.2e}, lr={current_lr:.2e}, "
+              f"pred_mean={pred.mean().item():.4e}, pred_std={pred.std().item():.4e}, "
+              f"x_mean={x.mean().item():.4e}, x_std={x.std().item():.4e}, "
+              f"y_dist={y.bincount().tolist()}, device={x.device}")
         return loss_total/len(dataloader)
     
 
