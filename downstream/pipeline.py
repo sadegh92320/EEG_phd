@@ -160,7 +160,7 @@ class Pipeline:
         if pretrain:
             print("new's")
             train_loader, valid_loader = self.import_data_pretrain()
-            model = AdaptiveRiemannEMAGraphBert()
+            model = AdaptiveRiemannGNNBert()
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
@@ -168,12 +168,12 @@ class Pipeline:
                     mode="min",
                     save_top_k=5,
                     save_last=True,
-                    filename="epoch{epoch}-rie-ema-{val_mse:.4f}",
+                    filename="epoch{epoch}-rie-gnn-{val_mse:.4f}",
                 )
 
             wandb_logger = WandbLogger(
                 project="eeg_foundation_model",
-                name="riemann-ema",
+                name="riemann-gnn",
                 log_model="all"
             )
             wandb_logger.experiment.config.update({

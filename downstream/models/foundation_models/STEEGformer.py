@@ -246,7 +246,7 @@ class MaskedAutoencoderViT(nn.Module):
         Seq_total = Seq * Ch_all
 
         # Flatten (Seq, Ch_all) → Seq_total
-        x = x.view(B, Seq_total, Dmodel)  # (B, Seq_total, Dmodel)
+        x = x.reshape(B, Seq_total, Dmodel)  # (B, Seq_total, Dmodel)
 
         # 1a) CHANNEL embeddings (small lookup)
         # If chan_idx is 1‐D (Ch_all,), broadcast to (B, Ch_all)
@@ -625,7 +625,7 @@ class STEEGFormerDownstream(nn.Module):
         x = self.patch_embed(eeg)
         _, Seq, Ch_all, Dmodel = x.shape
         Seq_total = Seq * Ch_all
-        x = x.view(B, Seq_total, Dmodel)
+        x = x.reshape(B, Seq_total, Dmodel)
 
         # 2) Channel embedding
         if channel_list.dim() == 1:

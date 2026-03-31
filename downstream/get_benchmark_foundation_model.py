@@ -296,22 +296,32 @@ def build_cbramod(num_classes, checkpoint_path, num_channels, data_length, **kwa
         pretrained_dir=checkpoint_path,
     )
 
-    # Freeze backbone, only train feed_forward head
+    # Freeze backbone by default (linear probe)
     for p in model.backbone.parameters():
         p.requires_grad = False
 
     if training_mode == "linear_probe":
-        # Fair linear probe: mean-pool over channels and patches → (B, 200),
-        # then LayerNorm + Linear. Same embed dim as LaBraM (200) for clean comparison.
+        # Fair linear probe: mean-pool over patches, keep channels → (B, C * 200)
         model.pool_mode = "mean"
+        in_features = num_channels * 200
         model.feed_forward = nn.Sequential(
-            nn.LayerNorm(200),
+            nn.LayerNorm(in_features),
+            nn.Linear(in_features, num_classes),
+        )
+    elif training_mode == "full":
+        # Fine-tuning: use original flatten + paper's 3-layer MLP head
+        # This preserves full temporal resolution so backbone + head can co-adapt
+        model.pool_mode = "flatten"
+        flat_features = num_channels * n_patches * 200  # e.g. 19 * 5 * 200 = 19,000
+        model.feed_forward = nn.Sequential(
+            nn.Linear(flat_features, n_patches * 200),
+            nn.ELU(),
+            nn.Dropout(0.1),
+            nn.Linear(n_patches * 200, 200),
+            nn.ELU(),
+            nn.Dropout(0.1),
             nn.Linear(200, num_classes),
         )
-    # else: keep the paper's original 3-layer MLP head with flatten pooling
-
-    if training_mode == "full":
-        # Unfreeze backbone for full fine-tuning
         for p in model.backbone.parameters():
             p.requires_grad = True
 

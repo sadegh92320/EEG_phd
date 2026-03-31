@@ -351,8 +351,10 @@ class CBraModClassifier(nn.Module):
         feats = self.backbone(x_windows)  # (bz, ch_num, seq_len, 200)
 
         if self.pool_mode == "mean":
-            # Mean-pool over channels and patches → (bz, 200)
-            feats = feats.mean(dim=(1, 2))
+            # Mean-pool over patches (temporal), keep channels → (bz, ch_num, 200)
+            # Then flatten → (bz, ch_num * 200) so classifier sees spatial structure
+            feats = feats.mean(dim=2)  # (bz, ch_num, seq_len, 200) → (bz, ch_num, 200)
+            feats = feats.flatten(1)   # → (bz, ch_num * 200)
         else:
             # Original: flatten everything → (bz, ch_num * seq_len * 200)
             feats = feats.contiguous().view(bz, ch_num * seq_len * 200)

@@ -61,7 +61,7 @@ FIXED_HP = {
         "early_stopping_patience": 20,
     },
     "full": {  # Foundation model fine-tuning or baseline NN training from scratch
-        "learning_rate": 5e-4,       # Table F.2(a)/F.5(a): 5e-4
+        "learning_rate": 1e-4,       # Unified: 1e-4 (CBraMod paper Table 6; 5e-4 caused catastrophic forgetting)
         "batch_size": 64,
         "optimizer": "adamw",
         "weight_decay": 0.05,        # Table F.2(a): 0.05

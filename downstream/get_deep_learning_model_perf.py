@@ -1,17 +1,38 @@
-import torch
-import random
+"""
+Benchmark evaluation for deep learning baselines (trained from scratch).
+
+Supported models:
+    - EEGNet       (Compact CNN with depthwise/separable convolutions)
+    - Conformer    (CNN + Transformer hybrid)
+    - DeepConvNet  (Deep convolutional network)
+    - CTNet        (CNN-Transformer EEG classifier)
+
+Usage:
+    python -m downstream.get_deep_learning_model_perf \
+        --model eegnet \
+        --dataset faced \
+        --protocol population
+"""
+
+import argparse
 import os
+import random
+import torch
 import numpy as np
-import lightning as L
+import torch.nn as nn
+
 from downstream.downstream_dataset import Downstream_Dataset
 from downstream.split_data_downstream import DownstreamDataLoader
 from downstream.training_model import TrainerDownstream, EarlyStopper
-from downstream.models.deep_learning_model.eeg_net import EEGNet
 
+
+# ────────────────────────────────────────────────────────────────
+# Reproducibility
+# ────────────────────────────────────────────────────────────────
 
 def seed_everything(seed=42):
     random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -20,58 +41,141 @@ def seed_everything(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
+# ────────────────────────────────────────────────────────────────
+# Dataset-specific configs
+# ────────────────────────────────────────────────────────────────
 
-def get_config_FACED():
-    config = {
-            "num_classes": 9,
-            "metric": "bacc",  # balanced accuracy (macro recall) — standard for FACED
-            "model_path": "downstream/saved_models",
-            "result_output": "downstream/results",
-        }
-    return config
+DATASET_CONFIGS = {
+    "faced": {
+        "num_classes": 9,
+        "metric": "bacc",
+        "model_path": "downstream/saved_models",
+        "result_output": "downstream/results",
+        "data_path": "downstream/data/faced",
+        "config_yaml": "downstream/info_dataset/faced.yaml",
+        "num_channels": 32,
+        "data_length": 7680,  # 30s * 256Hz
+        "sampling_rate": 256,
+    },
+    "bci_comp_2a": {
+        "num_classes": 4,
+        "metric": "accuracy",
+        "model_path": "downstream/saved_models",
+        "result_output": "downstream/results",
+        "data_path": "downstream/data/bci_comp_2a",
+        "config_yaml": "MAE_pretraining/info_dataset/bci_comp_2a.yaml",
+        "num_channels": 22,
+        "data_length": 1000,  # 4s * 250Hz
+        "sampling_rate": 250,
+    },
+    "upper_limb": {
+        "num_classes": 6,
+        "metric": "acc1",
+        "model_path": "downstream/saved_models",
+        "result_output": "downstream/results",
+        "data_path": "downstream/data/upper_limb",
+        "config_yaml": "downstream/info_dataset/upperlimb.yaml",
+        "num_channels": 32,
+        "data_length": 768,
+        "sampling_rate": 128,
+    },
+    "mumtaz": {
+        "num_classes": 2,
+        "metric": "bacc",
+        "model_path": "downstream/saved_models",
+        "result_output": "downstream/results",
+        "data_path": "downstream/data/mumtaz",
+        "config_yaml": "downstream/info_dataset/mumtaz.yaml",
+        "num_channels": 19,
+        "data_length": 1280,  # 5s * 256Hz
+        "sampling_rate": 256,
+    },
+}
 
 
-# ── Config ──
+# ────────────────────────────────────────────────────────────────
+# Model builders
+# ────────────────────────────────────────────────────────────────
 
+def build_eegnet(num_classes, num_channels, data_length, sampling_rate, **kwargs):
+    """EEGNet: Compact CNN with depthwise and separable convolutions."""
+    from downstream.models.deep_learning_model.eeg_net import EEGNet
 
-# ── Model ──
-def get_eeg_net():
     model = EEGNet(
         no_spatial_filters=2,
-        no_channels=32,
+        no_channels=num_channels,
         no_temporal_filters=8,
-        temporal_length_1=128,       # half of fs (256/2) — captures 2Hz+ temporal features
-        temporal_length_2=32,        # scaled up proportionally for 256 Hz
-        window_length=7680,          # 30s * 256 Hz
-        num_class=9,
+        temporal_length_1=sampling_rate // 2,   # half of fs — captures 2Hz+ temporal features
+        temporal_length_2=sampling_rate // 8,   # scaled proportionally
+        window_length=data_length,
+        num_class=num_classes,
     )
-
     return model
 
-# ── Data ──
 
-def get_loader(data_path):
-    loader = DownstreamDataLoader(
-        data_path=data_path,
-        config="downstream/info_dataset/faced.yaml",
-        custom_dataset_class=Downstream_Dataset,
+def build_conformer(num_classes, num_channels, data_length, sampling_rate, **kwargs):
+    """Conformer: CNN + Transformer hybrid for EEG classification."""
+    from downstream.models.deep_learning_model.conformer import Conformer
+
+    model = Conformer(
+        num_channel=num_channels,
+        data_length=data_length,
+        emb_size=40,
+        depth=6,
+        n_classes=num_classes,
     )
-    return loader
+    return model
 
+
+def build_deepconvnet(num_classes, num_channels, data_length, sampling_rate, **kwargs):
+    """DeepConvNet: Deep convolutional network for EEG decoding."""
+    from downstream.models.deep_learning_model.deepconvnet import DeepConvNet
+
+    model = DeepConvNet(
+        number_channel=num_channels,
+        nb_classes=num_classes,
+        data_length=data_length,
+        sampling_rate=sampling_rate,
+    )
+    return model
+
+
+def build_ctnet(num_classes, num_channels, data_length, sampling_rate, **kwargs):
+    """CTNet: CNN-Transformer EEG classifier."""
+    from downstream.models.deep_learning_model.ctnet import EEGTransformer
+
+    model = EEGTransformer(
+        number_class=num_classes,
+        number_channel=num_channels,
+        data_length=data_length,
+        sampling_rate=sampling_rate,
+    )
+    return model
+
+
+MODEL_BUILDERS = {
+    "eegnet": build_eegnet,
+    "conformer": build_conformer,
+    "deepconvnet": build_deepconvnet,
+    "ctnet": build_ctnet,
+}
+
+
+# ────────────────────────────────────────────────────────────────
+# Evaluation protocols
+# ────────────────────────────────────────────────────────────────
 
 loss_fn = torch.nn.CrossEntropyLoss()
 
-# =============================================
-# Protocol 1: Population
-# =============================================
 
-def get_pop_perf(loader, model, config):
+def run_population(model, model_name, loader, config):
+    """Protocol 1: Population-level evaluation (within-subject 80/10/10)."""
     train_ds, val_ds, test_ds = loader.get_data_for_population()
 
     trainer = TrainerDownstream(
-        model_name="EEGNet",
+        model_name=model_name,
         model=model,
-        optimizer="adam",
+        optimizer="adamw",
         loss_fn=loss_fn,
         batch_size=64,
         config=config,
@@ -79,72 +183,81 @@ def get_pop_perf(loader, model, config):
         train_data=train_ds,
         val_data=val_ds,
         test_data=test_ds,
-        training_mode="full",
+        training_mode="classic_nn",
     )
-    trainer.run_population(name_project="eegnet_faced")
+    trainer.run_population(name_project=f"{model_name}_population")
 
 
-# =============================================
-# Protocol 2 & 3: Per-Subject Self + Transfer
-# =============================================
-def get_perf_per_subj(loader, model, config):
+def run_per_subject(model, model_name, loader, config):
+    """Protocol 2 & 3: Per-subject self + transfer evaluation."""
     for pid in loader.participant_ids:
         train_sub, val_sub, test_sub = loader.per_subject(pid)
         transfer_test = loader.get_subject_transfer(pid)
 
         trainer = TrainerDownstream(
-            model_name="EEGNet", model=model, optimizer="adam",
-            loss_fn=loss_fn, batch_size=64, config=config,
-            early_stopper=EarlyStopper, training_mode="full",
+            model_name=model_name,
+            model=model,
+            optimizer="adamw",
+            loss_fn=loss_fn,
+            batch_size=64,
+            config=config,
+            early_stopper=EarlyStopper,
+            training_mode="classic_nn",
         )
         trainer.run_per_subject(
-            name_project="eegnet_faced",
+            name_project=f"{model_name}",
             participant_number=pid,
             train_data_sub=train_sub,
             val_data_sub=val_sub,
-            test_data_sub=test_sub,       
-            test_data_pop=transfer_test,   
+            test_data_sub=test_sub,
+            test_data_pop=transfer_test,
         )
 
 
-# =============================================
-# Protocol 4: LOO Zero-Shot (LOSO)
-# =============================================
-def get_LOSO_zero_shot_perf(loader, config, model):
+def run_loso_zero_shot(model, model_name, loader, config):
+    """Protocol 4: Leave-one-subject-out zero-shot evaluation."""
     for pid in loader.participant_ids:
         train_pop, val_pop = loader.get_loso_train_dataset(pid)
         test_sub = loader.get_full_subject_dataset(pid)
 
         trainer = TrainerDownstream(
-            model_name="EEGNet", model=model, optimizer="adam",
-            loss_fn=loss_fn, batch_size=64, config=config,
-            early_stopper=EarlyStopper, training_mode="full",
+            model_name=model_name,
+            model=model,
+            optimizer="adamw",
+            loss_fn=loss_fn,
+            batch_size=64,
+            config=config,
+            early_stopper=EarlyStopper,
+            training_mode="classic_nn",
         )
         trainer.run_LOSO(
             participant_number=pid,
-            name_project="eegnet_faced",
+            name_project=f"{model_name}",
             train_data_pop=train_pop,
             val_data_pop=val_pop,
             test_data_sub=test_sub,
         )
 
 
-# =============================================
-# Protocol 5: LOO Fine-Tune
-# =============================================
-def get_LOO_fine_tune_perf(loader, model, config):
+def run_loso_fine_tune(model, model_name, loader, config):
+    """Protocol 5: Leave-one-subject-out + per-subject fine-tuning."""
     for pid in loader.participant_ids:
         train_pop, val_pop = loader.get_loso_train_dataset(pid)
         train_sub, val_sub, test_sub = loader.per_subject(pid)
 
         trainer = TrainerDownstream(
-            model_name="EEGNet", model=model, optimizer="adam",
-            loss_fn=loss_fn, batch_size=64, config=config,
-            early_stopper=EarlyStopper, training_mode="full",
+            model_name=model_name,
+            model=model,
+            optimizer="adamw",
+            loss_fn=loss_fn,
+            batch_size=64,
+            config=config,
+            early_stopper=EarlyStopper,
+            training_mode="classic_nn",
         )
         trainer.run_LOSO_fine_tune(
             participant_number=pid,
-            name_project="eegnet_faced",
+            name_project=f"{model_name}",
             train_data_pop=train_pop,
             val_data_pop=val_pop,
             train_data_sub=train_sub,
@@ -153,55 +266,120 @@ def get_LOO_fine_tune_perf(loader, model, config):
         )
 
 
-# =============================================
-# Protocol 6: LOO Drop
-# =============================================
-def get_perf_LOO_drop(loader, model, config):
-    for pid in loader.participant_ids:
-        train_pop, val_pop = loader.get_loso_train_dataset(pid)
-        train_sub, val_sub, test_sub = loader.per_subject(pid)
-
-        trainer = TrainerDownstream(
-            model_name="EEGNet", model=model, optimizer="adam",
-            loss_fn=loss_fn, batch_size=64, config=config,
-            early_stopper=EarlyStopper, training_mode="full",
-        )
-        trainer.run_LOSO_drop(
-            participant_number=pid,
-            name_project="eegnet_faced",
-            train_data_pop=train_pop,
-            val_data_pop=val_pop,
-            train_data_sub=train_sub,
-            val_data_sub=val_sub,
-            test_data_sub=test_sub,
-        )
-
-
-# =============================================
-# Cross-Subject (ST-EEGFormer FACED protocol)
-# =============================================
-def get_cross_subject_perf(loader, model, config):
-    """80% subjects train, 20% subjects test — single split, not full LOSO."""
+def run_cross_subject(model, model_name, loader, config):
+    """
+    Cross-subject evaluation:
+    70% subjects train, 10% val, 20% test — single split.
+    """
     train_ds, val_ds, test_ds = loader.get_cross_subject_split(
         test_ratio=0.2, val_ratio=0.1, seed=42,
     )
 
     trainer = TrainerDownstream(
-        model_name="EEGNet", model=model, optimizer="adam",
-        loss_fn=loss_fn, batch_size=64, config=config,
+        model_name=model_name,
+        model=model,
+        optimizer="adamw",
+        loss_fn=loss_fn,
+        batch_size=64,
+        config=config,
         early_stopper=EarlyStopper,
-        train_data=train_ds, val_data=val_ds, test_data=test_ds,
-        training_mode="full",
+        train_data=train_ds,
+        val_data=val_ds,
+        test_data=test_ds,
+        training_mode="classic_nn",
     )
-    trainer.run_population(name_project="eegnet_faced_cross_subject")
+    trainer.run_population(name_project=f"{model_name}_cross_subject")
+
+
+PROTOCOL_RUNNERS = {
+    "population": run_population,
+    "per_subject": run_per_subject,
+    "loso": run_loso_zero_shot,
+    "loso_ft": run_loso_fine_tune,
+    "cross_subject": run_cross_subject,
+}
+
+
+# ────────────────────────────────────────────────────────────────
+# Main
+# ────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Evaluate deep learning baselines on downstream EEG tasks."
+    )
+    parser.add_argument(
+        "--model", type=str, required=True,
+        choices=list(MODEL_BUILDERS.keys()),
+        help="Which deep learning model to run.",
+    )
+    parser.add_argument(
+        "--dataset", type=str, required=True,
+        choices=list(DATASET_CONFIGS.keys()),
+        help="Which downstream dataset to evaluate on.",
+    )
+    parser.add_argument(
+        "--protocol", type=str, default="population",
+        choices=list(PROTOCOL_RUNNERS.keys()),
+        help="Evaluation protocol to run.",
+    )
+    parser.add_argument(
+        "--data_path", type=str, default=None,
+        help="Override default data path for the dataset.",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+
+    args = parser.parse_args()
+
+    # ── Seed ──
+    seed_everything(args.seed)
+
+    # ── Dataset config ──
+    ds_cfg = DATASET_CONFIGS[args.dataset].copy()
+    if args.data_path is not None:
+        ds_cfg["data_path"] = args.data_path
+
+    config = {
+        "num_classes": ds_cfg["num_classes"],
+        "metric": ds_cfg["metric"],
+        "model_path": ds_cfg["model_path"],
+        "result_output": ds_cfg["result_output"],
+    }
+
+    # ── Data loader (no per-model normalization for DL baselines) ──
+    loader = DownstreamDataLoader(
+        data_path=ds_cfg["data_path"],
+        config=ds_cfg["config_yaml"],
+        custom_dataset_class=Downstream_Dataset,
+    )
+
+    # ── Build model ──
+    builder = MODEL_BUILDERS[args.model]
+    model = builder(
+        num_classes=ds_cfg["num_classes"],
+        num_channels=ds_cfg["num_channels"],
+        data_length=ds_cfg["data_length"],
+        sampling_rate=ds_cfg["sampling_rate"],
+    )
+
+    print(f"\n{'='*60}")
+    print(f"  Model:    {args.model}")
+    print(f"  Dataset:  {args.dataset}")
+    print(f"  Protocol: {args.protocol}")
+    print(f"  Mode:     classic_nn (trained from scratch)")
+    print(f"{'='*60}\n")
+
+    # Count params
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Total params:     {total_params:,}")
+    print(f"  Trainable params: {trainable_params:,}")
+    print(f"  Frozen params:    {total_params - trainable_params:,}\n")
+
+    # ── Run evaluation ──
+    runner = PROTOCOL_RUNNERS[args.protocol]
+    runner(model, args.model, loader, config)
 
 
 if __name__ == "__main__":
-    seed_everything(42)
-    L.seed_everything(42, workers=True)
-
-    config = get_config_FACED()
-    model = get_eeg_net()
-    data_path = "downstream/data/faced"
-    loader = get_loader(data_path)
-    get_cross_subject_perf(loader=loader, model=model, config=config)
+    main()
