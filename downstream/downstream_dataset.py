@@ -15,9 +15,17 @@ MODEL_PREPROCESS_CONFIG = {
     "steegformer":  {"norm": {"method": "z_standardize"},            "sfreq": 128},
     "labram":       {"norm": {"method": "rescale", "scale": 1e-4},  "sfreq": 200},
     "biot":         {"norm": {"method": "percentile_95"},            "sfreq": 200},
-    "cbramod":      {"norm": {"method": "none"},                     "sfreq": 200},  # No normalization — matches original repo (only resamples to 200Hz)
+    "cbramod":      {"norm": {"method": "rescale", "scale": 1e-2},   "sfreq": 200},  # ×1e-2 rescaling as in original CBraMod repo
     "eegpt":        {"norm": {"method": "rescale", "scale": 1e-3},  "sfreq": 256},  # µV → mV (V→µV conversion handled by data_unit flag)
     "bendr":        {"norm": {"method": "minmax_neg1_1"},            "sfreq": 256},
+    # Your own pretrained models (pretrained at 128 Hz)
+    "baseline":          {"norm": {"method": "z_standardize"},  "sfreq": 128},
+    "encoder_gnn":       {"norm": {"method": "z_standardize"},  "sfreq": 128},
+    "riemann_loss":      {"norm": {"method": "z_standardize"},  "sfreq": 128},
+    "riemann_para":      {"norm": {"method": "z_standardize"},  "sfreq": 128},
+    "riemann_adaptive":  {"norm": {"method": "z_standardize"},  "sfreq": 128},
+    "riemann_ema":       {"norm": {"method": "z_standardize"},  "sfreq": 128},
+    "riemann_seq":       {"norm": {"method": "z_standardize"},  "sfreq": 128},
     # Classic NN baselines run at the baseline 256 Hz with z-standardization
     "default":      {"norm": {"method": "z_standardize"},            "sfreq": 256},
 }

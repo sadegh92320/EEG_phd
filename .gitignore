@@ -50,6 +50,7 @@ data/
 **/data/
 data_*/
 **/data_*/
+**/results
 
 # =====================
 # Large / common ML artifacts

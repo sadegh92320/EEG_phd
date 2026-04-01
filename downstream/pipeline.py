@@ -192,10 +192,11 @@ class Pipeline:
                 max_epochs=40,
                 precision="16-mixed",
                 gradient_clip_val=1.0,
+               
                 
             )
 
-            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
+            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader, ckpt_path="/Users/sadeghemami/checkpoint_benchmark/epochepoch=26-riemann-val_mse=0.1518.ckpt")
 
             # Use the best checkpoint from this run
             self.checkpoint_path = ckpt_callback.best_model_path

@@ -525,6 +525,149 @@ MODEL_BUILDERS = {
 
 
 # ────────────────────────────────────────────────────────────────
+# Result aggregation helpers
+# ────────────────────────────────────────────────────────────────
+
+SCALAR_METRICS = ["accuracy", "recall", "precision", "f1_score", "roc_auc",
+                  "kappa", "acc1", "acc2", "bacc"]
+
+
+def summarize_results(all_metrics, participant_ids, model_name, dataset_name,
+                      protocol_name, result_dir="downstream/results"):
+    """
+    Aggregate per-participant metrics, print a summary table, save a box plot,
+    and log the summary to wandb.
+
+    Args:
+        all_metrics: list of dicts, one per participant (from run_LOSO / run_per_subject).
+        participant_ids: list of participant identifiers (same order as all_metrics).
+        model_name: str, e.g. "steegformer".
+        dataset_name: str, e.g. "faced".
+        protocol_name: str, e.g. "loso" or "per_subject".
+        result_dir: str, directory to save outputs.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(result_dir, exist_ok=True)
+
+    # ── Collect scalar metrics into arrays ──
+    metric_arrays = {}
+    for key in SCALAR_METRICS:
+        vals = []
+        for m in all_metrics:
+            if key in m:
+                v = m[key]
+                vals.append(v.item() if hasattr(v, "item") else float(v))
+        if vals:
+            metric_arrays[key] = np.array(vals)
+
+    n_participants = len(all_metrics)
+
+    # ── Print per-participant table ──
+    # Pick display metrics (subset that's most useful)
+    display_keys = [k for k in ["bacc", "acc1", "f1_score", "precision", "recall", "kappa"]
+                    if k in metric_arrays]
+
+    header = f"\n{'='*70}\n  {protocol_name.upper()} Results — {model_name} on {dataset_name} ({n_participants} participants)\n{'='*70}"
+    print(header)
+
+    col_w = 10
+    hdr_line = f"  {'Participant':<14}" + "".join(f"{k:>{col_w}}" for k in display_keys)
+    print(hdr_line)
+    print(f"  {'─' * (14 + col_w * len(display_keys))}")
+
+    for i, pid in enumerate(participant_ids):
+        row = f"  {str(pid):<14}"
+        for k in display_keys:
+            v = metric_arrays[k][i] if i < len(metric_arrays[k]) else float("nan")
+            if k in ("bacc", "acc1"):
+                row += f"{v * 100:>{col_w}.1f}%"
+            else:
+                row += f"{v:>{col_w}.4f}"
+        print(row)
+
+    print(f"  {'─' * (14 + col_w * len(display_keys))}")
+    mean_row = f"  {'Mean±Std':<14}"
+    for k in display_keys:
+        arr = metric_arrays[k]
+        if k in ("bacc", "acc1"):
+            mean_row += f"{arr.mean() * 100:.1f}±{arr.std() * 100:.1f}%".rjust(col_w)
+        else:
+            mean_row += f"{arr.mean():.3f}±{arr.std():.3f}".rjust(col_w)
+    print(mean_row)
+    print(f"{'='*70}\n")
+
+    # ── Box plot of balanced accuracy ──
+    primary_metric = "bacc" if "bacc" in metric_arrays else ("acc1" if "acc1" in metric_arrays else None)
+    if primary_metric is not None:
+        fig, ax = plt.subplots(figsize=(5, 4))
+        vals = metric_arrays[primary_metric] * 100  # percent
+
+        bp = ax.boxplot(vals, vert=True, patch_artist=True, widths=0.5,
+                        boxprops=dict(facecolor="#4C78A8", alpha=0.7),
+                        medianprops=dict(color="white", linewidth=2),
+                        whiskerprops=dict(color="#555"),
+                        capprops=dict(color="#555"),
+                        flierprops=dict(marker="o", markersize=5, markerfacecolor="#E45756", alpha=0.7))
+
+        # Overlay individual points (jittered)
+        jitter = np.random.default_rng(42).uniform(-0.12, 0.12, size=len(vals))
+        ax.scatter(np.ones(len(vals)) + jitter, vals, color="#4C78A8", alpha=0.5,
+                   s=25, zorder=3, edgecolors="white", linewidth=0.5)
+
+        # Mean marker
+        ax.scatter([1], [vals.mean()], marker="D", color="white", edgecolors="#333",
+                   s=40, zorder=4, linewidth=0.8)
+
+        metric_label = "Balanced Accuracy" if primary_metric == "bacc" else "Top-1 Accuracy"
+        ax.set_ylabel(f"{metric_label} (%)")
+        ax.set_title(f"{model_name} — {dataset_name} — {protocol_name.upper()}\n"
+                     f"Mean: {vals.mean():.1f}% ± {vals.std():.1f}%  (n={len(vals)})",
+                     fontsize=11)
+        ax.set_xticks([1])
+        ax.set_xticklabels([model_name])
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+
+        plot_path = os.path.join(result_dir,
+                                 f"{model_name}_{dataset_name}_{protocol_name}_boxplot.png")
+        fig.savefig(plot_path, dpi=150)
+        plt.close(fig)
+        print(f"  Box plot saved to: {plot_path}")
+
+    # ── Log summary to wandb ──
+    try:
+        import wandb
+        summary = {}
+        for k, arr in metric_arrays.items():
+            summary[f"summary/{k}_mean"] = float(arr.mean())
+            summary[f"summary/{k}_std"] = float(arr.std())
+            summary[f"summary/{k}_median"] = float(np.median(arr))
+        summary["summary/n_participants"] = n_participants
+        summary["summary/protocol"] = protocol_name
+        summary["summary/model"] = model_name
+        summary["summary/dataset"] = dataset_name
+
+        wandb.init(
+            project=f"{protocol_name}_summary",
+            name=f"{model_name}_{dataset_name}_{protocol_name}_summary",
+            reinit=True,
+            config=summary,
+        )
+        wandb.log(summary)
+        # Log the box plot image if it exists
+        if primary_metric is not None and os.path.exists(plot_path):
+            wandb.log({"boxplot": wandb.Image(plot_path)})
+        wandb.finish()
+    except Exception as e:
+        print(f"  [Warning] Could not log summary to wandb: {e}")
+
+    return metric_arrays
+
+
+# ────────────────────────────────────────────────────────────────
 # Evaluation protocols
 # ────────────────────────────────────────────────────────────────
 
@@ -553,7 +696,9 @@ def run_population(model, model_name, loader, config):
 
 def run_per_subject(model, model_name, loader, config):
     """Protocol 2 & 3: Per-subject self + transfer evaluation."""
+    all_metrics = []
     for pid in loader.participant_ids:
+        
         train_sub, val_sub, test_sub = loader.per_subject(pid)
         transfer_test = loader.get_subject_transfer(pid)
 
@@ -567,7 +712,7 @@ def run_per_subject(model, model_name, loader, config):
             early_stopper=EarlyStopper,
             training_mode=config.get("training_mode", "linear_probe"),
         )
-        trainer.run_per_subject(
+        metrics = trainer.run_per_subject(
             name_project=f"{model_name}",
             participant_number=pid,
             train_data_sub=train_sub,
@@ -575,10 +720,18 @@ def run_per_subject(model, model_name, loader, config):
             test_data_sub=test_sub,
             test_data_pop=transfer_test,
         )
+        all_metrics.append(metrics)
+
+    summarize_results(
+        all_metrics, loader.participant_ids, model_name,
+        config.get("dataset_name", "unknown"), "per_subject",
+        result_dir=config.get("result_output", "downstream/results"),
+    )
 
 
 def run_loso_zero_shot(model, model_name, loader, config):
     """Protocol 4: Leave-one-subject-out zero-shot evaluation."""
+    all_metrics = []
     for pid in loader.participant_ids:
         train_pop, val_pop = loader.get_loso_train_dataset(pid)
         test_sub = loader.get_full_subject_dataset(pid)
@@ -593,17 +746,25 @@ def run_loso_zero_shot(model, model_name, loader, config):
             early_stopper=EarlyStopper,
             training_mode=config.get("training_mode", "linear_probe"),
         )
-        trainer.run_LOSO(
+        metrics = trainer.run_LOSO(
             participant_number=pid,
             name_project=f"{model_name}",
             train_data_pop=train_pop,
             val_data_pop=val_pop,
             test_data_sub=test_sub,
         )
+        all_metrics.append(metrics)
+
+    summarize_results(
+        all_metrics, loader.participant_ids, model_name,
+        config.get("dataset_name", "unknown"), "loso",
+        result_dir=config.get("result_output", "downstream/results"),
+    )
 
 
 def run_loso_fine_tune(model, model_name, loader, config):
     """Protocol 5: Leave-one-subject-out + per-subject fine-tuning."""
+    all_metrics = []
     for pid in loader.participant_ids:
         train_pop, val_pop = loader.get_loso_train_dataset(pid)
         train_sub, val_sub, test_sub = loader.per_subject(pid)
@@ -618,7 +779,7 @@ def run_loso_fine_tune(model, model_name, loader, config):
             early_stopper=EarlyStopper,
             training_mode=config.get("training_mode", "linear_probe"),
         )
-        trainer.run_LOSO_fine_tune(
+        metrics = trainer.run_LOSO_fine_tune(
             participant_number=pid,
             name_project=f"{model_name}",
             train_data_pop=train_pop,
@@ -627,6 +788,13 @@ def run_loso_fine_tune(model, model_name, loader, config):
             val_data_sub=val_sub,
             test_data_sub=test_sub,
         )
+        all_metrics.append(metrics)
+
+    summarize_results(
+        all_metrics, loader.participant_ids, model_name,
+        config.get("dataset_name", "unknown"), "loso_ft",
+        result_dir=config.get("result_output", "downstream/results"),
+    )
 
 
 def run_cross_subject(model, model_name, loader, config):
@@ -718,6 +886,7 @@ def main():
         "model_path": ds_cfg["model_path"],
         "result_output": ds_cfg["result_output"],
         "training_mode": args.training_mode,
+        "dataset_name": args.dataset,
     }
 
     # ── Data loader (with per-model normalization) ──

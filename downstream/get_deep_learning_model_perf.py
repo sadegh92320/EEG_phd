@@ -24,6 +24,7 @@ import torch.nn as nn
 from downstream.downstream_dataset import Downstream_Dataset
 from downstream.split_data_downstream import DownstreamDataLoader
 from downstream.training_model import TrainerDownstream, EarlyStopper
+from downstream.get_benchmark_foundation_model import summarize_results
 
 
 # ────────────────────────────────────────────────────────────────
@@ -201,6 +202,7 @@ def run_population(model, model_name, loader, config):
 
 def run_per_subject(model, model_name, loader, config):
     """Protocol 2 & 3: Per-subject self + transfer evaluation."""
+    all_metrics = []
     for pid in loader.participant_ids:
         train_sub, val_sub, test_sub = loader.per_subject(pid)
         transfer_test = loader.get_subject_transfer(pid)
@@ -215,7 +217,7 @@ def run_per_subject(model, model_name, loader, config):
             early_stopper=EarlyStopper,
             training_mode="classic_nn",
         )
-        trainer.run_per_subject(
+        metrics = trainer.run_per_subject(
             name_project=f"{model_name}",
             participant_number=pid,
             train_data_sub=train_sub,
@@ -223,10 +225,18 @@ def run_per_subject(model, model_name, loader, config):
             test_data_sub=test_sub,
             test_data_pop=transfer_test,
         )
+        all_metrics.append(metrics)
+
+    summarize_results(
+        all_metrics, loader.participant_ids, model_name,
+        config.get("dataset_name", "unknown"), "per_subject",
+        result_dir=config.get("result_output", "downstream/results"),
+    )
 
 
 def run_loso_zero_shot(model, model_name, loader, config):
     """Protocol 4: Leave-one-subject-out zero-shot evaluation."""
+    all_metrics = []
     for pid in loader.participant_ids:
         train_pop, val_pop = loader.get_loso_train_dataset(pid)
         test_sub = loader.get_full_subject_dataset(pid)
@@ -241,17 +251,25 @@ def run_loso_zero_shot(model, model_name, loader, config):
             early_stopper=EarlyStopper,
             training_mode="classic_nn",
         )
-        trainer.run_LOSO(
+        metrics = trainer.run_LOSO(
             participant_number=pid,
             name_project=f"{model_name}",
             train_data_pop=train_pop,
             val_data_pop=val_pop,
             test_data_sub=test_sub,
         )
+        all_metrics.append(metrics)
+
+    summarize_results(
+        all_metrics, loader.participant_ids, model_name,
+        config.get("dataset_name", "unknown"), "loso",
+        result_dir=config.get("result_output", "downstream/results"),
+    )
 
 
 def run_loso_fine_tune(model, model_name, loader, config):
     """Protocol 5: Leave-one-subject-out + per-subject fine-tuning."""
+    all_metrics = []
     for pid in loader.participant_ids:
         train_pop, val_pop = loader.get_loso_train_dataset(pid)
         train_sub, val_sub, test_sub = loader.per_subject(pid)
@@ -266,7 +284,7 @@ def run_loso_fine_tune(model, model_name, loader, config):
             early_stopper=EarlyStopper,
             training_mode="classic_nn",
         )
-        trainer.run_LOSO_fine_tune(
+        metrics = trainer.run_LOSO_fine_tune(
             participant_number=pid,
             name_project=f"{model_name}",
             train_data_pop=train_pop,
@@ -275,6 +293,13 @@ def run_loso_fine_tune(model, model_name, loader, config):
             val_data_sub=val_sub,
             test_data_sub=test_sub,
         )
+        all_metrics.append(metrics)
+
+    summarize_results(
+        all_metrics, loader.participant_ids, model_name,
+        config.get("dataset_name", "unknown"), "loso_ft",
+        result_dir=config.get("result_output", "downstream/results"),
+    )
 
 
 def run_cross_subject(model, model_name, loader, config):
@@ -355,6 +380,7 @@ def main():
         "metric": ds_cfg["metric"],
         "model_path": ds_cfg["model_path"],
         "result_output": ds_cfg["result_output"],
+        "dataset_name": args.dataset,
     }
 
     # ── Data loader (no per-model normalization for DL baselines) ──

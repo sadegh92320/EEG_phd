@@ -408,55 +408,73 @@ class TrainerDownstream:
             cfg = MODEL_LAYER_CONFIG[self.model_name]
             num_layers = cfg["num_layers"]
 
-            # Group params by layer_id
-            layer_params = {}  # layer_id -> list of params
+            # Group params by (layer_id, needs_decay)
+            # No weight decay on biases, LayerNorm, embeddings (BEiT/MAE convention)
+            layer_decay_params = {}   # layer_id -> list of params (with weight decay)
+            layer_nodecay_params = {} # layer_id -> list of params (no weight decay)
             for name, p in model.named_parameters():
                 if not p.requires_grad:
                     continue
                 lid = get_layer_id(name, self.model_name, num_layers)
-                if lid not in layer_params:
-                    layer_params[lid] = []
-                layer_params[lid].append(p)
+                no_decay = (p.dim() <= 1 or "bias" in name or "norm" in name
+                            or "cls_token" in name or "pos_embed" in name)
+                if no_decay:
+                    layer_nodecay_params.setdefault(lid, []).append(p)
+                else:
+                    layer_decay_params.setdefault(lid, []).append(p)
 
             # Build param groups with decaying lr
             param_groups = []
-            for lid in sorted(layer_params.keys()):
+            all_lids = sorted(set(list(layer_decay_params.keys()) + list(layer_nodecay_params.keys())))
+            for lid in all_lids:
                 scale = layer_decay ** (num_layers - lid)
                 layer_lr = base_lr * scale
-                # No weight decay on biases, LayerNorm, and embeddings
-                param_groups.append({
-                    "params": layer_params[lid],
-                    "lr": layer_lr,
-                    "weight_decay": weight_decay,
-                })
+                if lid in layer_decay_params:
+                    param_groups.append({
+                        "params": layer_decay_params[lid],
+                        "lr": layer_lr,
+                        "weight_decay": weight_decay,
+                    })
+                if lid in layer_nodecay_params:
+                    param_groups.append({
+                        "params": layer_nodecay_params[lid],
+                        "lr": layer_lr,
+                        "weight_decay": 0.0,
+                    })
 
             # Print summary
-            total_trainable = sum(len(v) for v in layer_params.values())
+            n_decay = sum(len(v) for v in layer_decay_params.values())
+            n_nodecay = sum(len(v) for v in layer_nodecay_params.values())
             min_lr = base_lr * (layer_decay ** num_layers)
             print(f"  [Optimizer] Layer-wise lr decay={layer_decay}: "
-                  f"{len(layer_params)} groups, lr range [{min_lr:.1e}, {base_lr:.1e}], "
-                  f"{total_trainable} trainable params")
+                  f"{len(all_lids)} layers, lr range [{min_lr:.1e}, {base_lr:.1e}], "
+                  f"{n_decay} decay + {n_nodecay} no-decay params")
 
         # ── Simple head_lr_multiplier path (LP, LoRA, classic_nn) ──
         else:
             head_lr_mult = hp.get("head_lr_multiplier", 1.0)
             head_lr = base_lr * head_lr_mult
 
-            backbone_params = []
-            head_params = []
+            backbone_decay, backbone_nodecay = [], []
+            head_decay, head_nodecay = [], []
             for name, p in model.named_parameters():
                 if not p.requires_grad:
                     continue
+                no_decay = (p.dim() <= 1 or "bias" in name or "norm" in name)
                 if self._is_head_param(name):
-                    head_params.append(p)
+                    (head_nodecay if no_decay else head_decay).append(p)
                 else:
-                    backbone_params.append(p)
+                    (backbone_nodecay if no_decay else backbone_decay).append(p)
 
             param_groups = []
-            if backbone_params:
-                param_groups.append({"params": backbone_params, "lr": base_lr, "weight_decay": weight_decay})
-            if head_params:
-                param_groups.append({"params": head_params, "lr": head_lr, "weight_decay": weight_decay})
+            if backbone_decay:
+                param_groups.append({"params": backbone_decay, "lr": base_lr, "weight_decay": weight_decay})
+            if backbone_nodecay:
+                param_groups.append({"params": backbone_nodecay, "lr": base_lr, "weight_decay": 0.0})
+            if head_decay:
+                param_groups.append({"params": head_decay, "lr": head_lr, "weight_decay": weight_decay})
+            if head_nodecay:
+                param_groups.append({"params": head_nodecay, "lr": head_lr, "weight_decay": 0.0})
 
             if not param_groups:
                 trainable = [p for p in model.parameters() if p.requires_grad]
@@ -464,7 +482,8 @@ class TrainerDownstream:
 
             if head_lr_mult != 1.0:
                 print(f"  [Optimizer] Discriminative lr: backbone={base_lr:.1e}, head={head_lr:.1e} "
-                      f"(×{head_lr_mult}), {len(backbone_params)} backbone params, {len(head_params)} head params")
+                      f"(×{head_lr_mult}), {len(backbone_decay)+len(backbone_nodecay)} backbone, "
+                      f"{len(head_decay)+len(head_nodecay)} head params")
 
         return optimizer_cls(param_groups)
 
@@ -861,7 +880,7 @@ class TrainerDownstream:
 
         # Load the initial weights safely (in-place)
         model.load_state_dict(self.initial_state)
-        best_model = model.state_dict()
+        best_model = deepcopy(model.state_dict())
 
         # Build the optimizer and define loss function
         self.optimizer_name = opt_name
@@ -954,7 +973,7 @@ class TrainerDownstream:
 
         # --- FINAL TEST EVALUATION RUN ---
         wandb.init(
-            project="per_subject_eval_4",
+            project="per_subject_eval_5",
             name=f"per_subject_{participant_number}_{name_project}",
             reinit=True,
             config={"learning_rate": hp["learning_rate"], "batch_size": hp["batch_size"],
@@ -966,12 +985,8 @@ class TrainerDownstream:
 
         wandb.log(self._metrics_to_wandb(metrics_sub, prefix="self"))
 
-        #metrics_pop = self.evaluate_model(learning_rate=hp["learning_rate"], opt_name=hp["optimizer"], batch_size=hp["batch_size"], num_epochs=hp["num_epochs_eval"], train_dataset=train_data_sub, val_dataset=val_data_sub, test_dataset=test_data_pop)
-
-        #wandb.log(self._metrics_to_wandb(metrics_pop, prefix="transfer"))
-
-       
         wandb.finish()
+        return metrics_sub
         
         
     def run_LOSO(self, participant_number, name_project, train_data_pop, val_data_pop, test_data_sub, save = False):
@@ -997,6 +1012,7 @@ class TrainerDownstream:
 
         wandb.log(self._metrics_to_wandb(metrics_sub, prefix="test"))
         wandb.finish()
+        return metrics_sub
 
 
     @time
@@ -1104,6 +1120,7 @@ class TrainerDownstream:
         # Restore original state
         self.initial_state = original_state
         self.training_mode = original_mode
+        return metrics
 
 
     def run_LOSO_drop(self, participant_number, name_project,
@@ -1156,9 +1173,10 @@ class TrainerDownstream:
         # Restore original state
         self.initial_state = original_state
         self.training_mode = original_mode
+        return metrics
 
 
-    
+
 
     def append_result(self, model, model_name, opt_name, study, accuracy, precision, recall, F1):
         """Write the results in a txt file"""
