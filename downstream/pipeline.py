@@ -196,7 +196,7 @@ class Pipeline:
                 
             )
 
-            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader, ckpt_path="/content/last-v21.ckpt ")
+            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader, ckpt_path="/content/last-v21.ckpt")
 
             # Use the best checkpoint from this run
             self.checkpoint_path = ckpt_callback.best_model_path
