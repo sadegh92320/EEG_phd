@@ -32,6 +32,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from downstream.downstream_model import Downstream
 #from downstream.models.conv_model import SimpleEEGfrom
 from pytorch_lightning.loggers import WandbLogger
+import wandb
 from MAE_pretraining.load_data import get_dataloader
 from downstream.split_data_downstream import DownstreamDataLoader
 from MAE_pretraining.old_idea.bert_adaptive_ema_only import AdaptiveRiemannEMABert
@@ -194,9 +195,12 @@ class Pipeline:
                         layer.attn.riemannian_bias.adaptive_log.log_mode = 'approx'
 
             # ── Fréchet mean (only for Riemannian + pade) ──
+            frechet_callback = None
             if use_frechet and log_mode == 'pade':
-                from MAE_pretraining.frechet_mean import compute_frechet_mean_from_model
-                print("[Fréchet] Computing offline Fréchet mean from embedding-space covariances...")
+                from MAE_pretraining.frechet_mean import (
+                    compute_frechet_mean_from_model, FrechetRefreshCallback
+                )
+                print("[Fréchet] Computing initial R from embedding-space covariances...")
                 frechet_result = compute_frechet_mean_from_model(
                     model, train_loader, enc_dim=512,
                     max_batches=200, verbose=True
@@ -214,6 +218,14 @@ class Pipeline:
                         'R_inv_sqrt', frechet_R_inv_sqrt.clone()
                     )
                 print(f"[Fréchet] Injected R_inv_sqrt into {len(model.encoder)} layers")
+
+                # Periodic refresh: recompute R every 10 epochs using current weights
+                frechet_callback = FrechetRefreshCallback(
+                    train_dataloader=train_loader,
+                    refresh_every=10,
+                    max_batches=100,
+                    enc_dim=512,
+                )
 
             # ── Run name for wandb (easy to compare in dashboard) ──
             if log_mode == 'baseline':
@@ -234,6 +246,7 @@ class Pipeline:
                     filename="epoch{epoch}-" + run_name + "-{val_mse:.4f}",
                 )
 
+            wandb.login(key="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")
             wandb_logger = WandbLogger(
                 project="eeg_foundation_model",
                 name=run_name,
@@ -251,8 +264,12 @@ class Pipeline:
                 "use_frechet": use_frechet and log_mode == 'pade',
             })
 
+            callbacks = [TQDMProgressBar(refresh_rate=20), ckpt_callback]
+            if frechet_callback is not None:
+                callbacks.append(frechet_callback)
+
             trainer = Trainer(
-                callbacks=[TQDMProgressBar(refresh_rate=20), ckpt_callback],
+                callbacks=callbacks,
                 log_every_n_steps=5,
                 logger=wandb_logger,
                 max_epochs=40,

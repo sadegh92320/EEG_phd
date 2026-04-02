@@ -25,6 +25,7 @@ The output file contains:
 import torch
 import numpy as np
 from scipy.linalg import sqrtm, inv
+import lightning.pytorch as pl
 
 
 def _matrix_sqrt_inv_np(M):
@@ -305,6 +306,85 @@ def compute_frechet_mean_from_model(model, dataloader, enc_dim=512,
                   f"Consider increasing eps or checking data normalization.")
 
     return result
+
+
+class FrechetRefreshCallback(pl.Callback):
+    """
+    Lightning callback that recomputes the Fréchet mean R every `refresh_every`
+    epochs using the model's CURRENT learned embeddings.
+
+    Why: R is initially computed from random-init embeddings. As training
+    progresses, the patch projection changes and the embedding-space covariance
+    distribution shifts. Periodically refreshing R keeps the pre-whitening
+    accurate throughout training.
+
+    How: At the start of every `refresh_every`-th epoch, we:
+      1. Put the model in eval mode (no dropout / stochastic depth)
+      2. Run `compute_frechet_mean_from_model` on the train dataloader
+      3. Inject the new R_inv_sqrt into every encoder layer's adaptive_log
+      4. Resume training
+
+    Cost: ~30-60s per refresh (one forward pass through max_batches, no grads).
+    With refresh_every=10 and max_epochs=200, that's 20 refreshes = ~15 minutes
+    total, negligible compared to training.
+
+    Args:
+        train_dataloader: the training dataloader (same one used for training)
+        refresh_every:    recompute R every N epochs (default 10)
+        max_batches:      batches to collect per refresh (default 100, less than
+                          init since we just need to track drift, not full accuracy)
+        enc_dim:          embedding dimension (default 512)
+        verbose:          print refresh logs
+    """
+
+    def __init__(self, train_dataloader, refresh_every=10, max_batches=100,
+                 enc_dim=512, verbose=True):
+        super().__init__()
+        self.train_dataloader = train_dataloader
+        self.refresh_every = refresh_every
+        self.max_batches = max_batches
+        self.enc_dim = enc_dim
+        self.verbose = verbose
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        epoch = trainer.current_epoch
+        # Skip epoch 0 (R was just computed at init)
+        if epoch == 0 or epoch % self.refresh_every != 0:
+            return
+
+        # Check that model actually uses Fréchet
+        first_log_map = pl_module.encoder[0].attn.riemannian_bias.adaptive_log
+        if not first_log_map.use_frechet:
+            return
+
+        if self.verbose:
+            print(f"\n[Fréchet Refresh] Epoch {epoch}: recomputing R from current embeddings...")
+
+        # Temporarily move model to CPU for the computation
+        device = next(pl_module.parameters()).device
+        pl_module.cpu()
+        pl_module.eval()
+
+        frechet_result = compute_frechet_mean_from_model(
+            pl_module, self.train_dataloader, enc_dim=self.enc_dim,
+            max_batches=self.max_batches, verbose=self.verbose
+        )
+        new_R_inv_sqrt = frechet_result['R_inv_sqrt']
+
+        # Inject into every layer
+        for layer in pl_module.encoder:
+            log_map = layer.attn.riemannian_bias.adaptive_log
+            log_map.R_inv_sqrt.copy_(new_R_inv_sqrt)
+
+        # Move back to training device and mode
+        pl_module.to(device)
+        pl_module.train()
+
+        if self.verbose:
+            R_np = frechet_result['R'].numpy()
+            eigvals = np.linalg.eigvalsh(R_np)
+            print(f"[Fréchet Refresh] Done. Condition number: "
+                  f"{eigvals.max() / eigvals.min():.2f}\n")
 
 
 if __name__ == "__main__":
