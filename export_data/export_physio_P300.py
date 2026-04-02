@@ -17,7 +17,6 @@ class ImportPhysioP300(ImportDataDownstream):
     Source: erp-based-brain-computer-interface-recordings-1.0.0
     """
 
-    SUBJECTS = [2, 3, 4, 5, 6, 7, 9, 11]
     NON_EEG = ["EARL", "EARR", "VEOGL", "VEOGR", "HEOGL", "HEOGR"]
 
     def get_config(self):
@@ -57,13 +56,15 @@ class ImportPhysioP300(ImportDataDownstream):
 
         rng = np.random.default_rng(random_seed)
 
-        # 1. Collect EDF files grouped by subject
+        # 1. Auto-discover subject folders (sXX) and collect EDF files
         subject_to_files = {}
-        for sub in self.SUBJECTS:
-            sub_dir = input_dir / f"s{sub:02d}"
+        for sub_dir in sorted(input_dir.iterdir()):
             if not sub_dir.is_dir():
-                print(f"Warning: subject folder {sub_dir} not found, skipping.")
                 continue
+            m = re.match(r"s(\d+)", sub_dir.name)
+            if m is None:
+                continue
+            sub = int(m.group(1))
             for file in sorted(sub_dir.iterdir()):
                 if not self.condition(file):
                     continue

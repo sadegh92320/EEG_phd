@@ -992,11 +992,12 @@ class TrainerDownstream:
     def run_LOSO(self, participant_number, name_project, train_data_pop, val_data_pop, test_data_sub, save = False):
         hp = self._get_hp()
 
-        def objective(trial):
-            return self.tune_params(trial, eval_scheme="LOSO",name_project=name_project,train_dataset=train_data_pop, val_dataset=val_data_pop)
-        sampler = TPESampler(seed=42)
-        study = optuna.create_study(direction="maximize", sampler=sampler)
-        study.optimize(objective, n_trials=1)
+        # Optuna HP search disabled — using fixed HP (same as run_per_subject)
+        #def objective(trial):
+        #    return self.tune_params(trial, eval_scheme="LOSO",name_project=name_project,train_dataset=train_data_pop, val_dataset=val_data_pop)
+        #sampler = TPESampler(seed=42)
+        #study = optuna.create_study(direction="maximize", sampler=sampler)
+        #study.optimize(objective, n_trials=1)
 
         # --- FINAL TEST EVALUATION RUN ---
         wandb.init(
@@ -1080,13 +1081,13 @@ class TrainerDownstream:
         hp = FIXED_HP[self.training_mode]
 
         # ── Phase 1: Population training ──
-        def objective_pop(trial):
-            return self.tune_params(trial, eval_scheme="LOSO_FT_pop", name_project=name_project,
-                                    train_dataset=train_data_pop, val_dataset=val_data_pop)
-
-        sampler = TPESampler(seed=42)
-        study_pop = optuna.create_study(direction="maximize", sampler=sampler)
-        study_pop.optimize(objective_pop, n_trials=1)
+        # Optuna HP search disabled — using fixed HP
+        #def objective_pop(trial):
+        #    return self.tune_params(trial, eval_scheme="LOSO_FT_pop", name_project=name_project,
+        #                            train_dataset=train_data_pop, val_dataset=val_data_pop)
+        #sampler = TPESampler(seed=42)
+        #study_pop = optuna.create_study(direction="maximize", sampler=sampler)
+        #study_pop.optimize(objective_pop, n_trials=1)
 
         # Train population model → get best weights
         pop_state = self._train_model(hp["learning_rate"], hp["optimizer"], hp["batch_size"], hp["num_epochs_eval"], train_data_pop, val_data_pop)
@@ -1134,13 +1135,13 @@ class TrainerDownstream:
         hp = FIXED_HP[self.training_mode]
 
         # ── Phase 1: Population training (identical to Fine-Tune Phase 1) ──
-        def objective_pop(trial):
-            return self.tune_params(trial, eval_scheme="LOSO_drop_pop", name_project=name_project,
-                                    train_dataset=train_data_pop, val_dataset=val_data_pop)
-
-        sampler = TPESampler(seed=42)
-        study_pop = optuna.create_study(direction="maximize", sampler=sampler)
-        study_pop.optimize(objective_pop, n_trials=1)
+        # Optuna HP search disabled — using fixed HP
+        #def objective_pop(trial):
+        #    return self.tune_params(trial, eval_scheme="LOSO_drop_pop", name_project=name_project,
+        #                            train_dataset=train_data_pop, val_dataset=val_data_pop)
+        #sampler = TPESampler(seed=42)
+        #study_pop = optuna.create_study(direction="maximize", sampler=sampler)
+        #study_pop.optimize(objective_pop, n_trials=1)
 
         # Train population model → get best weights
         pop_state = self._train_model(hp["learning_rate"], hp["optimizer"], hp["batch_size"], hp["num_epochs_eval"], train_data_pop, val_data_pop)

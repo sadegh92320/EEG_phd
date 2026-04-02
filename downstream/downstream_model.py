@@ -372,18 +372,23 @@ class DownstreamRiemannLoss(Downstream):
 class DownstreamRiemannTransformerPara(Downstream):
     """
     Encoder: AdaptiveRiemannianParallelTransformer (head-split spatial-temporal
-    attention with adaptive Riemannian bias on spatial heads, approx log map).
+    attention with adaptive Riemannian bias on spatial heads, Padé log map).
     Channel encoding: nn.Embedding (inherited from base).
 
     The adaptive transformer needs global channel indices (channel_idx) to
     extract the correct submatrix from the learned 144×144 SPD reference.
     These are passed from forward() → _run_encoder().
 
+    When use_frechet=True, the Fréchet mean R^{-1/2} is loaded from the
+    pretrained checkpoint (saved as a buffer). This makes the Padé [1,1]
+    approximation accurate by pre-whitening S near I.
+
     NOTE: No [CLS] token — adaptive Riemannian attention requires L = N * C.
     aggregation="class" is NOT supported; use "avg" (default).
     """
 
-    def __init__(self, *args, aggregation="avg", **kwargs):
+    def __init__(self, *args, aggregation="avg", use_frechet=False, **kwargs):
+        self._use_frechet = use_frechet
         if aggregation == "class":
             raise ValueError(
                 "DownstreamRiemannTransformerPara does not use a [CLS] token. "
@@ -391,11 +396,11 @@ class DownstreamRiemannTransformerPara(Downstream):
             )
         super().__init__(*args, aggregation=aggregation, **kwargs)
 
-    @staticmethod
-    def _build_encoder(enc_dim, depth_e):
+    def _build_encoder(self, enc_dim, depth_e):
         return nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
-                enc_dim, nhead=8, mlp_ratio=4, log_mode='approx'
+                enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
+                use_frechet=self._use_frechet,
             ) for _ in range(depth_e)
         ])
 
@@ -499,7 +504,7 @@ class DownstreamRiemannEMA(Downstream):
     def _build_encoder(enc_dim, depth_e):
         return nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
-                enc_dim, nhead=8, mlp_ratio=4, log_mode='approx'
+                enc_dim, nhead=8, mlp_ratio=4, log_mode='pade'
             ) for _ in range(depth_e)
         ])
 

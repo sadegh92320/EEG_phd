@@ -1025,20 +1025,40 @@ class AdaptiveLogMap(nn.Module):
     Log map at a reference point on the SPD manifold, supporting
     variable channel counts across batches.
 
-    Uses first-order tangent-space approximation: S - I.
+    Supports three tangent-space projection modes:
+        'approx' — first-order Taylor: S - I  (fastest, least accurate)
+        'pade'   — Padé [1,1]: 2(S-I)(I+S)^{-1}  (good accuracy near I)
+        'eigh'   — full eigendecomposition  (exact, expensive)
+
+    Optional Fréchet mean pre-whitening (use_frechet=True):
+        Instead of projecting at the identity, project at the offline
+        Fréchet mean R of the training covariance distribution:
+            S̃ = R^{-1/2} S R^{-1/2}     (whiten — brings S̃ close to I)
+            log(S̃) ≈ Padé(S̃)             (now accurate because S̃ ≈ I)
+
+        This is geometrically principled: R is the intrinsic center of
+        the data on the SPD manifold, so whitening minimizes the distance
+        ||S̃ - I|| across the training set, maximizing Padé accuracy.
+
+        The frozen R^{-1/2} is loaded from a precomputed file and stored
+        as a buffer (no gradients, moves with .to(device) automatically).
 
     Args:
         total_channels: Size of the global channel space (default 144)
         eps: Regularization constant for numerical stability
-        log_mode: How to compute the matrix logarithm:
-            'approx' — first-order: S - I  (fastest, no eigh)
-        use_approx: DEPRECATED — kept for backward compat. If True, sets log_mode='approx'.
+        log_mode: 'approx', 'pade', or 'eigh'
+        use_approx: DEPRECATED — kept for backward compat.
+        use_frechet: If True, pre-whiten S with frozen Fréchet mean
+        frechet_R_inv_sqrt: (C, C) tensor — precomputed R^{-1/2}.
+                            Required if use_frechet=True. Register as buffer.
     """
     def __init__(self, total_channels=TOTAL_GLOBAL_CHANNELS, eps=1e-5,
-                 log_mode='eigh', use_approx=False):
+                 log_mode='eigh', use_approx=False,
+                 use_frechet=False, frechet_R_inv_sqrt=None):
         super().__init__()
         self.eps = eps
         self.total_channels = total_channels
+        self.use_frechet = use_frechet
 
         # Backward compat: use_approx=True overrides log_mode
         if use_approx:
@@ -1046,18 +1066,52 @@ class AdaptiveLogMap(nn.Module):
         else:
             self.log_mode = log_mode
 
+        # Frozen Fréchet mean reference (no gradients, moves with device)
+        if use_frechet and frechet_R_inv_sqrt is not None:
+            self.register_buffer('R_inv_sqrt', frechet_R_inv_sqrt)
+        else:
+            self.R_inv_sqrt = None
+
     def forward(self, S, channel_idx=None, ema_ref=None):
         """
         Args:
             S: (batch, C, C) batch of SPD matrices
-            channel_idx: unused, kept for API compatibility
+            channel_idx: (C,) global channel indices — used to extract
+                         the correct submatrix of R^{-1/2} when use_frechet=True
             ema_ref: unused, kept for API compatibility
         Returns:
-            (batch, C, C) tangent vectors at identity
+            (batch, C, C) tangent vectors
         """
         orig_dtype = S.dtype
         C = S.shape[-1]
         I = torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
+
+        # ── Optional Fréchet pre-whitening ──
+        # S̃ = R^{-1/2} S R^{-1/2}  (centered at Fréchet mean, close to I)
+        S_before = S  # keep original in case whitening fails
+        if self.use_frechet and self.R_inv_sqrt is not None:
+            # Extract the C×C submatrix for this batch's channels
+            if channel_idx is not None and self.R_inv_sqrt.shape[0] > C:
+                R_sub = self.R_inv_sqrt[channel_idx][:, channel_idx]  # (C, C)
+            else:
+                R_sub = self.R_inv_sqrt[:C, :C]  # fallback: take first C
+            R_sub = R_sub.to(S.dtype).unsqueeze(0)  # (1, C, C)
+            S = R_sub @ S @ R_sub.transpose(-1, -2)
+            # Re-symmetrize (numerical safety after two matmuls)
+            S = 0.5 * (S + S.transpose(-1, -2))
+
+            # ── NaN/Inf guard after whitening ──
+            if torch.isnan(S).any() or torch.isinf(S).any():
+                print(f"[AdaptiveLogMap] NaN/Inf AFTER Fréchet whitening!")
+                print(f"  S_whitened range: [{S[~torch.isnan(S)].min().item():.4f}, "
+                      f"{S[~torch.isnan(S)].max().item():.4f}]")
+                print(f"  R_sub range: [{R_sub.min().item():.4f}, {R_sub.max().item():.4f}]")
+                print(f"  S_original diag: [{S_before.diagonal(dim1=-2,dim2=-1).min().item():.4f}, "
+                      f"{S_before.diagonal(dim1=-2,dim2=-1).max().item():.4f}]")
+                # Fall back to un-whitened S to avoid crash
+                S = S_before
+
+        # ── Tangent-space projection ──
         if self.log_mode == 'approx':
             # First-order: S - I
             return (S - I).to(orig_dtype)
@@ -1066,6 +1120,15 @@ class AdaptiveLogMap(nn.Module):
             # log(S) ≈ 2(S - I)(I + S)^{-1}
             X = S - I
             T = torch.linalg.solve(I + S, 2 * X)
+
+            # ── NaN/Inf guard after Padé ──
+            if torch.isnan(T).any() or torch.isinf(T).any():
+                print(f"[AdaptiveLogMap] NaN/Inf AFTER Padé solve!")
+                print(f"  S diag range: [{S.diagonal(dim1=-2,dim2=-1).min().item():.4f}, "
+                      f"{S.diagonal(dim1=-2,dim2=-1).max().item():.4f}]")
+                # Fall back to first-order (S - I) which can't produce NaN from SPD input
+                T = X
+
             return T.to(orig_dtype)
         
 
@@ -1083,15 +1146,20 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         eps: Regularization for SPD matrix
         log_mode: 'approx', 'pade', or 'eigh' (see AdaptiveLogMap)
         use_approx: DEPRECATED — kept for backward compat.
+        use_frechet: If True, pre-whiten S with frozen Fréchet mean
+        frechet_R_inv_sqrt: (C, C) tensor — precomputed R^{-1/2}
     """
     def __init__(self, num_heads, total_channels=TOTAL_GLOBAL_CHANNELS,
-                 eps=1e-5, log_mode='eigh', use_approx=False):
+                 eps=1e-5, log_mode='eigh', use_approx=False,
+                 use_frechet=False, frechet_R_inv_sqrt=None):
         super().__init__()
         self.num_heads = num_heads
         self.eps = eps
         self.adaptive_log = AdaptiveLogMap(
             total_channels=total_channels, eps=eps,
-            log_mode=log_mode, use_approx=use_approx
+            log_mode=log_mode, use_approx=use_approx,
+            use_frechet=use_frechet,
+            frechet_R_inv_sqrt=frechet_R_inv_sqrt,
         )
 
         # Per-head learnable scaling — initialized to 0 so the model starts
@@ -1149,10 +1217,13 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         spd_eps: SPD regularization constant
         log_mode: 'approx', 'pade', or 'eigh' (see AdaptiveLogMap)
         use_approx: DEPRECATED — kept for backward compat.
+        use_frechet: If True, pre-whiten S with frozen Fréchet mean
+        frechet_R_inv_sqrt: (C, C) tensor — precomputed R^{-1/2}
     """
     def __init__(self, embed_dim, num_heads=8, total_channels=TOTAL_GLOBAL_CHANNELS,
                  dropout=0.1, att_dropout=0.1, spd_eps=1e-5,
-                 log_mode='eigh', use_approx=False):
+                 log_mode='eigh', use_approx=False,
+                 use_frechet=False, frechet_R_inv_sqrt=None):
         super().__init__()
         assert num_heads % 2 == 0, "num_heads must be even for parallel split"
         assert embed_dim % num_heads == 0
@@ -1176,7 +1247,9 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             total_channels=total_channels,
             eps=spd_eps,
             log_mode=log_mode,
-            use_approx=use_approx
+            use_approx=use_approx,
+            use_frechet=use_frechet,
+            frechet_R_inv_sqrt=frechet_R_inv_sqrt,
         )
 
     def forward(self, x_norm, num_chan, residual=None, channel_idx=None, ema_ref=None):
@@ -1269,10 +1342,13 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
         spd_eps: SPD regularization constant
         log_mode: 'approx', 'pade', or 'eigh' (see AdaptiveLogMap)
         use_approx: DEPRECATED — kept for backward compat.
+        use_frechet: If True, pre-whiten S with frozen Fréchet mean
+        frechet_R_inv_sqrt: (C, C) tensor — precomputed R^{-1/2}
     """
     def __init__(self, embed_dim, nhead=8, total_channels=TOTAL_GLOBAL_CHANNELS,
                  mlp_ratio=4, drop=0.0, att_drop=0.0, drop_path=0.0, act=nn.GELU,
-                 norm=nn.LayerNorm, spd_eps=1e-5, log_mode='eigh', use_approx=False):
+                 norm=nn.LayerNorm, spd_eps=1e-5, log_mode='eigh', use_approx=False,
+                 use_frechet=False, frechet_R_inv_sqrt=None):
         super().__init__()
 
         self.attn = AdaptiveRiemannianParallelAttention(
@@ -1284,6 +1360,8 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
             spd_eps=spd_eps,
             log_mode=log_mode,
             use_approx=use_approx,
+            use_frechet=use_frechet,
+            frechet_R_inv_sqrt=frechet_R_inv_sqrt,
         )
 
         self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()

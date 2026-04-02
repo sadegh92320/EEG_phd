@@ -513,7 +513,7 @@ def compare_all_models(num_channels=32, seq_length=512, batch_size=2,
 
     # ── 5. BERT + Parallel Riemannian CrissCross (CBraMod-style) ──
     try:
-        from MAE_pretraining.bert_parallel_riemaniann_transformer import EncoderDecoder as BERT_PAR
+        from MAE_pretraining.old_idea.bert_parallel_riemaniann_transformer import EncoderDecoder as BERT_PAR
         model = BERT_PAR(
             num_channels=num_channels, enc_dim=enc_dim,
             depth_e=depth_e, mask_prob=0.5, patch_size=patch_size

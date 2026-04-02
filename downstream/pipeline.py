@@ -16,7 +16,7 @@ from sklearn.model_selection import train_test_split
 from MAE_pretraining.old_idea.bert_riemaniann_loss import RiemannLossBert
 from MAE_pretraining.bert_parallel_approx_riemann import ApproxAdaptiveRiemannBert
 from MAE_pretraining.pretrain_gnn import GNNEncoderDecoder
-from MAE_pretraining.bert_parallel_adaptive_riemann import AdaptiveRiemannBert
+from MAE_pretraining.old_idea.bert_parallel_adaptive_riemann import AdaptiveRiemannBert
 from MAE_pretraining.pretraining import EncoderDecoder
 
 import random
@@ -149,10 +149,15 @@ class Pipeline:
         return train_loader, valid_loader
 
 
-    def load_encoder(self, pretrain=True):
+    def load_encoder(self, pretrain=True, use_frechet=False):
         """
         Pretrain the MAE (EncoderDecoder) and return the checkpoint path
         for downstream loading.
+
+        Args:
+            pretrain:    if True, train from scratch; else load existing ckpt
+            use_frechet: if True, compute Fréchet mean from training data
+                         before training starts (adds ~30-60s one-time cost)
         """
         CKPT_DIR = self.config["lighting_CKPT_DIR"]
         os.makedirs(CKPT_DIR, exist_ok=True)
@@ -160,7 +165,39 @@ class Pipeline:
         if pretrain:
             print("new's")
             train_loader, valid_loader = self.import_data_pretrain()
+
+            # Create model first (without Fréchet — we need it to compute embeddings)
             model = ApproxAdaptiveRiemannBert()
+
+            # ── Compute frozen Fréchet mean from EMBEDDING-SPACE covariances ──
+            # IMPORTANT: We compute R from the same S = x @ x^T / D that the
+            # Riemannian attention actually sees — NOT from raw EEG covariances.
+            # This ensures R^{-1/2} S R^{-1/2} ≈ I, making Padé accurate.
+            frechet_R_inv_sqrt = None
+            if use_frechet:
+                from MAE_pretraining.frechet_mean import compute_frechet_mean_from_model
+                print("[Fréchet] Computing offline Fréchet mean from embedding-space covariances...")
+                frechet_result = compute_frechet_mean_from_model(
+                    model, train_loader, enc_dim=512,
+                    max_batches=200, verbose=True
+                )
+                frechet_R_inv_sqrt = frechet_result['R_inv_sqrt']  # (C, C) tensor
+
+                # Save for reproducibility / later reuse
+                frechet_save_path = os.path.join(CKPT_DIR, "frechet_mean.pt")
+                torch.save(frechet_result, frechet_save_path)
+                print(f"[Fréchet] Saved to {frechet_save_path}")
+
+            # Inject frozen Fréchet mean into every encoder layer
+            if use_frechet and frechet_R_inv_sqrt is not None:
+                # Chain: layer.attn.riemannian_bias.adaptive_log
+                for layer in model.encoder:
+                    log_map = layer.attn.riemannian_bias.adaptive_log
+                    log_map.use_frechet = True
+                    log_map.register_buffer(
+                        'R_inv_sqrt', frechet_R_inv_sqrt.clone()
+                    )
+                print(f"[Fréchet] Injected R_inv_sqrt into {len(model.encoder)} layers")
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
@@ -182,7 +219,8 @@ class Pipeline:
                 "depth_e": 8,
                 "depth_d": 4,
                 "mask_prob": 0.7,
-                "patch_size": 16
+                "patch_size": 16,
+                "use_frechet": use_frechet,
             })
 
             trainer = Trainer(
@@ -196,7 +234,7 @@ class Pipeline:
                 
             )
 
-            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
+            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader, ckpt_path="/content/drive/MyDrive/checkpoints_pretraining/last-v22.ckpt")
 
             # Use the best checkpoint from this run
             self.checkpoint_path = ckpt_callback.best_model_path
