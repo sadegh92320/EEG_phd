@@ -34,9 +34,9 @@ from downstream.downstream_model import Downstream
 from pytorch_lightning.loggers import WandbLogger
 from MAE_pretraining.load_data import get_dataloader
 from downstream.split_data_downstream import DownstreamDataLoader
-from MAE_pretraining.bert_adaptive_ema_only import AdaptiveRiemannEMABert
-from MAE_pretraining.bert_ema_graph import AdaptiveRiemannEMAGraphBert
-from MAE_pretraining.bert_riemann_gnn import AdaptiveRiemannGNNBert
+from MAE_pretraining.old_idea.bert_adaptive_ema_only import AdaptiveRiemannEMABert
+from MAE_pretraining.old_idea.bert_ema_graph import AdaptiveRiemannEMAGraphBert
+from MAE_pretraining.old_idea.bert_riemann_gnn import AdaptiveRiemannGNNBert
 
 
 def seed_everything(seed=42):

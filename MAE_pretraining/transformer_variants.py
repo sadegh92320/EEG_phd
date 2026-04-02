@@ -1046,19 +1046,28 @@ class AdaptiveLogMap(nn.Module):
         else:
             self.log_mode = log_mode
 
-    def forward(self, S, channel_idx, ema_ref=None):
+    def forward(self, S, channel_idx=None, ema_ref=None):
         """
         Args:
             S: (batch, C, C) batch of SPD matrices
-            channel_idx: (C,) long tensor — global channel indices for this batch
+            channel_idx: unused, kept for API compatibility
             ema_ref: unused, kept for API compatibility
         Returns:
             (batch, C, C) tangent vectors at identity
         """
         orig_dtype = S.dtype
         C = S.shape[-1]
-        ref = torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
-        return (S - ref).to(orig_dtype)
+        I = torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
+        if self.log_mode == 'approx':
+            # First-order: S - I
+            return (S - I).to(orig_dtype)
+        else:
+            # Padé [1,1] approximant of matrix logarithm:
+            # log(S) ≈ 2(S - I)(I + S)^{-1}
+            X = S - I
+            T = torch.linalg.solve(I + S, 2 * X)
+            return T.to(orig_dtype)
+        
 
 
 class AdaptiveRiemannianAttentionBias(nn.Module):

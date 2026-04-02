@@ -394,12 +394,17 @@ def build_cbramod(num_classes, checkpoint_path, num_channels, data_length, **kwa
         p.requires_grad = False
 
     if training_mode == "linear_probe":
-        # Mean-pool over channels AND patches → Linear(200, num_classes)
-        # (b, C, S, 200) → mean over C and S → (b, 200) → Linear → (b, num_classes)
-        # ~402 params for binary — minimal head that purely tests backbone quality.
+        # Pool over patches (temporal), keep channels → channel-aware linear probe.
+        # (b, C, S, 200) → mean over S → (b, C, 200) → flatten → LayerNorm → Linear
+        # This preserves spatial (channel) information, critical for tasks like
+        # motor imagery where left/right discrimination depends on electrode location.
+        # Params: C*200 * num_classes + norms ≈ 22*200*4 = ~17.6K for BCI 2a (4 classes)
+        lp_in = num_channels * 200
         model.classifier = nn.Sequential(
-            Reduce('b c s d -> b d', 'mean'),
-            nn.Linear(200, num_classes),
+            Reduce('b c s d -> b c d', 'mean'),   # pool over patches
+            Rearrange('b c d -> b (c d)'),          # flatten channels × embedding
+            nn.LayerNorm(lp_in),
+            nn.Linear(lp_in, num_classes),
         )
     elif training_mode == "full":
         # Pool over patches first to avoid parameter explosion on long/many-channel data.
@@ -420,11 +425,14 @@ def build_cbramod(num_classes, checkpoint_path, num_channels, data_length, **kwa
             finetune_layers, head_modules=[model.classifier],
         )
     elif training_mode == "lora":
-        # Frozen backbone + LoRA adapters + same LP head
+        # Frozen backbone + LoRA adapters + channel-aware LP head
         from downstream.lora import inject_lora
+        lp_in = num_channels * 200
         model.classifier = nn.Sequential(
-            Reduce('b c s d -> b d', 'mean'),
-            nn.Linear(200, num_classes),
+            Reduce('b c s d -> b c d', 'mean'),
+            Rearrange('b c d -> b (c d)'),
+            nn.LayerNorm(lp_in),
+            nn.Linear(lp_in, num_classes),
         )
         inject_lora(model.backbone, rank=8, alpha=16.0)
         for p in model.classifier.parameters():
@@ -531,12 +539,23 @@ MODEL_BUILDERS = {
 SCALAR_METRICS = ["accuracy", "recall", "precision", "f1_score", "roc_auc",
                   "kappa", "acc1", "acc2", "bacc"]
 
+MODEL_COLORS = {
+    "steegformer": "#4C78A8", "labram": "#F58518", "cbramod": "#E45756",
+    "biot": "#72B7B2", "eegpt": "#54A24B", "eegnet": "#B07AA1",
+    "conformer": "#FF9DA7", "deepconvnet": "#9D755D", "ctnet": "#BAB0AC",
+    "riemann_adaptive": "#4E79A7", "riemann_para": "#F28E2B",
+    "riemann_ema": "#76B7B2", "riemann_seq": "#59A14F",
+    "riemann_loss": "#EDC948", "baseline": "#AF7AA1",
+    "encoder_gnn": "#E15759",
+}
+
 
 def summarize_results(all_metrics, participant_ids, model_name, dataset_name,
                       protocol_name, result_dir="downstream/results"):
     """
-    Aggregate per-participant metrics, print a summary table, save a box plot,
-    and log the summary to wandb.
+    Aggregate per-participant metrics, print a summary table with ALL metrics,
+    save per-model results to JSON, and generate a combined box plot with all
+    models that have been evaluated so far.
 
     Args:
         all_metrics: list of dicts, one per participant (from run_LOSO / run_per_subject).
@@ -546,6 +565,7 @@ def summarize_results(all_metrics, participant_ids, model_name, dataset_name,
         protocol_name: str, e.g. "loso" or "per_subject".
         result_dir: str, directory to save outputs.
     """
+    import json
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -565,12 +585,13 @@ def summarize_results(all_metrics, participant_ids, model_name, dataset_name,
 
     n_participants = len(all_metrics)
 
-    # ── Print per-participant table ──
-    # Pick display metrics (subset that's most useful)
+    # ── Print per-participant table (display subset of metrics) ──
     display_keys = [k for k in ["bacc", "acc1", "f1_score", "precision", "recall", "kappa"]
                     if k in metric_arrays]
 
-    header = f"\n{'='*70}\n  {protocol_name.upper()} Results — {model_name} on {dataset_name} ({n_participants} participants)\n{'='*70}"
+    header = (f"\n{'='*70}\n"
+              f"  {protocol_name.upper()} Results — {model_name} on {dataset_name} "
+              f"({n_participants} participants)\n{'='*70}")
     print(header)
 
     col_w = 10
@@ -582,7 +603,7 @@ def summarize_results(all_metrics, participant_ids, model_name, dataset_name,
         row = f"  {str(pid):<14}"
         for k in display_keys:
             v = metric_arrays[k][i] if i < len(metric_arrays[k]) else float("nan")
-            if k in ("bacc", "acc1"):
+            if k in ("bacc", "acc1", "accuracy"):
                 row += f"{v * 100:>{col_w}.1f}%"
             else:
                 row += f"{v:>{col_w}.4f}"
@@ -592,50 +613,44 @@ def summarize_results(all_metrics, participant_ids, model_name, dataset_name,
     mean_row = f"  {'Mean±Std':<14}"
     for k in display_keys:
         arr = metric_arrays[k]
-        if k in ("bacc", "acc1"):
+        if k in ("bacc", "acc1", "accuracy"):
             mean_row += f"{arr.mean() * 100:.1f}±{arr.std() * 100:.1f}%".rjust(col_w)
         else:
             mean_row += f"{arr.mean():.3f}±{arr.std():.3f}".rjust(col_w)
     print(mean_row)
+
+    # ── Print ALL metrics summary ──
+    print(f"\n  {'─'*50}")
+    print(f"  Summary of ALL metrics (Mean ± Std):")
+    print(f"  {'─'*50}")
+    for k in SCALAR_METRICS:
+        if k not in metric_arrays:
+            continue
+        arr = metric_arrays[k]
+        if k in ("bacc", "acc1", "acc2", "accuracy"):
+            print(f"    {k:<14} {arr.mean()*100:6.2f} ± {arr.std()*100:5.2f}%")
+        else:
+            print(f"    {k:<14} {arr.mean():6.4f} ± {arr.std():6.4f}")
     print(f"{'='*70}\n")
 
-    # ── Box plot of balanced accuracy ──
-    primary_metric = "bacc" if "bacc" in metric_arrays else ("acc1" if "acc1" in metric_arrays else None)
-    if primary_metric is not None:
-        fig, ax = plt.subplots(figsize=(5, 4))
-        vals = metric_arrays[primary_metric] * 100  # percent
+    # ── Save per-model JSON (for combined plotting) ──
+    json_path = os.path.join(result_dir,
+                             f"{model_name}_{dataset_name}_{protocol_name}.json")
+    json_data = {
+        "model": model_name,
+        "dataset": dataset_name,
+        "protocol": protocol_name,
+        "n_participants": n_participants,
+        "participant_ids": [int(p) if isinstance(p, (int, np.integer)) else str(p)
+                           for p in participant_ids],
+        "metrics": {k: v.tolist() for k, v in metric_arrays.items()},
+    }
+    with open(json_path, "w") as f:
+        json.dump(json_data, f, indent=2)
+    print(f"  Results saved to: {json_path}")
 
-        bp = ax.boxplot(vals, vert=True, patch_artist=True, widths=0.5,
-                        boxprops=dict(facecolor="#4C78A8", alpha=0.7),
-                        medianprops=dict(color="white", linewidth=2),
-                        whiskerprops=dict(color="#555"),
-                        capprops=dict(color="#555"),
-                        flierprops=dict(marker="o", markersize=5, markerfacecolor="#E45756", alpha=0.7))
-
-        # Overlay individual points (jittered)
-        jitter = np.random.default_rng(42).uniform(-0.12, 0.12, size=len(vals))
-        ax.scatter(np.ones(len(vals)) + jitter, vals, color="#4C78A8", alpha=0.5,
-                   s=25, zorder=3, edgecolors="white", linewidth=0.5)
-
-        # Mean marker
-        ax.scatter([1], [vals.mean()], marker="D", color="white", edgecolors="#333",
-                   s=40, zorder=4, linewidth=0.8)
-
-        metric_label = "Balanced Accuracy" if primary_metric == "bacc" else "Top-1 Accuracy"
-        ax.set_ylabel(f"{metric_label} (%)")
-        ax.set_title(f"{model_name} — {dataset_name} — {protocol_name.upper()}\n"
-                     f"Mean: {vals.mean():.1f}% ± {vals.std():.1f}%  (n={len(vals)})",
-                     fontsize=11)
-        ax.set_xticks([1])
-        ax.set_xticklabels([model_name])
-        ax.grid(axis="y", alpha=0.3)
-        fig.tight_layout()
-
-        plot_path = os.path.join(result_dir,
-                                 f"{model_name}_{dataset_name}_{protocol_name}_boxplot.png")
-        fig.savefig(plot_path, dpi=150)
-        plt.close(fig)
-        print(f"  Box plot saved to: {plot_path}")
+    # ── Generate combined box plot (all models evaluated so far) ──
+    _plot_combined_boxplot(dataset_name, protocol_name, result_dir)
 
     # ── Log summary to wandb ──
     try:
@@ -657,14 +672,126 @@ def summarize_results(all_metrics, participant_ids, model_name, dataset_name,
             config=summary,
         )
         wandb.log(summary)
-        # Log the box plot image if it exists
-        if primary_metric is not None and os.path.exists(plot_path):
-            wandb.log({"boxplot": wandb.Image(plot_path)})
+
+        plot_path = os.path.join(result_dir,
+                                 f"{dataset_name}_{protocol_name}_all_models_boxplot.png")
+        if os.path.exists(plot_path):
+            wandb.log({"boxplot_all_models": wandb.Image(plot_path)})
         wandb.finish()
     except Exception as e:
         print(f"  [Warning] Could not log summary to wandb: {e}")
 
     return metric_arrays
+
+
+def _plot_combined_boxplot(dataset_name, protocol_name, result_dir):
+    """
+    Read all saved JSON result files for a given dataset + protocol and
+    draw a single box plot with every model side by side.
+    """
+    import json
+    import glob as glob_mod
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    pattern = os.path.join(result_dir, f"*_{dataset_name}_{protocol_name}.json")
+    json_files = sorted(glob_mod.glob(pattern))
+    if not json_files:
+        return
+
+    # Load all model results
+    model_data = {}  # model_name -> np.array of primary metric values
+    primary_metric = None
+    for jf in json_files:
+        with open(jf, "r") as f:
+            data = json.load(f)
+        mname = data["model"]
+        metrics = data["metrics"]
+        # Pick primary metric (prefer bacc, then acc1, then accuracy)
+        for pm in ("bacc", "acc1", "accuracy"):
+            if pm in metrics:
+                primary_metric = pm
+                model_data[mname] = np.array(metrics[pm])
+                break
+
+    if not model_data or primary_metric is None:
+        return
+
+    # Sort models: foundation models first, then DL baselines, alphabetical within each
+    foundation = ["steegformer", "labram", "cbramod", "biot", "eegpt"]
+    dl_baselines = ["eegnet", "conformer", "deepconvnet", "ctnet"]
+    own_models = ["riemann_adaptive", "riemann_para", "riemann_ema",
+                  "riemann_seq", "riemann_loss", "baseline", "encoder_gnn"]
+
+    def sort_key(name):
+        if name in foundation:
+            return (0, foundation.index(name))
+        if name in dl_baselines:
+            return (1, dl_baselines.index(name))
+        if name in own_models:
+            return (2, own_models.index(name))
+        return (3, 0)
+
+    model_names = sorted(model_data.keys(), key=sort_key)
+    n_models = len(model_names)
+
+    # ── Draw combined box plot ──
+    fig_w = max(6, n_models * 1.2 + 2)
+    fig, ax = plt.subplots(figsize=(fig_w, 5))
+
+    positions = list(range(1, n_models + 1))
+    all_vals = [model_data[m] * 100 for m in model_names]
+    colors = [MODEL_COLORS.get(m, "#888888") for m in model_names]
+
+    bp = ax.boxplot(all_vals, positions=positions, vert=True, patch_artist=True,
+                    widths=0.55,
+                    medianprops=dict(color="white", linewidth=2),
+                    whiskerprops=dict(color="#555", linewidth=1),
+                    capprops=dict(color="#555", linewidth=1),
+                    flierprops=dict(marker="o", markersize=4,
+                                    markerfacecolor="#E45756", alpha=0.6))
+
+    rng = np.random.default_rng(42)
+    for i, (vals, color) in enumerate(zip(all_vals, colors)):
+        # Color boxes
+        bp["boxes"][i].set_facecolor(color)
+        bp["boxes"][i].set_alpha(0.7)
+
+        # Overlay individual points (jittered)
+        jitter = rng.uniform(-0.15, 0.15, size=len(vals))
+        ax.scatter(np.full(len(vals), i + 1) + jitter, vals,
+                   color=color, alpha=0.5, s=20, zorder=3,
+                   edgecolors="white", linewidth=0.4)
+
+        # Mean diamond
+        ax.scatter([i + 1], [vals.mean()], marker="D", color="white",
+                   edgecolors="#333", s=35, zorder=4, linewidth=0.8)
+
+        # Mean±std label above whisker
+        whisker_top = bp["caps"][i * 2 + 1].get_ydata()[0]
+        ax.text(i + 1, whisker_top + 1.5, f"{vals.mean():.1f}",
+                ha="center", va="bottom", fontsize=8, fontweight="bold", color="#333")
+
+    # Labels
+    metric_label = {"bacc": "Balanced Accuracy", "acc1": "Top-1 Accuracy",
+                    "accuracy": "Accuracy"}.get(primary_metric, primary_metric)
+    ax.set_ylabel(f"{metric_label} (%)", fontsize=11)
+    ax.set_title(f"{dataset_name.upper()} — {protocol_name.upper()}\n"
+                 f"{metric_label} per participant ({n_models} models)",
+                 fontsize=12, fontweight="bold")
+    ax.set_xticks(positions)
+    ax.set_xticklabels([m.replace("_", "\n") for m in model_names],
+                       fontsize=9, rotation=0)
+    ax.grid(axis="y", alpha=0.3)
+    ax.set_xlim(0.3, n_models + 0.7)
+    fig.tight_layout()
+
+    plot_path = os.path.join(result_dir,
+                             f"{dataset_name}_{protocol_name}_all_models_boxplot.png")
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    print(f"  Combined box plot saved to: {plot_path}")
 
 
 # ────────────────────────────────────────────────────────────────

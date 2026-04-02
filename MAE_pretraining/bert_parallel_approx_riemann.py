@@ -132,11 +132,11 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         self.num_channels = num_channels
 
         # Adaptive Riemannian parallel transformer layers
-        # use_approx=True → M - I approximation (no batch eigendecomposition)
+        # log_mode='pade' → Padé [1,1] approximant: log(S) ≈ 2(S-I)(I+S)^{-1}
         # No num_channels needed — reference lives in global 144-channel space
         self.encoder = nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
-                enc_dim, nhead=8, mlp_ratio=4, use_approx=True
+                enc_dim, nhead=8, mlp_ratio=4, log_mode='pade'
             ) for _ in range(depth_e)
         ])
 
