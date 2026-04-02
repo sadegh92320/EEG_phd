@@ -149,48 +149,64 @@ class Pipeline:
         return train_loader, valid_loader
 
 
-    def load_encoder(self, pretrain=True, use_frechet=False):
+    def load_encoder(self, pretrain=True, use_frechet=False, log_mode='pade',
+                     use_corr_masking=True, resume_ckpt=None):
         """
-        Pretrain the MAE (EncoderDecoder) and return the checkpoint path
-        for downstream loading.
+        Pretrain the MAE and return the checkpoint path for downstream loading.
+
+        Ablation table (5 rows):
+            1. baseline                          → log_mode='baseline'
+            2. approx (S-I)                      → log_mode='approx', use_corr_masking=False
+            3. pade                              → log_mode='pade',   use_corr_masking=False
+            4. pade + correlation masking         → log_mode='pade',   use_corr_masking=True
+            5. pade + correlation masking + fréchet → log_mode='pade', use_corr_masking=True, use_frechet=True
 
         Args:
-            pretrain:    if True, train from scratch; else load existing ckpt
-            use_frechet: if True, compute Fréchet mean from training data
-                         before training starts (adds ~30-60s one-time cost)
+            pretrain:         if True, train from scratch; else load existing ckpt
+            use_frechet:      if True, compute Fréchet mean before training
+            log_mode:         'pade', 'approx', or 'baseline'
+            use_corr_masking: if True, use correlation-aware channel masking;
+                              if False, use standard random BERT masking
+            resume_ckpt:      path to checkpoint to resume from (None = from scratch)
         """
+        assert log_mode in ('pade', 'approx', 'baseline'), \
+            f"log_mode must be 'pade', 'approx', or 'baseline', got '{log_mode}'"
+
         CKPT_DIR = self.config["lighting_CKPT_DIR"]
         os.makedirs(CKPT_DIR, exist_ok=True)
 
         if pretrain:
-            print("new's")
             train_loader, valid_loader = self.import_data_pretrain()
 
-            # Create model first (without Fréchet — we need it to compute embeddings)
-            model = ApproxAdaptiveRiemannBert()
+            # ── Select model variant ──
+            if log_mode == 'baseline':
+                print("[Ablation] Using baseline ViT (no Riemannian attention)")
+                model = EncoderDecoder()
+                use_frechet = False       # not applicable
+                use_corr_masking = False  # baseline uses its own masking
+            else:
+                masking_str = "corr-masking" if use_corr_masking else "random-masking"
+                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}")
+                model = ApproxAdaptiveRiemannBert(use_corr_masking=use_corr_masking)
+                # Override log_mode in every encoder layer if needed
+                if log_mode == 'approx':
+                    for layer in model.encoder:
+                        layer.attn.riemannian_bias.adaptive_log.log_mode = 'approx'
 
-            # ── Compute frozen Fréchet mean from EMBEDDING-SPACE covariances ──
-            # IMPORTANT: We compute R from the same S = x @ x^T / D that the
-            # Riemannian attention actually sees — NOT from raw EEG covariances.
-            # This ensures R^{-1/2} S R^{-1/2} ≈ I, making Padé accurate.
-            frechet_R_inv_sqrt = None
-            if use_frechet:
+            # ── Fréchet mean (only for Riemannian + pade) ──
+            if use_frechet and log_mode == 'pade':
                 from MAE_pretraining.frechet_mean import compute_frechet_mean_from_model
                 print("[Fréchet] Computing offline Fréchet mean from embedding-space covariances...")
                 frechet_result = compute_frechet_mean_from_model(
                     model, train_loader, enc_dim=512,
                     max_batches=200, verbose=True
                 )
-                frechet_R_inv_sqrt = frechet_result['R_inv_sqrt']  # (C, C) tensor
+                frechet_R_inv_sqrt = frechet_result['R_inv_sqrt']
 
-                # Save for reproducibility / later reuse
                 frechet_save_path = os.path.join(CKPT_DIR, "frechet_mean.pt")
                 torch.save(frechet_result, frechet_save_path)
                 print(f"[Fréchet] Saved to {frechet_save_path}")
 
-            # Inject frozen Fréchet mean into every encoder layer
-            if use_frechet and frechet_R_inv_sqrt is not None:
-                # Chain: layer.attn.riemannian_bias.adaptive_log
                 for layer in model.encoder:
                     log_map = layer.attn.riemannian_bias.adaptive_log
                     log_map.use_frechet = True
@@ -199,18 +215,28 @@ class Pipeline:
                     )
                 print(f"[Fréchet] Injected R_inv_sqrt into {len(model.encoder)} layers")
 
+            # ── Run name for wandb (easy to compare in dashboard) ──
+            if log_mode == 'baseline':
+                run_name = "baseline-vit"
+            else:
+                run_name = f"riemann-{log_mode}"
+                if use_corr_masking:
+                    run_name += "-corrmask"
+                if use_frechet and log_mode == 'pade':
+                    run_name += "-frechet"
+
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
                     monitor="val_mse",
                     mode="min",
                     save_top_k=5,
                     save_last=True,
-                    filename="epoch{epoch}-riemann-pade-{val_mse:.4f}",
+                    filename="epoch{epoch}-" + run_name + "-{val_mse:.4f}",
                 )
 
             wandb_logger = WandbLogger(
                 project="eeg_foundation_model",
-                name="riemann-pade",
+                name=run_name,
                 log_model="all"
             )
             wandb_logger.experiment.config.update({
@@ -220,7 +246,9 @@ class Pipeline:
                 "depth_d": 4,
                 "mask_prob": 0.7,
                 "patch_size": 16,
-                "use_frechet": use_frechet,
+                "log_mode": log_mode,
+                "use_corr_masking": use_corr_masking,
+                "use_frechet": use_frechet and log_mode == 'pade',
             })
 
             trainer = Trainer(
@@ -230,22 +258,20 @@ class Pipeline:
                 max_epochs=40,
                 precision="16-mixed",
                 gradient_clip_val=1.0,
-               
-                
             )
 
-            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader, ckpt_path="/content/drive/MyDrive/checkpoints_pretraining/last-v22.ckpt")
+            trainer.fit(model, train_dataloaders=train_loader,
+                        val_dataloaders=valid_loader,
+                        ckpt_path="/content/drive/MyDrive/checkpoints_pretraining/last-v22.ckpt")
 
-            # Use the best checkpoint from this run
             self.checkpoint_path = ckpt_callback.best_model_path
             print(f"Best checkpoint: {self.checkpoint_path}")
         else:
-            # Find the best existing checkpoint (or last.ckpt as fallback)
             import glob
             candidates = sorted(glob.glob(os.path.join(CKPT_DIR, "epoch*-baseline-*.ckpt")))
             last_ckpt = os.path.join(CKPT_DIR, "last.ckpt")
             if candidates:
-                self.checkpoint_path = candidates[-1]  # latest/best by filename sort
+                self.checkpoint_path = candidates[-1]
             elif os.path.exists(last_ckpt):
                 self.checkpoint_path = last_ckpt
             else:

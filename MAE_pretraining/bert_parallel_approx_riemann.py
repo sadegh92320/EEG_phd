@@ -125,12 +125,14 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
     def __init__(self, config=None, num_channels=64,
                  max_embedding=2000, enc_dim=512, depth_e=8,
                  mask_prob=0.5, patch_size=16, norm_pix_loss=False,
-                 use_frechet=False, frechet_path=None):
+                 use_frechet=False, frechet_path=None,
+                 use_corr_masking=True):
         super().__init__()
 
         self.config = config
         self.enc_dim = enc_dim
         self.num_channels = num_channels
+        self.use_corr_masking = use_corr_masking
 
         # ── Load frozen Fréchet mean reference (optional) ──
         # When use_frechet=True, the tangent-space projection pre-whitens S
@@ -311,14 +313,14 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         channel_list = torch.tensor(channel_list, dtype=torch.long, device=device) if not isinstance(channel_list, torch.Tensor) else channel_list.to(device)
 
         # ── Compute per-sample channel correlation from RAW EEG ──
-        # This is done BEFORE patching, on the original signal, because
-        # that's where true inter-channel redundancy lives.
-        # The correlation matrix is also the same geometric object that
+        # Only needed when correlation-aware masking is enabled.
+        # The correlation matrix is the same geometric object that
         # the Riemannian attention branch operates on (covariance → SPD).
-        with torch.no_grad():
-            x_centered = x - x.mean(dim=-1, keepdim=True)          # (B, C, T)
-            x_normed = x_centered / (x_centered.std(dim=-1, keepdim=True) + 1e-8)
-            corr = torch.bmm(x_normed, x_normed.transpose(-1, -2)) / T  # (B, C, C)
+        if self.use_corr_masking:
+            with torch.no_grad():
+                x_centered = x - x.mean(dim=-1, keepdim=True)          # (B, C, T)
+                x_normed = x_centered / (x_centered.std(dim=-1, keepdim=True) + 1e-8)
+                corr = torch.bmm(x_normed, x_normed.transpose(-1, -2)) / T  # (B, C, C)
 
         # Patch the EEG: (B, C, T) → (B, N, C, D) → (B, N*C, D)
         x = self.patch(x)
@@ -339,8 +341,11 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         tp = self.temporal_embedding_e(eeg_seq_indices)
         x += tp
 
-        # ── Masking: correlation-aware (large C) or random (small C) ──
-        x, mask = self.mask_corr_channels(x, corr, C)
+        # ── Masking ──
+        if self.use_corr_masking:
+            x, mask = self.mask_corr_channels(x, corr, C)
+        else:
+            x, mask = self.mask_bert(x)
 
         # Extract channel indices for the adaptive Riemannian reference
         channel_idx = channel_list[0]  # (C,) global channel indices
