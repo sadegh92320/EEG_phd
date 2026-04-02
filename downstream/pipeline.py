@@ -168,12 +168,12 @@ class Pipeline:
                     mode="min",
                     save_top_k=5,
                     save_last=True,
-                    filename="epoch{epoch}-riemann-{val_mse:.4f}",
+                    filename="epoch{epoch}-riemann-pade-{val_mse:.4f}",
                 )
 
             wandb_logger = WandbLogger(
                 project="eeg_foundation_model",
-                name="riemann-gnn",
+                name="riemann-pade",
                 log_model="all"
             )
             wandb_logger.experiment.config.update({
@@ -196,7 +196,7 @@ class Pipeline:
                 
             )
 
-            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader, ckpt_path="/content/last-v21.ckpt")
+            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
 
             # Use the best checkpoint from this run
             self.checkpoint_path = ckpt_callback.best_model_path
