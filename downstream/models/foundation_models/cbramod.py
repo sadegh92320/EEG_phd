@@ -344,21 +344,28 @@ class CBraModClassifier(nn.Module):
 
         n_patches = data_length // 200
 
-        # Default classifier: mean-pool over patches, keep channels (overridden by build_cbramod)
-        in_features = num_channel * 200
+        # Default classifier: paper's original 3-layer MLP on flattened features
+        # forward() flattens (bz, ch, seq, 200) → (bz, ch*seq*200)
+        flat_dim = num_channel * n_patches * 200
         self.classifier = nn.Sequential(
-            Reduce('b c s d -> b c d', 'mean'),
-            Rearrange('b c d -> b (c d)'),
-            nn.LayerNorm(in_features),
-            nn.Linear(in_features, num_class),
+            nn.Linear(flat_dim, n_patches * 200),
+            nn.ELU(),
+            nn.Dropout(0.1),
+            nn.Linear(n_patches * 200, 200),
+            nn.ELU(),
+            nn.Dropout(0.1),
+            nn.Linear(200, num_class),
         )
 
     def forward(self, x):
         # input: (batch, channel, time) → window into patches of 200
         x_windows = x.unfold(dimension=2, size=200, step=200)
         # x_windows: (bz, ch_num, seq_len, 200)
+        bz = x_windows.shape[0]
         feats = self.backbone(x_windows)  # (bz, ch_num, seq_len, 200)
-        out = self.classifier(feats)
+        # Flatten to (bz, ch_num * seq_len * 200) — matches paper's original forward
+        feats_flat = feats.contiguous().view(bz, -1)
+        out = self.classifier(feats_flat)
         return out
     
 

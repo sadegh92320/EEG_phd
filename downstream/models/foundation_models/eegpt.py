@@ -1022,6 +1022,7 @@ class LitEEGPTModel(nn.Module):
         # we always use the internal codebook IDs resolved from the dataset.
         B, C, T = x.shape
         x = self.chan_conv(x)                          # (B, dataset_chans, T) → (B, proj_chans, T)
+        self.target_encoder.eval()                     # JEPA target encoder always runs in eval mode
         z = self.target_encoder(x, self.chans_id)      # (B, N_temporal, embed_num, embed_dim)
 
         if self._use_standard_probe:

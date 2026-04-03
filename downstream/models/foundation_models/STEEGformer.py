@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 from timm.models.vision_transformer import PatchEmbed, Block
+from timm.layers import trunc_normal_
 import math
 
 class PatchEmbedEEG(nn.Module):
@@ -515,7 +516,9 @@ class STEEGFormerDownstream(nn.Module):
         num_heads=8,
         patch_size=16,
         mlp_ratio=4.,
-        aggregation="class",
+        aggregation="mean",
+        drop_path_rate=0.1,
+        proj_drop_rate=0.0,
     ):
         super().__init__()
         self.aggregation = aggregation
@@ -527,10 +530,13 @@ class STEEGFormerDownstream(nn.Module):
         self.enc_channel_emd = ChannelPositionalEmbed(embed_dim)
         self.enc_temporal_emd = TemporalPositionalEncoding(embed_dim, 512)
 
+        # Stochastic depth: linearly increasing 0 → drop_path_rate across blocks
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.blocks = nn.ModuleList([
             Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True,
-                  norm_layer=partial(nn.LayerNorm, eps=1e-6))
-            for _ in range(depth)
+                  norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                  drop_path=dpr[i], proj_drop=proj_drop_rate)
+            for i in range(depth)
         ])
         self.norm = nn.LayerNorm(embed_dim, eps=1e-6)
 
@@ -559,6 +565,11 @@ class STEEGFormerDownstream(nn.Module):
             dropout=0.1,
             num_special_tokens=1,
         )
+        # Initialize head weights with small std (paper convention: trunc_normal std=2e-5)
+        if hasattr(self.head, 'final'):
+            trunc_normal_(self.head.final.weight, std=2e-5)
+        if hasattr(self.head, 'final_simple'):
+            trunc_normal_(self.head.final_simple.weight, std=2e-5)
         # Keep self.fc as alias so TrainerDownstream can find the head
         self.fc = self.head
 
@@ -666,7 +677,7 @@ class STEEGFormerDownstream(nn.Module):
         return self.head(x)
 
 
-def steegformer_small_downstream(num_classes, checkpoint_path=None, aggregation="class"):
+def steegformer_small_downstream(num_classes, checkpoint_path=None, aggregation="mean"):
     """Convenience constructor for the small ST-EEGFormer downstream model."""
     return STEEGFormerDownstream(
         num_classes=num_classes,
@@ -676,4 +687,6 @@ def steegformer_small_downstream(num_classes, checkpoint_path=None, aggregation=
         num_heads=8,
         patch_size=16,
         aggregation=aggregation,
+        drop_path_rate=0.1,
+        proj_drop_rate=0.0,
     )

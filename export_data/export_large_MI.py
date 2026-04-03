@@ -55,8 +55,8 @@ class ImportLargeMI(ImportDataPre):
         if data.shape[0] != 21 and data.shape[1] == 21:
             data = data.T
      
-        dataa = self.apply_preprocessing_pretrain(data)
-        
+        data = self.apply_preprocessing_pretrain(data)
+
         trials.append(data)
 
         return trials

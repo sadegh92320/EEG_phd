@@ -36,12 +36,11 @@ def get_batch_size(num_channel):
         return 128
 
 
-def get_dataloader(config):
+def get_dataloader(config, use_global_norm=False):
     dataset_to_use = config["data_use"]
-    
-    
-    train_sets = [get_pretrain_dataset(dataset, type="train") for dataset in dataset_to_use]
-    valid_sets = [get_pretrain_dataset(dataset, type="val") for dataset in dataset_to_use]
+
+    train_sets = [get_pretrain_dataset(dataset, type="train", use_global_norm=use_global_norm) for dataset in dataset_to_use]
+    valid_sets = [get_pretrain_dataset(dataset, type="val", use_global_norm=use_global_norm) for dataset in dataset_to_use]
     
 
     # FIX 1 & 2: Actually call the function to calculate batch sizes

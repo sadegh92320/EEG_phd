@@ -62,7 +62,7 @@ DATASET_CONFIGS = {
         "data_path": "downstream/data/faced",
         "config_yaml": "downstream/info_dataset/faced.yaml",
         "num_channels": 32,
-        "data_length": 2560,  # 30s * 256Hz (baseline rate, resampled per-model in dataset)
+        "data_length": 7680,  # 30s * 256Hz (baseline rate, resampled per-model in dataset)
         "sampling_rate": 256,
     },
     "bci_comp_2a": {
@@ -183,7 +183,7 @@ def build_steegformer(num_classes, checkpoint_path, num_channels, data_length, *
     model = steegformer_small_downstream(
         num_classes=num_classes,
         checkpoint_path=checkpoint_path,
-        aggregation="class",
+        aggregation="mean",
     )
 
     # Model is frozen by default inside steegformer_small_downstream.
@@ -339,14 +339,10 @@ def build_biot(num_classes, checkpoint_path, num_channels, data_length, **kwargs
     for p in model.biot.parameters():
         p.requires_grad = False
 
-    if training_mode == "linear_probe":
-        # Replace paper's ELU+Linear head with standardized linear probe
-        # (original head preserved in ClassificationHead for fine-tuning)
-        model.classifier = nn.Sequential(
-            nn.LayerNorm(256),
-            nn.Linear(256, num_classes),
-        )
-    # else: keep paper's ClassificationHead (ELU + Linear)
+    # Keep paper's original ClassificationHead (ELU + Linear) for both LP and FT.
+    # chan_conv is always trainable (projects arbitrary channels → 18 BIOT channels).
+    for p in model.chan_conv.parameters():
+        p.requires_grad = True
 
     if training_mode == "full":
         finetune_layers = FIXED_HP["full"].get("finetune_layers", 4)
@@ -387,37 +383,35 @@ def build_cbramod(num_classes, checkpoint_path, num_channels, data_length, **kwa
         pretrained_dir=checkpoint_path,
     )
 
-    from einops.layers.torch import Rearrange, Reduce
-
     # Freeze backbone by default (linear probe)
     for p in model.backbone.parameters():
         p.requires_grad = False
 
+    # Paper's original feed_forward: flatten (b, C*S*200) → 3-layer MLP
+    # This matches the original CBraModClassifier in the STEEGFormer repo exactly.
+    flat_dim = num_channels * n_patches * 200  # = C * S * 200
+
     if training_mode == "linear_probe":
-        # Pool over patches (temporal), keep channels → channel-aware linear probe.
-        # (b, C, S, 200) → mean over S → (b, C, 200) → flatten → LayerNorm → Linear
-        # This preserves spatial (channel) information, critical for tasks like
-        # motor imagery where left/right discrimination depends on electrode location.
-        # Params: C*200 * num_classes + norms ≈ 22*200*4 = ~17.6K for BCI 2a (4 classes)
-        lp_in = num_channels * 200
+        # Paper uses same feed_forward MLP for both LP and FT
         model.classifier = nn.Sequential(
-            Reduce('b c s d -> b c d', 'mean'),   # pool over patches
-            Rearrange('b c d -> b (c d)'),          # flatten channels × embedding
-            nn.LayerNorm(lp_in),
-            nn.Linear(lp_in, num_classes),
-        )
-    elif training_mode == "full":
-        # Pool over patches first to avoid parameter explosion on long/many-channel data.
-        # (b, C, S, 200) → mean over S → (b, C, 200) → flatten → MLP
-        in_features = num_channels * 200
-        model.classifier = nn.Sequential(
-            Reduce('b c s d -> b c d', 'mean'),
-            Rearrange('b c d -> b (c d)'),
-            nn.LayerNorm(in_features),
-            nn.Linear(in_features, 256),
+            nn.Linear(flat_dim, n_patches * 200),
             nn.ELU(),
             nn.Dropout(0.1),
-            nn.Linear(256, num_classes),
+            nn.Linear(n_patches * 200, 200),
+            nn.ELU(),
+            nn.Dropout(0.1),
+            nn.Linear(200, num_classes),
+        )
+    elif training_mode == "full":
+        # Same MLP head as paper
+        model.classifier = nn.Sequential(
+            nn.Linear(flat_dim, n_patches * 200),
+            nn.ELU(),
+            nn.Dropout(0.1),
+            nn.Linear(n_patches * 200, 200),
+            nn.ELU(),
+            nn.Dropout(0.1),
+            nn.Linear(200, num_classes),
         )
         finetune_layers = FIXED_HP["full"].get("finetune_layers", 12)
         _partial_unfreeze(
@@ -425,14 +419,15 @@ def build_cbramod(num_classes, checkpoint_path, num_channels, data_length, **kwa
             finetune_layers, head_modules=[model.classifier],
         )
     elif training_mode == "lora":
-        # Frozen backbone + LoRA adapters + channel-aware LP head
         from downstream.lora import inject_lora
-        lp_in = num_channels * 200
         model.classifier = nn.Sequential(
-            Reduce('b c s d -> b c d', 'mean'),
-            Rearrange('b c d -> b (c d)'),
-            nn.LayerNorm(lp_in),
-            nn.Linear(lp_in, num_classes),
+            nn.Linear(flat_dim, n_patches * 200),
+            nn.ELU(),
+            nn.Dropout(0.1),
+            nn.Linear(n_patches * 200, 200),
+            nn.ELU(),
+            nn.Dropout(0.1),
+            nn.Linear(200, num_classes),
         )
         inject_lora(model.backbone, rank=8, alpha=16.0)
         for p in model.classifier.parameters():
@@ -479,38 +474,27 @@ def build_eegpt(num_classes, checkpoint_path, num_channels, data_length, **kwarg
     for p in model.target_encoder.parameters():
         p.requires_grad = False
 
+    # Always use paper's original 2-layer probe (LinearWithConstraint) for both LP & FT.
+    # chan_conv is always trainable (projects arbitrary channels → EEGPT channels).
+    model._use_standard_probe = False
+    for p in model.chan_conv.parameters():
+        p.requires_grad = True
+
     if training_mode == "linear_probe":
-        # Standardized single-linear probe (matches other models)
-        model._use_standard_probe = True
-        # Freeze the original 2-layer probe so only the standard one trains
-        for p in model._original_probe1.parameters():
-            p.requires_grad = False
-        for p in model._original_probe2.parameters():
-            p.requires_grad = False
+        # Encoder frozen (done above), train chan_conv + probe1 + probe2
+        pass  # probe1/probe2 are already trainable by default
     elif training_mode == "full":
-        # Paper's original 2-layer probe + partially unfrozen encoder
-        model._use_standard_probe = False
+        # Partially unfreeze encoder + train probe
         finetune_layers = FIXED_HP["full"].get("finetune_layers", 12)
         _partial_unfreeze(
             model, model.target_encoder.blocks, len(model.target_encoder.blocks),
             finetune_layers,
-            head_modules=[model._original_probe1, model._original_probe2],
+            head_modules=[model._original_probe1, model._original_probe2, model.chan_conv],
         )
-        # Freeze the standard probe so only the original one trains
-        for p in model.probe_norm.parameters():
-            p.requires_grad = False
-        model.probe_linear.weight.requires_grad = False
-        model.probe_linear.bias.requires_grad = False
     elif training_mode == "lora":
-        # Frozen encoder + LoRA adapters + standard LP head
-        model._use_standard_probe = True
-        for p in model._original_probe1.parameters():
-            p.requires_grad = False
-        for p in model._original_probe2.parameters():
-            p.requires_grad = False
         from downstream.lora import inject_lora
         inject_lora(model.target_encoder, rank=8, alpha=16.0)
-        # Standard probe head stays trainable (probe_norm + probe_linear)
+        # probe1/probe2 + chan_conv stay trainable
 
     return model
 

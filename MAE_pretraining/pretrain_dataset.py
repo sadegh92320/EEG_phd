@@ -1,6 +1,6 @@
 from torch.utils.data import Dataset
 import torch
-from MAE_pretraining.utils import resample_eeg, standardize_channel
+from MAE_pretraining.utils import resample_eeg, standardize_channel, normalize_global
 import os
 import yaml
 import numpy as np
@@ -15,67 +15,46 @@ import h5py
 
 
 
-def get_pretrain_dataset(datasetName, type):
-    dataset = None
+def get_pretrain_dataset(datasetName, type, use_global_norm=False):
+    """
+    Factory for pretraining datasets.
 
-    if datasetName == "im":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config= Path("MAE_pretraining/info_dataset/im_lab.yaml"),
-                                  new_freq=200)
+    Args:
+        datasetName: dataset identifier (must match config yaml)
+        type: 'train' or 'val'
+        use_global_norm: if True, use global normalization (preserves channel
+                         variance ratios). If False, use per-channel z-score.
+    """
+    # Map dataset name → config path
+    CONFIG_MAP = {
+        "im":            "MAE_pretraining/info_dataset/im_lab.yaml",
+        "p300":          "MAE_pretraining/info_dataset/p300.yaml",
+        "ssvep":         "MAE_pretraining/info_dataset/ssvep.yaml",
+        "hgd":           "MAE_pretraining/info_dataset/hgd.yaml",
+        "seed":          "MAE_pretraining/info_dataset/seed.yaml",
+        "seed2":         "MAE_pretraining/info_dataset/seed2.yaml",
+        "eeg_mi_bci":    "MAE_pretraining/info_dataset/eeg_mi_bci.yaml",
+        "bci_comp_iv2a": "MAE_pretraining/info_dataset/bci_comp_2a.yaml",
+        "bci_comp_iv2b": "MAE_pretraining/info_dataset/bci_comp_2b.yaml",
+        "auditory":      "MAE_pretraining/info_dataset/auditory.yaml",
+        "online":        "MAE_pretraining/info_dataset/online_bci_cla.yaml",
+        "mi":            "MAE_pretraining/info_dataset/LMI_C.yaml",
+        "mif":           "MAE_pretraining/info_dataset/LMI_F.yaml",
+        "physionet":     "MAE_pretraining/info_dataset/physionet.yaml",
+    }
 
-    if datasetName == "p300":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type,config=Path("MAE_pretraining/info_dataset/p300.yaml"),
-                                  new_freq=200)
-
-    if datasetName == "ssvep":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config=Path("MAE_pretraining/info_dataset/ssvep.yaml"),
-                                  new_freq=200)
-
-    if datasetName == "hgd":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config=Path("MAE_pretraining/info_dataset/hgd.yaml"),
-                                  new_freq=200)
-
-    if datasetName == "seed":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config=Path("MAE_pretraining/info_dataset/seed.yaml"),
-                                  new_freq=200)
-        
-    if datasetName == "seed2":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config=Path("MAE_pretraining/info_dataset/seed2.yaml"),
-                                  new_freq=200)
-
-    if datasetName == "eeg_mi_bci":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config=Path("MAE_pretraining/info_dataset/eeg_mi_bci.yaml"),
-                                  new_freq=200)
-
-    if datasetName == "bci_comp_iv2a":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config= Path("MAE_pretraining/info_dataset/bci_comp_2a.yaml"),
-                                  new_freq=200)
-
-    if datasetName == "bci_comp_iv2b":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config= Path("MAE_pretraining/info_dataset/bci_comp_2b.yaml"),
-                                  new_freq=200)
-
-    if datasetName == "auditory":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config= Path("MAE_pretraining/info_dataset/auditory.yaml"),
-                                  new_freq=200)
-
-    if datasetName == "online":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config=Path("MAE_pretraining/info_dataset/online_bci_cla.yaml"),
-                                  new_freq=200)
-
-    if datasetName == "mi":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config=Path("MAE_pretraining/info_dataset/LMI_C.yaml"),
-                                  new_freq=200)
-
-    if datasetName == "mif":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/LMI_F.yaml",
-                                  new_freq=200)
-
-    if datasetName == "physionet":
-        dataset = PretrainDataset(dataset_name=datasetName, type=type, config="MAE_pretraining/info_dataset/physionet.yaml",
-                                  new_freq=200)
-    if dataset == None:
+    config_path = CONFIG_MAP.get(datasetName)
+    if config_path is None:
         print(datasetName)
         raise ValueError("Please enter a correct dataset name")
+
+    dataset = PretrainDataset(
+        dataset_name=datasetName,
+        type=type,
+        config=Path(config_path),
+        new_freq=200,
+        use_global_norm=use_global_norm,
+    )
     
     return dataset
     
@@ -427,13 +406,15 @@ class PretrainDataset(Dataset):
 
 
 class PretrainDataset(Dataset):
-    def __init__(self, dataset_name, config, 
-                 new_freq=None, resample=False, type="train"):
+    def __init__(self, dataset_name, config,
+                 new_freq=None, resample=False, type="train",
+                 use_global_norm=False):
         super().__init__()
-        
+
         self.dataset_name = dataset_name
-        self.resample = resample 
+        self.resample = resample
         self.new_freq = new_freq
+        self.use_global_norm = use_global_norm
 
         # Load Global Channel Config
         with open(Path("MAE_pretraining/info_dataset/channel_info.yaml"), "r") as file:
@@ -494,7 +475,11 @@ class PretrainDataset(Dataset):
         if self.resample and (self.new_freq != self.old_freq):
             eeg = resample_eeg(eeg=eeg, previous_freq=self.old_freq, new_freq=self.new_freq)
             
-        eeg = standardize_channel(eeg)
-        eeg = np.clip(eeg, -500, 500)
+        if self.use_global_norm:
+            eeg = normalize_global(eeg, dataset_name=self.dataset_name)
+            eeg = np.clip(eeg, -20, 20)
+        else:
+            eeg = standardize_channel(eeg)
+            eeg = np.clip(eeg, -500, 500)
         
         return torch.from_numpy(eeg).float(), torch.tensor(self.channel_id, dtype=torch.long)

@@ -144,23 +144,23 @@ class Pipeline:
         return train_loader, valid_loader
     
 
-    def import_data_pretrain(self):
+    def import_data_pretrain(self, use_global_norm=False):
         """Import the validation and train dataloader"""
-        train_loader, valid_loader = get_dataloader(self.config)
+        train_loader, valid_loader = get_dataloader(self.config, use_global_norm=use_global_norm)
         return train_loader, valid_loader
 
 
     def load_encoder(self, pretrain=True, use_frechet=False, log_mode='pade',
-                     use_corr_masking=True, resume_ckpt=None):
+                     use_corr_masking=True, resume_ckpt=None, use_global_norm=False):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
         Ablation table (5 rows):
-            1. baseline                          → log_mode='baseline'
-            2. approx (S-I)                      → log_mode='approx', use_corr_masking=False
-            3. pade                              → log_mode='pade',   use_corr_masking=False
-            4. pade + correlation masking         → log_mode='pade',   use_corr_masking=True
-            5. pade + correlation masking + fréchet → log_mode='pade', use_corr_masking=True, use_frechet=True
+            1. baseline (parallel attn, no Riemannian) → log_mode='baseline'
+            2. approx (S-I)                            → log_mode='approx', use_corr_masking=False
+            3. pade                                    → log_mode='pade',   use_corr_masking=False
+            4. pade + correlation masking               → log_mode='pade',   use_corr_masking=True
+            5. pade + corr masking + fréchet            → log_mode='pade',   use_corr_masking=True, use_frechet=True
 
         Args:
             pretrain:         if True, train from scratch; else load existing ckpt
@@ -169,6 +169,8 @@ class Pipeline:
             use_corr_masking: if True, use correlation-aware channel masking;
                               if False, use standard random BERT masking
             resume_ckpt:      path to checkpoint to resume from (None = from scratch)
+            use_global_norm:  if True, use global normalization (preserves channel
+                              variance ratios); if False, use z-standardization
         """
         assert log_mode in ('pade', 'approx', 'baseline'), \
             f"log_mode must be 'pade', 'approx', or 'baseline', got '{log_mode}'"
@@ -177,14 +179,20 @@ class Pipeline:
         os.makedirs(CKPT_DIR, exist_ok=True)
 
         if pretrain:
-            train_loader, valid_loader = self.import_data_pretrain()
+            train_loader, valid_loader = self.import_data_pretrain(use_global_norm=use_global_norm)
 
             # ── Select model variant ──
+            # All variants use the same parallel attention architecture.
+            # The baseline freezes head_scales=0 so the Riemannian branch
+            # has zero contribution — same architecture, same param count,
+            # only the geometric signal is ablated.
             if log_mode == 'baseline':
-                print("[Ablation] Using baseline ViT (no Riemannian attention)")
-                model = EncoderDecoder()
-                use_frechet = False       # not applicable
-                use_corr_masking = False  # baseline uses its own masking
+                print("[Ablation] Parallel attention with Riemannian branch disabled (head_scales=0)")
+                model = ApproxAdaptiveRiemannBert(use_corr_masking=use_corr_masking)
+                for layer in model.encoder:
+                    layer.attn.riemannian_bias.head_scales.requires_grad = False
+                    layer.attn.riemannian_bias.head_scales.zero_()
+                use_frechet = False
             else:
                 masking_str = "corr-masking" if use_corr_masking else "random-masking"
                 print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}")
@@ -228,10 +236,11 @@ class Pipeline:
                 )
 
             # ── Run name for wandb (easy to compare in dashboard) ──
+            norm_tag = "gnorm" if use_global_norm else "zstd"
             if log_mode == 'baseline':
-                run_name = "baseline-vit"
+                run_name = f"baseline-vit-{norm_tag}"
             else:
-                run_name = f"riemann-{log_mode}"
+                run_name = f"riemann-{log_mode}-{norm_tag}"
                 if use_corr_masking:
                     run_name += "-corrmask"
                 if use_frechet and log_mode == 'pade':
@@ -262,6 +271,7 @@ class Pipeline:
                 "log_mode": log_mode,
                 "use_corr_masking": use_corr_masking,
                 "use_frechet": use_frechet and log_mode == 'pade',
+                "use_global_norm": use_global_norm,
             })
 
             callbacks = [TQDMProgressBar(refresh_rate=20), ckpt_callback]
