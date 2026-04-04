@@ -294,7 +294,7 @@ class Pipeline:
 
             trainer.fit(model, train_dataloaders=train_loader,
                         val_dataloaders=valid_loader,
-                        ckpt_path="/content/drive/MyDrive/checkpoints_pretraining/last-v22.ckpt")
+                        )
 
             self.checkpoint_path = ckpt_callback.best_model_path
             print(f"Best checkpoint: {self.checkpoint_path}")

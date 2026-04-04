@@ -64,14 +64,20 @@ def normalize_global(eeg, dataset_name=None, clamp_channels=False):
         eeg = eeg * scale
 
     # Step 2 (optional): Clamp outlier channels (bad electrodes / impedance drift)
+    # Ceiling: scale down channels with variance > 10× median (noisy electrodes)
+    # Floor:   scale up channels with variance < 0.1× median (near-dead electrodes)
+    # This bounds the max/min variance ratio to ~100, preventing rank-1 covariances
     if clamp_channels:
         ch_var = np.var(eeg, axis=1)               # (C,)
         median_var = np.median(ch_var)
         if median_var > 0:
-            threshold = 10.0 * median_var
+            ceil = 10.0 * median_var
+            floor = 0.1 * median_var
             for c in range(eeg.shape[0]):
-                if ch_var[c] > threshold:
-                    eeg[c] *= np.sqrt(threshold / ch_var[c])
+                if ch_var[c] > ceil:
+                    eeg[c] *= np.sqrt(ceil / ch_var[c])
+                elif ch_var[c] < floor and ch_var[c] > 0:
+                    eeg[c] *= np.sqrt(floor / ch_var[c])
 
     # Step 3: Global centering (same offset for all channels)
     eeg = eeg - np.mean(eeg)
