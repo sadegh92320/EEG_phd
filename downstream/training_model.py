@@ -56,8 +56,8 @@ OPTIMIZER_REGISTRY = {
 # Following ST-EEGFormer paper (Tables F.2, F.4, F.5, F.10)
 FIXED_HP = {
     "linear_probe": {  # Foundation model: frozen encoder, only train head
-        "learning_rate": 5e-3,       # Table F.2(b): 0.005
-        "batch_size": 32,
+        "learning_rate": 5e-3,       # Table F.2(b) / F.5(b): 0.005
+        "batch_size": 64,            # Table F.2(b) / F.5(b): 64
         "optimizer": "adamw",
         "weight_decay": 0.05,        # Table F.2(b): 0.05
         "num_epochs_cv": 100,         # Table F.2(b): 100
@@ -605,7 +605,7 @@ class TrainerDownstream:
             x = x.float().to(self.device)
             y = y.long().to(self.device)
 
-            # Apply Mixup if enabled (fine-tuning only)
+            # Apply Mixup if enabled
             if mixup_fn is not None:
                 x, y = mixup_fn(x, y)
 
@@ -774,7 +774,7 @@ class TrainerDownstream:
             train_subs = Subset(train_dataset, train_idx)
             val_subs = Subset(train_dataset, val_idx)
 
-            train_loader = DataLoader(train_subs, batch_size=batch_size, shuffle=True, generator = g, worker_init_fn=seed_worker)
+            train_loader = DataLoader(train_subs, batch_size=batch_size, shuffle=True, drop_last=True, generator=g, worker_init_fn=seed_worker)
             val_loader = DataLoader(val_subs, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
 
             best = -float("inf")
@@ -894,7 +894,7 @@ class TrainerDownstream:
         num_epochs = hp["num_epochs_cv"]
         early_stopper = self.early_stopper(patience=hp.get("early_stopping_patience", 10))
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g, worker_init_fn=seed_worker)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, generator=g, worker_init_fn=seed_worker)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
 
         best = -float("inf")
@@ -977,7 +977,7 @@ class TrainerDownstream:
             early_stopper = self.early_stopper(patience=patience)
 
         # Create DataLoaders for this specific fold
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g, worker_init_fn=seed_worker)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, generator=g, worker_init_fn=seed_worker)
         if use_val:
             val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
@@ -994,22 +994,14 @@ class TrainerDownstream:
         self.optimizer_name = opt_name
         optimizer = self.build_optimizer(model, {"lr": learning_rate, "weight_decay": weight_decay})
 
-        use_iter_lr = self.training_mode in ("full", "loo_finetune")
-        if use_iter_lr:
-            for pg in optimizer.param_groups:
-                pg["base_lr"] = pg["lr"]
-            loss_fn = SoftTargetCrossEntropy() if HAS_TIMM else self._build_loss_fn(label_smoothing)
-            mixup_fn = self._build_mixup_fn(self.config["num_classes"]) if HAS_TIMM else None
-            scheduler, step_per_batch = None, False
-        else:
-            loss_fn = self._build_loss_fn(label_smoothing)
-            mixup_fn = None
-            scheduler, step_per_batch = self._build_scheduler(
-                optimizer, num_epochs, warmup_epochs,
-                scheduler_type=hp.get("scheduler", "cosine"),
-                steps_per_epoch=len(train_loader),
-                max_lr=learning_rate,
-            )
+        # Paper uses per-iteration cosine LR + mixup + SoftTargetCrossEntropy
+        # for ALL modes (LP, FT, classic_nn) — not just fine-tuning.
+        use_iter_lr = True
+        for pg in optimizer.param_groups:
+            pg["base_lr"] = pg["lr"]
+        loss_fn = SoftTargetCrossEntropy() if HAS_TIMM else self._build_loss_fn(label_smoothing)
+        mixup_fn = self._build_mixup_fn(self.config["num_classes"]) if HAS_TIMM else None
+        scheduler, step_per_batch = None, False
 
         # Loop through epochs
         for epoch in range(num_epochs):
@@ -1174,7 +1166,7 @@ class TrainerDownstream:
         # Merge train + val into single training set (paper uses no val for Phase 1)
         merged_train = ConcatDataset([train_dataset, val_dataset])
 
-        train_loader = DataLoader(merged_train, batch_size=batch_size, shuffle=True, generator=g, worker_init_fn=seed_worker)
+        train_loader = DataLoader(merged_train, batch_size=batch_size, shuffle=True, drop_last=True, generator=g, worker_init_fn=seed_worker)
 
         model = deepcopy(self.model).to(self.device)
         model.load_state_dict(self.initial_state)

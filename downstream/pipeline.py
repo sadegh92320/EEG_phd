@@ -144,14 +144,15 @@ class Pipeline:
         return train_loader, valid_loader
     
 
-    def import_data_pretrain(self, use_global_norm=False):
+    def import_data_pretrain(self, use_global_norm=False, clamp_channels=False):
         """Import the validation and train dataloader"""
-        train_loader, valid_loader = get_dataloader(self.config, use_global_norm=use_global_norm)
+        train_loader, valid_loader = get_dataloader(self.config, use_global_norm=use_global_norm, clamp_channels=clamp_channels)
         return train_loader, valid_loader
 
 
     def load_encoder(self, pretrain=True, use_frechet=False, log_mode='pade',
-                     use_corr_masking=True, resume_ckpt=None, use_global_norm=False):
+                     use_corr_masking=True, resume_ckpt=None, use_global_norm=False,
+                     clamp_channels=False):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
@@ -171,6 +172,9 @@ class Pipeline:
             resume_ckpt:      path to checkpoint to resume from (None = from scratch)
             use_global_norm:  if True, use global normalization (preserves channel
                               variance ratios); if False, use z-standardization
+            clamp_channels:   if True, clamp channels with variance > 10× median
+                              (only applies when use_global_norm=True). Use if
+                              training is unstable due to noisy electrodes.
         """
         assert log_mode in ('pade', 'approx', 'baseline'), \
             f"log_mode must be 'pade', 'approx', or 'baseline', got '{log_mode}'"
@@ -179,7 +183,7 @@ class Pipeline:
         os.makedirs(CKPT_DIR, exist_ok=True)
 
         if pretrain:
-            train_loader, valid_loader = self.import_data_pretrain(use_global_norm=use_global_norm)
+            train_loader, valid_loader = self.import_data_pretrain(use_global_norm=use_global_norm, clamp_channels=clamp_channels)
 
             # ── Select model variant ──
             # All variants use the same parallel attention architecture.
@@ -272,6 +276,7 @@ class Pipeline:
                 "use_corr_masking": use_corr_masking,
                 "use_frechet": use_frechet and log_mode == 'pade',
                 "use_global_norm": use_global_norm,
+                "clamp_channels": clamp_channels,
             })
 
             callbacks = [TQDMProgressBar(refresh_rate=20), ckpt_callback]

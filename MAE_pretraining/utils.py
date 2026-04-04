@@ -32,17 +32,18 @@ UNIT_SCALE = {
     "auditory":      1.0,   # already µV — KU/SparrKULee, .npy provided by authors in µV
     "mi":            1.0,   # already µV — Lee2019, BrainAmp, .mat in µV (MOABB confirms)
     "online":        1.0,   # already µV — Neuroscan SynAmps RT, .mat in µV (var_ratio=5453 = bad channels)
-    "im":            1e-1,  # 1e-7 V → µV: multiply by 1e-7 × 1e6 = 0.1 (|mean|≈1260 → 126 µV)
+    "im":            1.0,   # likely µV with DC offset (|mean|≈1260 from baseline shift, removed by centering)
 }
 
 
-def normalize_global(eeg, dataset_name=None):
+def normalize_global(eeg, dataset_name=None, clamp_channels=False):
     """
     Global normalization that PRESERVES channel variance ratios.
 
     1. Convert to microvolts (if dataset_name provided)
-    2. Remove global mean (not per-channel)
-    3. Divide by global robust scale (MAD across all channels + time)
+    2. (Optional) Clamp outlier channels whose variance > 10× median
+    3. Remove global mean (not per-channel)
+    4. Divide by global robust scale (MAD across all channels + time)
 
     This keeps the relative variance structure across channels intact,
     which is the geometric signal that Riemannian attention exploits.
@@ -50,6 +51,10 @@ def normalize_global(eeg, dataset_name=None):
     Args:
         eeg: (C, T) single sample
         dataset_name: str — used to look up unit conversion factor
+        clamp_channels: if True, scale down channels with variance > 10×
+                        the median channel variance. Use if training is
+                        unstable due to noisy electrodes; leave off by
+                        default to let the model learn robustness.
     Returns:
         eeg: (C, T) normalized, values roughly in [-10, 10]
     """
@@ -58,10 +63,20 @@ def normalize_global(eeg, dataset_name=None):
         scale = UNIT_SCALE.get(dataset_name, 1.0)
         eeg = eeg * scale
 
-    # Step 2: Global centering (same offset for all channels)
+    # Step 2 (optional): Clamp outlier channels (bad electrodes / impedance drift)
+    if clamp_channels:
+        ch_var = np.var(eeg, axis=1)               # (C,)
+        median_var = np.median(ch_var)
+        if median_var > 0:
+            threshold = 10.0 * median_var
+            for c in range(eeg.shape[0]):
+                if ch_var[c] > threshold:
+                    eeg[c] *= np.sqrt(threshold / ch_var[c])
+
+    # Step 3: Global centering (same offset for all channels)
     eeg = eeg - np.mean(eeg)
 
-    # Step 3: Global robust scaling (same scale for all channels)
+    # Step 4: Global robust scaling (same scale for all channels)
     # MAD (median absolute deviation) is robust to outliers/artifacts
     mad = np.median(np.abs(eeg - np.median(eeg))) + 1e-8
     eeg = eeg / (mad * 1.4826)  # 1.4826 makes MAD comparable to std for Gaussian

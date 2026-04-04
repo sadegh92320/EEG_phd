@@ -242,6 +242,10 @@ class ImportBCIComp2a(ImportDataDownstream):
         # keep EEG channels only
         data = data[:22, :]
 
+        # ----- filter continuous recording BEFORE epoching -----
+        # Paper D.2: bandpass 0.1–128 Hz, notch 50/60 Hz on continuous data
+        data = self.apply_preprocessing(data)
+
         # ----- get cue onsets from GDF -----
         # Official 2a cue codes: 769,770,771,772
        
@@ -296,7 +300,6 @@ class ImportBCIComp2a(ImportDataDownstream):
                 continue
 
             eeg = data[:, start:end]
-            eeg = self.apply_preprocessing(eeg)
 
             # Convert labels to 0..3 if they are 1..4
             label = int(labels[label_idx])

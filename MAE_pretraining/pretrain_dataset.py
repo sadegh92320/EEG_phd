@@ -15,7 +15,7 @@ import h5py
 
 
 
-def get_pretrain_dataset(datasetName, type, use_global_norm=False):
+def get_pretrain_dataset(datasetName, type, use_global_norm=False, clamp_channels=False):
     """
     Factory for pretraining datasets.
 
@@ -24,6 +24,8 @@ def get_pretrain_dataset(datasetName, type, use_global_norm=False):
         type: 'train' or 'val'
         use_global_norm: if True, use global normalization (preserves channel
                          variance ratios). If False, use per-channel z-score.
+        clamp_channels: if True, clamp channels with variance > 10× median.
+                        Only used when use_global_norm=True.
     """
     # Map dataset name → config path
     CONFIG_MAP = {
@@ -54,6 +56,7 @@ def get_pretrain_dataset(datasetName, type, use_global_norm=False):
         config=Path(config_path),
         new_freq=200,
         use_global_norm=use_global_norm,
+        clamp_channels=clamp_channels,
     )
     
     return dataset
@@ -408,13 +411,14 @@ class PretrainDataset(Dataset):
 class PretrainDataset(Dataset):
     def __init__(self, dataset_name, config,
                  new_freq=None, resample=False, type="train",
-                 use_global_norm=False):
+                 use_global_norm=False, clamp_channels=False):
         super().__init__()
 
         self.dataset_name = dataset_name
         self.resample = resample
         self.new_freq = new_freq
         self.use_global_norm = use_global_norm
+        self.clamp_channels = clamp_channels
 
         # Load Global Channel Config
         with open(Path("MAE_pretraining/info_dataset/channel_info.yaml"), "r") as file:
@@ -476,7 +480,7 @@ class PretrainDataset(Dataset):
             eeg = resample_eeg(eeg=eeg, previous_freq=self.old_freq, new_freq=self.new_freq)
             
         if self.use_global_norm:
-            eeg = normalize_global(eeg, dataset_name=self.dataset_name)
+            eeg = normalize_global(eeg, dataset_name=self.dataset_name, clamp_channels=self.clamp_channels)
             eeg = np.clip(eeg, -20, 20)
         else:
             eeg = standardize_channel(eeg)
