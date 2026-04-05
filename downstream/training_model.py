@@ -17,6 +17,7 @@ from torch.optim import SGD, Adam, AdamW
 import math
 try:
     from timm.data import Mixup
+    from timm.data.mixup import mixup_target
     from timm.loss import SoftTargetCrossEntropy
     HAS_TIMM = True
 except ImportError:
@@ -56,7 +57,7 @@ OPTIMIZER_REGISTRY = {
 # Following ST-EEGFormer paper (Tables F.2, F.4, F.5, F.10)
 FIXED_HP = {
     "linear_probe": {  # Foundation model: frozen encoder, only train head
-        "learning_rate": 5e-3,       # Table F.2(b) / F.5(b): 0.005
+        "learning_rate": 5e-3,       # Table F.5(b): 0.005 (absolute, no batch scaling)
         "batch_size": 64,            # Table F.2(b) / F.5(b): 64
         "optimizer": "adamw",
         "weight_decay": 0.05,        # Table F.2(b): 0.05
@@ -69,7 +70,7 @@ FIXED_HP = {
         "head_lr_multiplier": 1.0,   # Only head trains, no separate lr needed
     },
     "full": {  # Foundation model fine-tuning (ST-EEGFormer style)
-        "learning_rate": 5e-4,       # Table F.5: blr=5e-4 (effective lr = blr × batch/256)
+        "learning_rate": 5e-4,       # Table F.5: 5e-4 (absolute, no batch scaling)
         "batch_size": 64,
         "optimizer": "adamw",
         "weight_decay": 0.05,
@@ -85,7 +86,7 @@ FIXED_HP = {
         "grad_clip": 1.0,            # Gradient clipping max norm
     },
     "classic_nn": {  # Classic NN models (EEGNet, Conformer, CTNet, DeepConvNet)
-        "learning_rate": 3e-3,       # Table F.10(a): 3e-3
+        "learning_rate": 3e-3,       # Table F.10(a): 3e-3 (absolute, no batch scaling)
         "batch_size": 64,
         "optimizer": "adamw",
         "weight_decay": 0.05,        # Table F.10(a): 0.05
@@ -310,9 +311,9 @@ class TrainerDownstream:
         Matches ST-EEGFormer's lr_sched.adjust_learning_rate().
         """
         if total_epochs <= warmup_epochs or total_epochs <= 0:
-            lr = base_lr * (min(epoch_frac + 1, warmup_epochs) / float(max(warmup_epochs, 1)))
+            lr = base_lr * (min(epoch_frac, warmup_epochs) / float(max(warmup_epochs, 1)))
         elif epoch_frac < warmup_epochs:
-            lr = base_lr * ((epoch_frac + 1) / float(warmup_epochs))
+            lr = base_lr * (epoch_frac / float(warmup_epochs))
         else:
             denom = max(1, total_epochs - warmup_epochs)
             t = (min(epoch_frac, total_epochs) - warmup_epochs) / float(denom)
@@ -605,9 +606,17 @@ class TrainerDownstream:
             x = x.float().to(self.device)
             y = y.long().to(self.device)
 
-            # Apply Mixup if enabled
-            if mixup_fn is not None:
+            # Skip single-sample batches (paper does this — causes issues with BN/mixup)
+            if x.size(0) == 1:
+                continue
+
+            # Apply Mixup if enabled; on odd-sized batches fall back to label smoothing
+            # (paper: drop_last=False, odd batch gets smoothed soft targets, not raw mixup)
+            if mixup_fn is not None and x.size(0) % 2 == 0:
                 x, y = mixup_fn(x, y)
+            elif mixup_fn is not None:
+                # odd batch: no spatial mix, but still convert to soft targets with label smoothing
+                y = mixup_target(y, mixup_fn.num_classes, lam=1.0, smoothing=mixup_fn.label_smoothing)
 
             # Only pass channel_list if the model actually uses it (foundation model)
             if self._model_uses_channels and channel_list is not None:
@@ -774,7 +783,7 @@ class TrainerDownstream:
             train_subs = Subset(train_dataset, train_idx)
             val_subs = Subset(train_dataset, val_idx)
 
-            train_loader = DataLoader(train_subs, batch_size=batch_size, shuffle=True, drop_last=True, generator=g, worker_init_fn=seed_worker)
+            train_loader = DataLoader(train_subs, batch_size=batch_size, shuffle=True, drop_last=False, generator=g, worker_init_fn=seed_worker)
             val_loader = DataLoader(val_subs, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
 
             best = -float("inf")
@@ -894,7 +903,7 @@ class TrainerDownstream:
         num_epochs = hp["num_epochs_cv"]
         early_stopper = self.early_stopper(patience=hp.get("early_stopping_patience", 10))
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, generator=g, worker_init_fn=seed_worker)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=False, generator=g, worker_init_fn=seed_worker)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
 
         best = -float("inf")
@@ -977,7 +986,7 @@ class TrainerDownstream:
             early_stopper = self.early_stopper(patience=patience)
 
         # Create DataLoaders for this specific fold
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, generator=g, worker_init_fn=seed_worker)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=False, generator=g, worker_init_fn=seed_worker)
         if use_val:
             val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
@@ -1118,13 +1127,12 @@ class TrainerDownstream:
         
     def run_LOSO(self, participant_number, name_project, train_data_pop, val_data_pop, test_data_sub, save = False):
         """
-        Paper's LOSO protocol: train on ALL N-1 subjects (train+val merged)
-        for a fixed number of epochs, no validation set, no early stopping.
-        Evaluate directly on the held-out subject at the final epoch.
+        LOSO: train on all data from N-1 subjects (both sessions merged),
+        evaluate on held-out subject.
         """
         hp = self._get_hp()
 
-        # Merge train + val into a single training set (paper uses no val for LOSO)
+        from torch.utils.data import ConcatDataset
         merged_train = ConcatDataset([train_data_pop, val_data_pop])
 
         # --- FINAL TEST EVALUATION RUN ---
@@ -1166,7 +1174,7 @@ class TrainerDownstream:
         # Merge train + val into single training set (paper uses no val for Phase 1)
         merged_train = ConcatDataset([train_dataset, val_dataset])
 
-        train_loader = DataLoader(merged_train, batch_size=batch_size, shuffle=True, drop_last=True, generator=g, worker_init_fn=seed_worker)
+        train_loader = DataLoader(merged_train, batch_size=batch_size, shuffle=True, drop_last=False, generator=g, worker_init_fn=seed_worker)
 
         model = deepcopy(self.model).to(self.device)
         model.load_state_dict(self.initial_state)

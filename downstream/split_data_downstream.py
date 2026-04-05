@@ -117,9 +117,7 @@ class DownstreamDataLoader:
 
     def get_full_subject_dataset(self, participant_number):
         """
-        Full held-out subject dataset:
-        train.h5(subject) + val.h5(subject)
-        Used as LOSO test set.
+        Full held-out subject dataset: both sessions (train.h5 + val.h5).
         """
         x_train, y_train = self._load_split_by_participant(
             self.train_data_path, participant_number=participant_number, include=True
