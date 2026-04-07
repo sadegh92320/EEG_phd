@@ -129,8 +129,11 @@ def build_riemann_loss(num_classes, checkpoint_path, num_channels, data_length, 
     return model
 
 def build_riemann_transformer_para(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
-    """Adaptive Riemannian parallel transformer (approx log map, learned SPD reference)."""
-    model = DownstreamRiemannTransformerPara(num_classes=num_classes, checkpoint_path=checkpoint_path)
+    """Adaptive Riemannian parallel transformer (Padé log map, learned SPD reference)."""
+    log_mode = kwargs.get("log_mode", "pade")
+    model = DownstreamRiemannTransformerPara(
+        num_classes=num_classes, checkpoint_path=checkpoint_path, log_mode=log_mode,
+    )
     return model
 
 def build_riemann_transformer_seq(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
@@ -980,6 +983,19 @@ def main():
         help="Training mode: 'linear_probe' (frozen backbone + linear head), "
              "'full' (unfreeze everything), 'lora' (frozen backbone + low-rank adapters + head).",
     )
+    parser.add_argument(
+        "--log_mode", type=str, default="pade",
+        choices=["pade", "approx", "baseline"],
+        help="Riemannian log map mode for riemann_para/riemann_adaptive models. "
+             "Use 'approx' for S-I ablation, 'pade' for full Padé (default).",
+    )
+    parser.add_argument(
+        "--norm", type=str, default=None,
+        choices=["global_mad", "z_standardize"],
+        help="Override downstream normalization. Use 'global_mad' for MAD-pretrained "
+             "checkpoints, 'z_standardize' for z-std-pretrained checkpoints. "
+             "If not set, uses the default from MODEL_PREPROCESS_CONFIG for the model.",
+    )
 
     args = parser.parse_args()
 
@@ -1001,12 +1017,24 @@ def main():
     }
 
     # ── Data loader (with per-model normalization) ──
+    # If --norm is provided, override the normalization method for this model
+    # while keeping the model's native sampling rate.
+    norm_mode_key = args.model
+    if args.norm is not None:
+        from downstream.downstream_dataset import MODEL_PREPROCESS_CONFIG
+        base_cfg = MODEL_PREPROCESS_CONFIG.get(args.model, MODEL_PREPROCESS_CONFIG["default"]).copy()
+        base_cfg["norm"] = {"method": args.norm}
+        override_key = f"_override_{args.model}"
+        MODEL_PREPROCESS_CONFIG[override_key] = base_cfg
+        norm_mode_key = override_key
+        print(f"  [Norm override] {args.model} → {args.norm} (sfreq={base_cfg['sfreq']})")
+
     loader = DownstreamDataLoader(
         data_path=ds_cfg["data_path"],
         config=ds_cfg["config_yaml"],
         custom_dataset_class=Downstream_Dataset,
-        norm_mode=args.model,  # maps to MODEL_PREPROCESS_CONFIG in downstream_dataset.py
-        base_sfreq=ds_cfg["sampling_rate"],  # baseline rate of stored data (250 for 2a, 256 for FACED)
+        norm_mode=norm_mode_key,
+        base_sfreq=ds_cfg["sampling_rate"],
     )
 
     # ── Build model ──
@@ -1019,6 +1047,7 @@ def main():
         base_sfreq=ds_cfg["sampling_rate"],
         training_mode=args.training_mode,
         config_yaml=ds_cfg["config_yaml"],
+        log_mode=args.log_mode,
     )
 
     print(f"\n{'='*60}")

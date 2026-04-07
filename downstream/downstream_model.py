@@ -387,8 +387,9 @@ class DownstreamRiemannTransformerPara(Downstream):
     aggregation="class" is NOT supported; use "avg" (default).
     """
 
-    def __init__(self, *args, aggregation="avg", use_frechet=False, **kwargs):
+    def __init__(self, *args, aggregation="avg", use_frechet=False, log_mode='pade', **kwargs):
         self._use_frechet = use_frechet
+        self._log_mode = log_mode
         if aggregation == "class":
             raise ValueError(
                 "DownstreamRiemannTransformerPara does not use a [CLS] token. "
@@ -399,7 +400,7 @@ class DownstreamRiemannTransformerPara(Downstream):
     def _build_encoder(self, enc_dim, depth_e):
         return nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
-                enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
+                enc_dim, nhead=8, mlp_ratio=4, log_mode=self._log_mode,
                 use_frechet=self._use_frechet,
             ) for _ in range(depth_e)
         ])

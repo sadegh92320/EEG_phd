@@ -1093,13 +1093,11 @@ class TrainerDownstream:
         
     def run_per_subject(self, name_project,participant_number, train_data_sub, val_data_sub, test_data_pop, test_data_sub, save = False):
         """
-        Paper's per-subject protocol: train on ALL of subject's data (train+val merged)
-        for fixed epochs, no validation, no early stopping. Final-epoch model.
+        Per-subject protocol: train on subject's training split, use validation
+        split for early stopping / best-model selection, evaluate on test set.
+        With limited per-subject data, validation prevents overfitting.
         """
         hp = self._get_hp()
-
-        # Merge train + val into single training set (paper uses no val for per-subject)
-        merged_train = ConcatDataset([train_data_sub, val_data_sub])
 
         # --- FINAL TEST EVALUATION RUN ---
         wandb.init(
@@ -1116,7 +1114,7 @@ class TrainerDownstream:
         metrics_sub = self.evaluate_model(
             learning_rate=hp["learning_rate"], opt_name=hp["optimizer"],
             batch_size=hp["batch_size"], num_epochs=hp["num_epochs_eval"],
-            train_dataset=merged_train, val_dataset=None, test_dataset=test_data_sub,
+            train_dataset=train_data_sub, val_dataset=val_data_sub, test_dataset=test_data_sub,
         )
 
         wandb.log(self._metrics_to_wandb(metrics_sub, prefix="self"))

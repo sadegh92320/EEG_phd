@@ -7,25 +7,23 @@ from scipy.signal import resample_poly
 from math import gcd
 
 
-# ── Per-model preprocessing configs (Table F.1 from ST-EEGFormer paper) ──
-# Keys match model names used in get_benchmark_foundation_model.py
-# - norm: normalization method and parameters
-# - sfreq: model's native sampling rate (Hz) — data is resampled from baseline (256 Hz)
 MODEL_PREPROCESS_CONFIG = {
     "steegformer":  {"norm": {"method": "z_standardize"},            "sfreq": 128},
     "labram":       {"norm": {"method": "rescale", "scale": 1e-4},  "sfreq": 200},
     "biot":         {"norm": {"method": "percentile_95"},            "sfreq": 200},
-    "cbramod":      {"norm": {"method": "rescale", "scale": 1e-3},   "sfreq": 200},  # ×1e-3: µV → mV (Table F.1 of ST-EEGFormer paper)
+    "cbramod":      {"norm": {"method": "rescale", "scale": 1e-3},   "sfreq": 200},  # ×1e-3: µV → mV 
     "eegpt":        {"norm": {"method": "rescale", "scale": 1e-3},  "sfreq": 256},  # µV → mV (V→µV conversion handled by data_unit flag)
     "bendr":        {"norm": {"method": "minmax_neg1_1"},            "sfreq": 256},
     # Your own pretrained models (pretrained at 128 Hz)
-    "baseline":          {"norm": {"method": "z_standardize"},  "sfreq": 128},
-    "encoder_gnn":       {"norm": {"method": "z_standardize"},  "sfreq": 128},
-    "riemann_loss":      {"norm": {"method": "z_standardize"},  "sfreq": 128},
-    "riemann_para":      {"norm": {"method": "z_standardize"},  "sfreq": 128},
-    "riemann_adaptive":  {"norm": {"method": "z_standardize"},  "sfreq": 128},
-    "riemann_ema":       {"norm": {"method": "z_standardize"},  "sfreq": 128},
-    "riemann_seq":       {"norm": {"method": "z_standardize"},  "sfreq": 128},
+    # Riemannian models use global_mad to preserve channel variance ratios
+    # (per-channel z-std collapses covariance → eigenvalues ≈ 1 → Padé ≈ S-I)
+    "baseline":          {"norm": {"method": "global_mad"},  "sfreq": 128},
+    "encoder_gnn":       {"norm": {"method": "global_mad"},  "sfreq": 128},
+    "riemann_loss":      {"norm": {"method": "global_mad"},  "sfreq": 128},
+    "riemann_para":      {"norm": {"method": "global_mad"},  "sfreq": 128},
+    "riemann_adaptive":  {"norm": {"method": "global_mad"},  "sfreq": 128},
+    "riemann_ema":       {"norm": {"method": "global_mad"},  "sfreq": 128},
+    "riemann_seq":       {"norm": {"method": "global_mad"},  "sfreq": 128},
     # Classic NN baselines run at the baseline 256 Hz with z-standardization
     "default":      {"norm": {"method": "z_standardize"},            "sfreq": 256},
 }
@@ -108,10 +106,30 @@ class Downstream_Dataset(Dataset):
         return len(self.class_label)
 
     def _normalize(self, trial_data):
-        """Apply model-specific normalization (Table F.1)."""
+        """Apply model-specific normalization"""
         method = self.norm_config["method"]
 
-        if method == "z_standardize":
+        if method == "global_mad":
+            # Global MAD normalization — one scale factor for all channels.
+            # Preserves inter-channel variance ratios (critical for Riemannian
+            # attention: covariance eigenvalues stay meaningful for Padé log map).
+            # Channel clamping: floor (0.1× median var) + ceiling (10× median var)
+            # to bound max variance ratio at 100, handling dead/noisy electrodes.
+            ch_var = np.var(trial_data, axis=1)
+            median_var = np.median(ch_var)
+            if median_var > 0:
+                ceil = 10.0 * median_var
+                floor = 0.1 * median_var
+                for c in range(trial_data.shape[0]):
+                    if ch_var[c] > ceil:
+                        trial_data[c] *= np.sqrt(ceil / ch_var[c])
+                    elif ch_var[c] < floor and ch_var[c] > 0:
+                        trial_data[c] *= np.sqrt(floor / ch_var[c])
+            trial_data = trial_data - np.mean(trial_data)
+            mad = np.median(np.abs(trial_data - np.median(trial_data))) + 1e-8
+            return trial_data / (mad * 1.4826)
+
+        elif method == "z_standardize":
             # Zero mean, unit variance per channel
             mean = np.mean(trial_data, axis=1, keepdims=True)
             std = np.std(trial_data, axis=1, keepdims=True) + 1e-6
