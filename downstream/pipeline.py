@@ -152,7 +152,7 @@ class Pipeline:
 
     def load_encoder(self, pretrain=True, use_frechet=False, log_mode='pade',
                      use_corr_masking=True, resume_ckpt=None, use_global_norm=False,
-                     clamp_channels=False):
+                     clamp_channels=False, use_riemannian_metric=False, metric_reg=0.01):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
@@ -161,20 +161,23 @@ class Pipeline:
             2. approx (S-I)                            → log_mode='approx', use_corr_masking=False
             3. pade                                    → log_mode='pade',   use_corr_masking=False
             4. pade + correlation masking               → log_mode='pade',   use_corr_masking=True
-            5. pade + corr masking + fréchet            → log_mode='pade',   use_corr_masking=True, use_frechet=True
+            5. pade + riemannian metric                 → log_mode='pade',   use_riemannian_metric=True
 
         Args:
-            pretrain:         if True, train from scratch; else load existing ckpt
-            use_frechet:      if True, compute Fréchet mean before training
-            log_mode:         'pade', 'approx', or 'baseline'
-            use_corr_masking: if True, use correlation-aware channel masking;
-                              if False, use standard random BERT masking
-            resume_ckpt:      path to checkpoint to resume from (None = from scratch)
-            use_global_norm:  if True, use global normalization (preserves channel
-                              variance ratios); if False, use z-standardization
-            clamp_channels:   if True, clamp channels with variance > 10× median
-                              (only applies when use_global_norm=True). Use if
-                              training is unstable due to noisy electrodes.
+            pretrain:               if True, train from scratch; else load existing ckpt
+            use_frechet:            if True, compute Fréchet mean before training
+            log_mode:               'pade', 'approx', or 'baseline'
+            use_corr_masking:       if True, use correlation-aware channel masking;
+                                    if False, use standard random BERT masking
+            resume_ckpt:            path to checkpoint to resume from (None = from scratch)
+            use_global_norm:        if True, use global normalization (preserves channel
+                                    variance ratios); if False, use z-standardization
+            clamp_channels:         if True, clamp channels with variance > 10× median
+                                    (only applies when use_global_norm=True). Use if
+                                    training is unstable due to noisy electrodes.
+            use_riemannian_metric:  if True, use learned per-head SPD metric M = L·L^T
+                                    in spatial attention (Q·M·K^T instead of Q·K^T)
+            metric_reg:             regularization weight toward identity for M
         """
         assert log_mode in ('pade', 'approx', 'baseline'), \
             f"log_mode must be 'pade', 'approx', or 'baseline', got '{log_mode}'"
@@ -199,8 +202,13 @@ class Pipeline:
                 use_frechet = False
             else:
                 masking_str = "corr-masking" if use_corr_masking else "random-masking"
-                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}")
-                model = ApproxAdaptiveRiemannBert(use_corr_masking=use_corr_masking)
+                metric_str = "+riem-metric" if use_riemannian_metric else ""
+                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}{metric_str}")
+                model = ApproxAdaptiveRiemannBert(
+                    use_corr_masking=use_corr_masking,
+                    use_riemannian_metric=use_riemannian_metric,
+                    metric_reg=metric_reg,
+                )
                 # Override log_mode in every encoder layer if needed
                 if log_mode == 'approx':
                     for layer in model.encoder:
@@ -253,6 +261,8 @@ class Pipeline:
                     run_name += "-corrmask"
                 if use_frechet and log_mode == 'pade':
                     run_name += "-frechet"
+                if use_riemannian_metric:
+                    run_name += "-metric"
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
@@ -281,6 +291,8 @@ class Pipeline:
                 "use_frechet": use_frechet and log_mode == 'pade',
                 "use_global_norm": use_global_norm,
                 "clamp_channels": clamp_channels,
+                "use_riemannian_metric": use_riemannian_metric,
+                "metric_reg": metric_reg if use_riemannian_metric else 0.0,
             })
 
             callbacks = [TQDMProgressBar(refresh_rate=20), ckpt_callback]
