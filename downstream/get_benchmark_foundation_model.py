@@ -154,9 +154,11 @@ def build_riemann_transformer_para(num_classes, checkpoint_path, num_channels, d
     """Adaptive Riemannian parallel transformer (Padé log map, learned SPD reference)."""
     log_mode = kwargs.get("log_mode", "pade")
     use_frechet = kwargs.get("use_frechet", False)
+    use_riemannian_metric = kwargs.get("use_riemannian_metric", False)
     model = DownstreamRiemannTransformerPara(
         num_classes=num_classes, checkpoint_path=checkpoint_path,
         log_mode=log_mode, use_frechet=use_frechet,
+        use_riemannian_metric=use_riemannian_metric,
     )
     return model
 
@@ -1026,6 +1028,11 @@ def main():
         help="Enable Fréchet whitening for riemann_para/riemann_adaptive models. "
              "The R_inv_sqrt buffer is loaded from the checkpoint automatically.",
     )
+    parser.add_argument(
+        "--use_riemannian_metric", action="store_true", default=False,
+        help="Enable learned per-head Riemannian metric M in spatial attention. "
+             "M = L @ L^T (Cholesky-parameterized SPD). Loaded from checkpoint.",
+    )
 
     args = parser.parse_args()
 
@@ -1079,6 +1086,7 @@ def main():
         config_yaml=ds_cfg["config_yaml"],
         log_mode=args.log_mode,
         use_frechet=args.use_frechet,
+        use_riemannian_metric=args.use_riemannian_metric,
     )
 
     print(f"\n{'='*60}")

@@ -126,13 +126,15 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                  max_embedding=2000, enc_dim=512, depth_e=8,
                  mask_prob=0.5, patch_size=16, norm_pix_loss=False,
                  use_frechet=False, frechet_path=None,
-                 use_corr_masking=True):
+                 use_corr_masking=True,
+                 use_riemannian_metric=False, metric_reg=0.01):
         super().__init__()
 
         self.config = config
         self.enc_dim = enc_dim
         self.num_channels = num_channels
         self.use_corr_masking = use_corr_masking
+        self.use_riemannian_metric = use_riemannian_metric
 
         # ── Load frozen Fréchet mean reference (optional) ──
         # When use_frechet=True, the tangent-space projection pre-whitens S
@@ -158,6 +160,8 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
                 use_frechet=use_frechet,
                 frechet_R_inv_sqrt=frechet_R_inv_sqrt,
+                use_riemannian_metric=use_riemannian_metric,
+                metric_reg=metric_reg,
             ) for _ in range(depth_e)
         ])
 
@@ -385,7 +389,23 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         return x, pad
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, weight_decay=0.05)
+        # Separate param groups: metric_L gets 0.1× learning rate for stability
+        if self.use_riemannian_metric:
+            metric_params = []
+            other_params = []
+            for name, param in self.named_parameters():
+                if 'metric_L' in name:
+                    metric_params.append(param)
+                else:
+                    other_params.append(param)
+            param_groups = [
+                {"params": other_params, "lr": 1e-3, "weight_decay": 0.05},
+                {"params": metric_params, "lr": 1e-4, "weight_decay": 0.0},  # 0.1× lr, no wd
+            ]
+            optimizer = torch.optim.AdamW(param_groups)
+        else:
+            optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, weight_decay=0.05)
+
         total_steps = self.trainer.estimated_stepping_batches
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -432,6 +452,32 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 f"NaN/Inf detected in training loss at epoch {self.current_epoch}, "
                 f"batch {batch_idx}. Check logs above for diagnostics."
             )
+
+        # ── Riemannian metric regularization: λ * Σ ||M_h - I||² ──
+        # Keeps learned metric near identity to prevent collapse/divergence
+        if self.use_riemannian_metric:
+            metric_reg_loss = sum(
+                layer.attn.metric_regularization_loss() for layer in self.encoder
+            )
+            loss = loss + metric_reg_loss
+            self.log("metric_reg_loss", metric_reg_loss, on_step=False, on_epoch=True)
+
+            # Log per-layer metric condition number for monitoring
+            for i, layer in enumerate(self.encoder):
+                if layer.attn.use_riemannian_metric:
+                    with torch.no_grad():
+                        L_tri = torch.tril(layer.attn.metric_L)
+                        M = L_tri @ L_tri.transpose(-1, -2)
+                        # M: (H2, d, d) — log mean condition number across heads
+                        eigvals = torch.linalg.eigvalsh(M)
+                        cond = (eigvals[:, -1] / eigvals[:, 0].clamp(min=1e-8))
+                        self.log(f"metric_cond_mean/layer_{i}", cond.mean(),
+                                 on_step=False, on_epoch=True)
+                        # Log Frobenius distance from identity
+                        I = torch.eye(M.shape[-1], device=M.device)
+                        dist = ((M - I) ** 2).sum(dim=(-2, -1)).mean().sqrt()
+                        self.log(f"metric_dist_I/layer_{i}", dist,
+                                 on_step=False, on_epoch=True)
 
         lr = self.trainer.optimizers[0].param_groups[0]["lr"]
         self.log("lr", lr, on_step=True, prog_bar=False)
