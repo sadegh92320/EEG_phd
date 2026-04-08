@@ -1328,16 +1328,16 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             if self.use_riemannian_metric:
                 # Low-rank Riemannian metric: M = I + U @ U^T
                 # score = Q·M·K^T / √d = (Q·K^T + (Q·U)·(K·U)^T) / √d
-                # Two small matmuls (d→r) instead of one large (d→d).
-                U = self.metric_U.float()                  # (H2, d, r)
+                U = self.metric_U                          # (H2, d, r)
                 q_f = q_s.float()
                 k_f = k_s.float()
                 # Standard dot product: Q·K^T
                 score = q_f @ k_f.transpose(-2, -1)
-                # Low-rank correction: (Q·U)·(K·U)^T
-                # q_f: (BN, H2, C, d), U: (H2, d, r) → q_U: (BN, H2, C, r)
-                q_U = torch.einsum('bhcd,hdr->bhcr', q_f, U)
-                k_U = torch.einsum('bhcd,hdr->bhcr', k_f, U)
+                # Low-rank correction: (Q·U)·(K·U)^T using @ (not einsum)
+                # @ broadcasts (BN,H2,C,d)@(1,H2,d,r) → (BN,H2,C,r) efficiently
+                U_b = U.unsqueeze(0).float()               # (1, H2, d, r)
+                q_U = q_f @ U_b                            # (BN, H2, C, r)
+                k_U = k_f @ U_b                            # (BN, H2, C, r)
                 score = (score + q_U @ k_U.transpose(-2, -1)) / (d ** 0.5)
             else:
                 score = (q_s.float() @ k_s.float().transpose(-2, -1)) / (d ** 0.5)
