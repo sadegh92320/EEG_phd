@@ -131,8 +131,10 @@ def build_riemann_loss(num_classes, checkpoint_path, num_channels, data_length, 
 def build_riemann_transformer_para(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
     """Adaptive Riemannian parallel transformer (Padé log map, learned SPD reference)."""
     log_mode = kwargs.get("log_mode", "pade")
+    use_frechet = kwargs.get("use_frechet", False)
     model = DownstreamRiemannTransformerPara(
-        num_classes=num_classes, checkpoint_path=checkpoint_path, log_mode=log_mode,
+        num_classes=num_classes, checkpoint_path=checkpoint_path,
+        log_mode=log_mode, use_frechet=use_frechet,
     )
     return model
 
@@ -996,6 +998,11 @@ def main():
              "checkpoints, 'z_standardize' for z-std-pretrained checkpoints. "
              "If not set, uses the default from MODEL_PREPROCESS_CONFIG for the model.",
     )
+    parser.add_argument(
+        "--use_frechet", action="store_true", default=False,
+        help="Enable Fréchet whitening for riemann_para/riemann_adaptive models. "
+             "The R_inv_sqrt buffer is loaded from the checkpoint automatically.",
+    )
 
     args = parser.parse_args()
 
@@ -1048,6 +1055,7 @@ def main():
         training_mode=args.training_mode,
         config_yaml=ds_cfg["config_yaml"],
         log_mode=args.log_mode,
+        use_frechet=args.use_frechet,
     )
 
     print(f"\n{'='*60}")

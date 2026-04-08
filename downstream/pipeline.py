@@ -232,12 +232,14 @@ class Pipeline:
                 print(f"[Fréchet] Injected R_inv_sqrt into {len(model.encoder)} layers")
 
                 # Periodic refresh: recompute R every 10 epochs using current weights
+                # Warm-started from the initial R so first refresh converges in 2-5 iters
                 frechet_callback = FrechetRefreshCallback(
                     train_dataloader=train_loader,
                     refresh_every=10,
                     max_batches=100,
                     enc_dim=512,
                 )
+                frechet_callback._prev_R = frechet_result['R'].numpy()
 
             # ── Run name for wandb (easy to compare in dashboard) ──
             norm_tag = "gnorm" if use_global_norm else "zstd"
@@ -294,7 +296,7 @@ class Pipeline:
 
             trainer.fit(model, train_dataloaders=train_loader,
                         val_dataloaders=valid_loader,
-                        ckpt_path="/content/drive/MyDrive/checkpoints_pretraining/last-v25.ckpt"
+                        
                         )
 
             self.checkpoint_path = ckpt_callback.best_model_path

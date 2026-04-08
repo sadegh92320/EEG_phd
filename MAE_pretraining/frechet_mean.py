@@ -44,12 +44,13 @@ def _matrix_sqrt_np(M):
     return M_sqrt
 
 
-def compute_frechet_mean(covariances, max_iters=100, tol=1e-8, verbose=True):
+def compute_frechet_mean(covariances, max_iters=100, tol=1e-8, verbose=True,
+                         warm_start=None):
     """
     Compute the Riemannian Fréchet mean of SPD matrices via iterative algorithm.
 
     Uses the Karcher flow / gradient descent on the SPD manifold:
-        1. Initialize R = arithmetic mean (a decent starting point)
+        1. Initialize R = warm_start if provided, else arithmetic mean
         2. Repeat:
            a. Compute tangent vectors: T_i = log(R^{-1/2} S_i R^{-1/2})
            b. Average tangent vector: T_avg = mean(T_i)
@@ -61,6 +62,9 @@ def compute_frechet_mean(covariances, max_iters=100, tol=1e-8, verbose=True):
         max_iters:   maximum Karcher flow iterations
         tol:         convergence tolerance on ||T_avg||_F
         verbose:     print progress
+        warm_start:  (C, C) numpy array — previous Fréchet mean to start from.
+                     When provided, Karcher typically converges in 2-5 iterations
+                     instead of 10-30, since the encoder changes slowly per epoch.
 
     Returns:
         R: (C, C) numpy array — Fréchet mean
@@ -68,8 +72,13 @@ def compute_frechet_mean(covariances, max_iters=100, tol=1e-8, verbose=True):
     N = len(covariances)
     C = covariances[0].shape[0]
 
-    # Initialize with arithmetic mean (reasonable for SPD near each other)
-    R = np.mean(covariances, axis=0)
+    if warm_start is not None and warm_start.shape == (C, C):
+        R = warm_start.copy()
+        if verbose:
+            print(f"  Warm-starting Karcher from previous Fréchet mean")
+    else:
+        # Initialize with arithmetic mean (reasonable for SPD near each other)
+        R = np.mean(covariances, axis=0)
 
     # Ensure R is SPD
     R = 0.5 * (R + R.T)
@@ -191,7 +200,8 @@ def compute_frechet_mean_from_dataloader(dataloader, eps=1e-5, max_batches=200,
 
 def compute_frechet_mean_from_model(model, dataloader, enc_dim=512,
                                      eps=1e-5, max_batches=200,
-                                     max_iters=100, verbose=True):
+                                     max_iters=100, verbose=True,
+                                     warm_start=None):
     """
     Compute Fréchet mean from the EMBEDDING-SPACE covariances that the
     Riemannian attention actually sees during training.
@@ -284,7 +294,8 @@ def compute_frechet_mean_from_model(model, dataloader, enc_dim=512,
         print(f"Total: {len(all_covs)} covariances, C={C_seen}")
         print(f"\nComputing Fréchet mean ({max_iters} max iterations)...")
 
-    R = compute_frechet_mean(all_covs, max_iters=max_iters, verbose=verbose)
+    R = compute_frechet_mean(all_covs, max_iters=max_iters, verbose=verbose,
+                             warm_start=warm_start)
     R_inv_sqrt = _matrix_sqrt_inv_np(R)
     R_sqrt = _matrix_sqrt_np(R)
 
@@ -345,6 +356,7 @@ class FrechetRefreshCallback(pl.Callback):
         self.max_batches = max_batches
         self.enc_dim = enc_dim
         self.verbose = verbose
+        self._prev_R = None  # warm-start cache
 
     def on_train_epoch_start(self, trainer, pl_module):
         epoch = trainer.current_epoch
@@ -367,9 +379,13 @@ class FrechetRefreshCallback(pl.Callback):
 
         frechet_result = compute_frechet_mean_from_model(
             pl_module, self.train_dataloader, enc_dim=self.enc_dim,
-            max_batches=self.max_batches, verbose=self.verbose
+            max_batches=self.max_batches, verbose=self.verbose,
+            warm_start=self._prev_R,
         )
         new_R_inv_sqrt = frechet_result['R_inv_sqrt']
+
+        # Cache for next warm-start
+        self._prev_R = frechet_result['R'].numpy()
 
         # Inject into every layer
         for layer in pl_module.encoder:
