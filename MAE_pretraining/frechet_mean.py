@@ -306,15 +306,24 @@ def compute_frechet_mean_from_model(model, dataloader, enc_dim=512,
 
             # Compute mean covariance for this batch (faster than per-sample)
             x_np = x_emb.float().numpy()  # (B*N, C, D)
-            # Batch covariance: mean of x @ x^T / D
-            cov_batch = np.einsum('nci,ncj->cij', x_np, x_np)  # (C, C, ...) wait
-            # Actually: (B*N, C, D) -> covariance per sample then mean
-            cov_mean = np.einsum('bcd,bce->ce', x_np, x_np) / (x_np.shape[0] * D)
-            # This is the average (C, C) covariance for this batch
+            # Batch covariance: mean of (x @ x^T / D) over all B*N samples
+            # einsum: (B*N, C, D) x (B*N, C, D) -> (C, C)
+            cov_mean = np.einsum('bcd,bed->ce', x_np, x_np) / (x_np.shape[0] * D)
 
-            # Scatter into global space
-            idx = np.ix_(ch_idx, ch_idx)  # meshgrid for (C, C) -> (total, total)
-            G_sum[idx] += cov_mean * x_np.shape[0]  # weight by num samples
+            # Regularize to ensure SPD before taking log
+            cov_mean = 0.5 * (cov_mean + cov_mean.T)
+            cov_mean += eps * np.eye(C)
+
+            # Log-Euclidean mean (Arsigny et al. 2007):
+            # R_LE = exp( mean( log(S_i) ) )
+            # Accumulate log(S) in the global channel space
+            eigvals_c, eigvecs_c = np.linalg.eigh(cov_mean)
+            eigvals_c = np.maximum(eigvals_c, 1e-10)
+            log_cov = eigvecs_c @ np.diag(np.log(eigvals_c)) @ eigvecs_c.T
+
+            # Scatter log(S) into global space
+            idx = np.ix_(ch_idx, ch_idx)
+            G_sum[idx] += log_cov * x_np.shape[0]  # weight by num samples
             G_count[idx] += x_np.shape[0]
             n_covs += x_np.shape[0]
 
@@ -322,33 +331,30 @@ def compute_frechet_mean_from_model(model, dataloader, enc_dim=512,
                 print(f"  Batch {batch_idx}: C={C}, {n_covs} total samples, "
                       f"channels seen: {(G_count.diagonal() > 0).sum()}/{total_channels}")
 
-    # Build the global mean covariance
-    # For positions with observations, use the mean; for unseen positions, use identity
-    mask_seen = G_count > 0
-    G_mean = np.eye(total_channels) * eps  # start with regularized identity
-    G_mean[mask_seen] = G_sum[mask_seen] / G_count[mask_seen]
+    # ── Log-Euclidean mean in global space ──
+    # R_LE = exp( weighted_mean( log(S_i) ) )
+    # For unseen channel pairs, log(I) = 0, so they map back to identity via exp(0) = 1
+    channels_seen = int((G_count.diagonal() > 0).sum())
 
-    # Add regularization to diagonal
-    G_mean += eps * np.eye(total_channels)
+    # Average the accumulated log-covariances
+    log_G_mean = np.zeros((total_channels, total_channels))
+    mask_seen = G_count > 0
+    log_G_mean[mask_seen] = G_sum[mask_seen] / G_count[mask_seen]
+    # Unseen positions stay at 0 → exp(0) = identity
 
     # Symmetrize
-    G_mean = 0.5 * (G_mean + G_mean.T)
+    log_G_mean = 0.5 * (log_G_mean + log_G_mean.T)
 
-    channels_seen = int((G_count.diagonal() > 0).sum())
     if verbose:
         print(f"Total: {n_covs} covariance samples across {channels_seen}/{total_channels} channels")
-        print(f"\nComputing Fréchet mean ({max_iters} max iterations)...")
+        print(f"\nComputing log-Euclidean mean (Arsigny et al. 2007)...")
 
-    # For the Fréchet mean, we use the global mean covariance as a single
-    # aggregated estimate rather than running Karcher on individual samples.
-    # This is mathematically the arithmetic mean, which for well-conditioned
-    # SPD matrices is close to the Fréchet mean. Running Karcher on the
-    # global-space aggregated covariances would require storing individual
-    # 144×144 matrices (memory heavy). The arithmetic mean + regularization
-    # is a practical compromise.
-    R = G_mean
+    # Exponentiate back to SPD manifold: R = exp(mean(log(S)))
+    eigvals_g, eigvecs_g = np.linalg.eigh(log_G_mean)
+    R = eigvecs_g @ np.diag(np.exp(eigvals_g)) @ eigvecs_g.T
 
-    # Ensure SPD
+    # Symmetrize and ensure SPD
+    R = 0.5 * (R + R.T)
     eigvals = np.linalg.eigvalsh(R)
     if eigvals.min() < 1e-6:
         R += (1e-6 - eigvals.min()) * np.eye(total_channels)
@@ -366,7 +372,7 @@ def compute_frechet_mean_from_model(model, dataloader, enc_dim=512,
     if verbose:
         eigvals = np.linalg.eigvalsh(R)
         cond = eigvals.max() / eigvals.min()
-        print(f"\nGlobal R eigenvalue range: [{eigvals.min():.4f}, {eigvals.max():.4f}]")
+        print(f"\nLog-Euclidean mean R eigenvalue range: [{eigvals.min():.4f}, {eigvals.max():.4f}]")
         print(f"Condition number: {cond:.2f}")
         print(f"Channels with data: {channels_seen}/{total_channels}")
         if cond > 1000:
