@@ -353,11 +353,21 @@ def compute_frechet_mean_from_model(model, dataloader, enc_dim=512,
     eigvals_g, eigvecs_g = np.linalg.eigh(log_G_mean)
     R = eigvecs_g @ np.diag(np.exp(eigvals_g)) @ eigvecs_g.T
 
-    # Symmetrize and ensure SPD
+    # Symmetrize and ensure SPD with bounded condition number
     R = 0.5 * (R + R.T)
-    eigvals = np.linalg.eigvalsh(R)
-    if eigvals.min() < 1e-6:
-        R += (1e-6 - eigvals.min()) * np.eye(total_channels)
+    eigvals_r, eigvecs_r = np.linalg.eigh(R)
+
+    # Clamp eigenvalues to bound condition number at ~100
+    # This prevents R_inv_sqrt from having extreme entries that cause
+    # overflow in the Padé computation. The clamping is conservative:
+    # it smooths the reference without distorting it significantly.
+    max_cond = 100.0
+    eig_max = eigvals_r.max()
+    eig_floor = eig_max / max_cond
+    eigvals_r = np.maximum(eigvals_r, eig_floor)
+
+    R = eigvecs_r @ np.diag(eigvals_r) @ eigvecs_r.T
+    R = 0.5 * (R + R.T)  # re-symmetrize after reconstruction
 
     R_inv_sqrt = _matrix_sqrt_inv_np(R)
     R_sqrt = _matrix_sqrt_np(R)
