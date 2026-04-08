@@ -72,13 +72,26 @@ def compute_frechet_mean(covariances, max_iters=100, tol=1e-8, verbose=True,
     N = len(covariances)
     C = covariances[0].shape[0]
 
+    # Stack into (N, C, C) array for vectorized operations
+    covs = np.stack(covariances, axis=0)  # (N, C, C)
+
+    # Subsample if too many covariances (>5000 is overkill for C×C estimation)
+    MAX_COVS = 5000
+    if N > MAX_COVS:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(N, MAX_COVS, replace=False)
+        covs = covs[idx]
+        N = MAX_COVS
+        if verbose:
+            print(f"  Subsampled to {N} covariances (more than enough for {C}×{C})")
+
     if warm_start is not None and warm_start.shape == (C, C):
         R = warm_start.copy()
         if verbose:
             print(f"  Warm-starting Karcher from previous Fréchet mean")
     else:
         # Initialize with arithmetic mean (reasonable for SPD near each other)
-        R = np.mean(covariances, axis=0)
+        R = np.mean(covs, axis=0)
 
     # Ensure R is SPD
     R = 0.5 * (R + R.T)
@@ -90,20 +103,22 @@ def compute_frechet_mean(covariances, max_iters=100, tol=1e-8, verbose=True,
         R_inv_sqrt = _matrix_sqrt_inv_np(R)
         R_sqrt = _matrix_sqrt_np(R)
 
-        # Compute average tangent vector
-        T_avg = np.zeros((C, C))
-        for S in covariances:
-            # Whitened matrix: R^{-1/2} S R^{-1/2}
-            M = R_inv_sqrt @ S @ R_inv_sqrt
-            # Symmetrize (numerical safety)
-            M = 0.5 * (M + M.T)
-            # Log map at identity
-            eigvals_m, eigvecs_m = np.linalg.eigh(M)
-            eigvals_m = np.maximum(eigvals_m, 1e-10)
-            log_M = eigvecs_m @ np.diag(np.log(eigvals_m)) @ eigvecs_m.T
-            T_avg += log_M
+        # Vectorized: whiten all covariances at once
+        # M_all = R^{-1/2} @ S_i @ R^{-1/2} for all i
+        M_all = R_inv_sqrt @ covs @ R_inv_sqrt  # (N, C, C) broadcast
+        M_all = 0.5 * (M_all + M_all.transpose(0, 2, 1))  # symmetrize
 
-        T_avg /= N
+        # Batched eigendecomposition
+        eigvals_all, eigvecs_all = np.linalg.eigh(M_all)  # (N, C), (N, C, C)
+        eigvals_all = np.maximum(eigvals_all, 1e-10)
+        log_eigvals = np.log(eigvals_all)  # (N, C)
+
+        # Reconstruct log matrices: V @ diag(log(λ)) @ V^T for all i
+        # log_M_all[i] = eigvecs_all[i] @ diag(log_eigvals[i]) @ eigvecs_all[i].T
+        log_M_all = eigvecs_all * log_eigvals[:, np.newaxis, :]  # (N, C, C) broadcast
+        log_M_all = log_M_all @ eigvecs_all.transpose(0, 2, 1)  # (N, C, C)
+
+        T_avg = log_M_all.mean(axis=0)  # (C, C)
 
         # Check convergence
         step_size = np.linalg.norm(T_avg, 'fro')

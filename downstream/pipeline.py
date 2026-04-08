@@ -215,7 +215,7 @@ class Pipeline:
                 print("[Fréchet] Computing initial R from embedding-space covariances...")
                 frechet_result = compute_frechet_mean_from_model(
                     model, train_loader, enc_dim=512,
-                    max_batches=200, verbose=True
+                    max_batches=30, verbose=True
                 )
                 frechet_R_inv_sqrt = frechet_result['R_inv_sqrt']
 
