@@ -389,7 +389,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         return x, pad
 
     def configure_optimizers(self):
-        # Separate param groups: metric_L gets 0.1× learning rate for stability
+        # Separate param groups: metric_U gets 0.1× learning rate for stability
         if self.use_riemannian_metric:
             metric_params = []
             other_params = []

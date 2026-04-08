@@ -1255,9 +1255,12 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.metric_reg = metric_reg
         self.metric_rank = 8  # rank of the correction term
         if use_riemannian_metric:
-            # U: (H2, d, r) — initialized near zero for smooth start from I
+            # U: (H2, d, r) — initialized with small random values.
+            # Cannot be zero: the correction Q·U·U^T·K^T is quadratic in U,
+            # so grad w.r.t. U vanishes at U=0 (saddle point).
+            # Scale 0.01 keeps M ≈ I + 0.0001·(noise) at init → near-identity start.
             self.metric_U = nn.Parameter(
-                torch.zeros(self.heads_per_branch, self.dim_head, self.metric_rank) * 0.01
+                torch.randn(self.heads_per_branch, self.dim_head, self.metric_rank) * 0.01
             )
 
         # Adaptive Riemannian bias for spatial heads (global channel space)

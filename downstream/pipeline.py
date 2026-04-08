@@ -175,8 +175,8 @@ class Pipeline:
             clamp_channels:         if True, clamp channels with variance > 10× median
                                     (only applies when use_global_norm=True). Use if
                                     training is unstable due to noisy electrodes.
-            use_riemannian_metric:  if True, use learned per-head SPD metric M = L·L^T
-                                    in spatial attention (Q·M·K^T instead of Q·K^T)
+            use_riemannian_metric:  if True, use learned per-head low-rank SPD metric
+                                    M = I + U·U^T in spatial attention (Q·M·K^T)
             metric_reg:             regularization weight toward identity for M
         """
         assert log_mode in ('pade', 'approx', 'baseline'), \
