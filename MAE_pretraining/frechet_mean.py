@@ -130,6 +130,19 @@ def compute_frechet_mean(covariances, max_iters=100, tol=1e-8, verbose=True,
                 print(f"  Converged at iteration {it}")
             break
 
+        # Early stopping: if diverging, revert to best iterate
+        if it == 0:
+            best_step = step_size
+            best_R = R.copy()
+        elif step_size < best_step:
+            best_step = step_size
+            best_R = R.copy()
+        elif step_size > best_step * 2.0:
+            if verbose:
+                print(f"  Diverging at iteration {it} (step={step_size:.4e} > "
+                      f"2×best={best_step:.4e}). Reverting to best iterate.")
+            return best_R
+
         # Exponential map: update R = R^{1/2} @ exp(T_avg) @ R^{1/2}
         eigvals_t, eigvecs_t = np.linalg.eigh(T_avg)
         exp_T = eigvecs_t @ np.diag(np.exp(eigvals_t)) @ eigvecs_t.T
