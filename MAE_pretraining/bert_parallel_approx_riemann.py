@@ -465,8 +465,8 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             # Log per-layer metric condition number for monitoring
             for i, layer in enumerate(self.encoder):
                 if layer.attn.use_riemannian_metric:
-                    with torch.no_grad():
-                        L_tri = torch.tril(layer.attn.metric_L)
+                    with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+                        L_tri = torch.tril(layer.attn.metric_L).float()
                         M = L_tri @ L_tri.transpose(-1, -2)
                         # M: (H2, d, d) — log mean condition number across heads
                         eigvals = torch.linalg.eigvalsh(M)
