@@ -1242,17 +1242,22 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.att_dropout = att_dropout
 
-        # ── Learned Riemannian metric for spatial heads ──
-        # Per-head SPD metric M_h = L_h @ L_h^T, initialized as I.
-        # Changes attention from q·k^T to q·M·k^T, reweighting directions
-        # by learned geometric importance.
+        # ── Learned low-rank Riemannian metric for spatial heads ──
+        # Per-head SPD metric M_h = I + U_h @ U_h^T (rank-r correction).
+        # At init U=0 → M=I → standard dot product. During training, U learns
+        # to amplify/suppress directions in the tangent space based on geometric
+        # informativeness. Low-rank is motivated by the intrinsic low
+        # dimensionality of EEG spatial covariance (~8-12 brain rhythm sources).
+        #
+        # Attention: score = Q·M·K^T = Q·K^T + (Q·U)·(K·U)^T
+        # The second term adds two small matmuls (d→r projection), ~5% overhead.
         self.use_riemannian_metric = use_riemannian_metric
         self.metric_reg = metric_reg
+        self.metric_rank = 8  # rank of the correction term
         if use_riemannian_metric:
-            # L is lower-triangular, one per spatial head: (H2, d, d)
-            # Initialize as identity → M starts as I → standard dot product
-            self.metric_L = nn.Parameter(
-                torch.eye(self.dim_head).unsqueeze(0).repeat(self.heads_per_branch, 1, 1)
+            # U: (H2, d, r) — initialized near zero for smooth start from I
+            self.metric_U = nn.Parameter(
+                torch.zeros(self.heads_per_branch, self.dim_head, self.metric_rank) * 0.01
             )
 
         # Adaptive Riemannian bias for spatial heads (global channel space)
@@ -1321,13 +1326,19 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         with torch.amp.autocast('cuda', enabled=False), \
              torch.amp.autocast('cpu', enabled=False):
             if self.use_riemannian_metric:
-                # Learned Riemannian metric: score = q @ M @ k^T / sqrt(d)
-                # where M = L @ L^T is per-head SPD matrix (H2, d, d)
-                L = torch.tril(self.metric_L)           # enforce lower-triangular
-                M = L @ L.transpose(-1, -2)             # (H2, d, d) — guaranteed SPD
-                # q_s: (BN, H2, C, d), M: (H2, d, d) → q_M: (BN, H2, C, d)
-                q_M = torch.einsum('bhcd,hde->bhce', q_s.float(), M.float())
-                score = (q_M @ k_s.float().transpose(-2, -1)) / (d ** 0.5)
+                # Low-rank Riemannian metric: M = I + U @ U^T
+                # score = Q·M·K^T / √d = (Q·K^T + (Q·U)·(K·U)^T) / √d
+                # Two small matmuls (d→r) instead of one large (d→d).
+                U = self.metric_U.float()                  # (H2, d, r)
+                q_f = q_s.float()
+                k_f = k_s.float()
+                # Standard dot product: Q·K^T
+                score = q_f @ k_f.transpose(-2, -1)
+                # Low-rank correction: (Q·U)·(K·U)^T
+                # q_f: (BN, H2, C, d), U: (H2, d, r) → q_U: (BN, H2, C, r)
+                q_U = torch.einsum('bhcd,hdr->bhcr', q_f, U)
+                k_U = torch.einsum('bhcd,hdr->bhcr', k_f, U)
+                score = (score + q_U @ k_U.transpose(-2, -1)) / (d ** 0.5)
             else:
                 score = (q_s.float() @ k_s.float().transpose(-2, -1)) / (d ** 0.5)
             score = score + riem_bias.float()
@@ -1344,13 +1355,13 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         return self.dropout(out)
 
     def metric_regularization_loss(self):
-        """Regularization toward identity: λ * ||M - I||_F² summed over heads."""
+        """Regularization toward identity: λ * ||U||_F² (keeps M close to I).
+        Since M = I + U·U^T, ||M - I||_F² = ||U·U^T||_F². We use the simpler
+        ||U||_F² as a proxy (upper bound), which also penalizes large singular
+        values of U and prevents metric divergence."""
         if not self.use_riemannian_metric:
             return 0.0
-        L = torch.tril(self.metric_L)
-        M = L @ L.transpose(-1, -2)  # (H2, d, d)
-        I = torch.eye(self.dim_head, device=M.device, dtype=M.dtype).unsqueeze(0)
-        return self.metric_reg * ((M - I) ** 2).sum()
+        return self.metric_reg * (self.metric_U ** 2).sum()
 
 
 class AdaptiveRiemannianParallelTransformer(nn.Module):

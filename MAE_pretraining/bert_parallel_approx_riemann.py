@@ -394,7 +394,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             metric_params = []
             other_params = []
             for name, param in self.named_parameters():
-                if 'metric_L' in name:
+                if 'metric_U' in name:
                     metric_params.append(param)
                 else:
                     other_params.append(param)
@@ -462,22 +462,23 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             loss = loss + metric_reg_loss
             self.log("metric_reg_loss", metric_reg_loss, on_step=False, on_epoch=True)
 
-            # Log per-layer metric condition number for monitoring
+            # Log per-layer metric stats for monitoring
             for i, layer in enumerate(self.encoder):
                 if layer.attn.use_riemannian_metric:
-                    with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
-                        L_tri = torch.tril(layer.attn.metric_L).float()
-                        M = L_tri @ L_tri.transpose(-1, -2)
-                        # M: (H2, d, d) — log mean condition number across heads
-                        eigvals = torch.linalg.eigvalsh(M)
-                        cond = (eigvals[:, -1] / eigvals[:, 0].clamp(min=1e-8))
-                        self.log(f"metric_cond_mean/layer_{i}", cond.mean(),
+                    with torch.no_grad():
+                        U = layer.attn.metric_U  # (H2, d, r)
+                        # ||U||_F per head — how far M has moved from I
+                        u_norm = (U ** 2).sum(dim=(-2, -1)).sqrt().mean()
+                        self.log(f"metric_U_norm/layer_{i}", u_norm,
                                  on_step=False, on_epoch=True)
-                        # Log Frobenius distance from identity
-                        I = torch.eye(M.shape[-1], device=M.device)
-                        dist = ((M - I) ** 2).sum(dim=(-2, -1)).mean().sqrt()
-                        self.log(f"metric_dist_I/layer_{i}", dist,
-                                 on_step=False, on_epoch=True)
+                        # Singular values of U — shows which rank directions are active
+                        # Only compute occasionally (every 100 steps) to save time
+                        if batch_idx % 100 == 0:
+                            sv = torch.linalg.svdvals(U.float())  # (H2, r)
+                            self.log(f"metric_sv_max/layer_{i}", sv[:, 0].mean(),
+                                     on_step=False, on_epoch=True)
+                            self.log(f"metric_sv_min/layer_{i}", sv[:, -1].mean(),
+                                     on_step=False, on_epoch=True)
 
         lr = self.trainer.optimizers[0].param_groups[0]["lr"]
         self.log("lr", lr, on_step=True, prog_bar=False)
