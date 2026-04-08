@@ -431,10 +431,25 @@ class FrechetRefreshCallback(pl.Callback):
         self.verbose = verbose
         self._prev_R = None  # warm-start cache
 
+    def _should_refresh(self, epoch):
+        """
+        Adaptive refresh schedule:
+          - Epochs 1-10:  refresh every 3 epochs (encoder changing fast)
+          - Epochs 11-20: refresh every 5 epochs (stabilizing)
+          - Epochs 21+:   refresh every `refresh_every` epochs (default 10)
+        """
+        if epoch == 0:
+            return False
+        if epoch <= 10:
+            return epoch % 3 == 0
+        elif epoch <= 20:
+            return epoch % 5 == 0
+        else:
+            return epoch % self.refresh_every == 0
+
     def on_train_epoch_start(self, trainer, pl_module):
         epoch = trainer.current_epoch
-        # Skip epoch 0 (R was just computed at init)
-        if epoch == 0 or epoch % self.refresh_every != 0:
+        if not self._should_refresh(epoch):
             return
 
         # Check that model actually uses Fréchet
