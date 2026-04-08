@@ -22,6 +22,26 @@ try:
     HAS_TIMM = True
 except ImportError:
     HAS_TIMM = False
+
+
+class WeightedSoftTargetCrossEntropy(torch.nn.Module):
+    """SoftTargetCrossEntropy with per-class weights for imbalanced datasets.
+
+    timm's SoftTargetCrossEntropy computes:  -sum(target * log_softmax(pred)) / B
+    This version multiplies each class's contribution by its weight before summing,
+    so rare classes contribute more to the loss (same idea as nn.CrossEntropyLoss(weight=...)).
+
+    When weights are None or all ones, this is numerically identical to the original.
+    """
+    def __init__(self, class_weights=None):
+        super().__init__()
+        self.register_buffer("class_weights", class_weights)
+
+    def forward(self, x, target):
+        loss = -target * torch.nn.functional.log_softmax(x, dim=-1)
+        if self.class_weights is not None:
+            loss = loss * self.class_weights.unsqueeze(0)  # (B, C) * (1, C)
+        return loss.sum(dim=-1).mean()
 from torchmetrics import Accuracy, Recall, Precision, F1Score, ConfusionMatrix, AUROC
 from torchmetrics.classification import CohenKappa
 import sys
@@ -348,12 +368,37 @@ class TrainerDownstream:
             num_classes=num_classes,
         )
 
-    def _build_loss_fn(self, label_smoothing=0.0):
-        """Build loss function with optional label smoothing."""
-        nc = self.config["num_classes"]
+    def _build_loss_fn(self, label_smoothing=0.0, class_weights=None):
+        """Build loss function with optional label smoothing and class weighting.
+
+        class_weights: optional tensor of per-class weights (computed from
+        inverse class frequency).  For balanced datasets the weights are ~1.0
+        everywhere, so numerically identical to unweighted CE.
+        """
         if label_smoothing > 0:
-            return torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+            return torch.nn.CrossEntropyLoss(
+                weight=class_weights, label_smoothing=label_smoothing)
+        if class_weights is not None:
+            return torch.nn.CrossEntropyLoss(weight=class_weights)
         return self.loss_fn
+
+    @staticmethod
+    def _compute_class_weights(dataset):
+        """Compute inverse-frequency class weights from a dataset.
+
+        Returns a float32 tensor of shape (num_classes,) where each weight is
+        proportional to 1/count, normalized so they sum to num_classes.
+        For a perfectly balanced dataset this gives [1.0, 1.0, ...].
+        """
+        labels = []
+        for i in range(len(dataset)):
+            y = dataset[i][1]
+            labels.append(y.item() if hasattr(y, 'item') else int(y))
+        labels = np.array(labels)
+        counts = np.bincount(labels)
+        weights = 1.0 / counts
+        weights = weights / weights.sum() * len(counts)  # normalize → sum = num_classes
+        return torch.tensor(weights, dtype=torch.float32)
 
     @staticmethod
     def _build_scheduler(optimizer, num_epochs, warmup_epochs=0,
@@ -795,16 +840,17 @@ class TrainerDownstream:
             optimizer = self.build_optimizer(model, {"lr": learning_rate, "weight_decay": weight_decay})
 
             # Fine-tuning: per-iteration cosine LR + Mixup + SoftTargetCrossEntropy
+            class_weights = self._compute_class_weights(train_subs).to(self.device)
             use_iter_lr = self.training_mode in ("full", "loo_finetune")
             if use_iter_lr:
                 # Store base_lr in param groups for per-iteration adjustment
                 for pg in optimizer.param_groups:
                     pg["base_lr"] = pg["lr"]
-                loss_fn = SoftTargetCrossEntropy() if HAS_TIMM else self._build_loss_fn(label_smoothing)
+                loss_fn = WeightedSoftTargetCrossEntropy(class_weights) if HAS_TIMM else self._build_loss_fn(label_smoothing, class_weights)
                 mixup_fn = self._build_mixup_fn(self.config["num_classes"]) if HAS_TIMM else None
                 scheduler, step_per_batch = None, False
             else:
-                loss_fn = self._build_loss_fn(label_smoothing)
+                loss_fn = self._build_loss_fn(label_smoothing, class_weights)
                 mixup_fn = None
                 scheduler, step_per_batch = self._build_scheduler(
                     optimizer, num_epochs, warmup_epochs,
@@ -913,15 +959,16 @@ class TrainerDownstream:
         self.optimizer_name = opt_name
         optimizer = self.build_optimizer(model, {"lr": learning_rate, "weight_decay": weight_decay})
 
+        class_weights = self._compute_class_weights(train_dataset).to(self.device)
         use_iter_lr = self.training_mode in ("full", "loo_finetune")
         if use_iter_lr:
             for pg in optimizer.param_groups:
                 pg["base_lr"] = pg["lr"]
-            loss_fn = SoftTargetCrossEntropy() if HAS_TIMM else self._build_loss_fn(label_smoothing)
+            loss_fn = WeightedSoftTargetCrossEntropy(class_weights) if HAS_TIMM else self._build_loss_fn(label_smoothing, class_weights)
             mixup_fn = self._build_mixup_fn(self.config["num_classes"]) if HAS_TIMM else None
             scheduler, step_per_batch = None, False
         else:
-            loss_fn = self._build_loss_fn(label_smoothing)
+            loss_fn = self._build_loss_fn(label_smoothing, class_weights)
             mixup_fn = None
             scheduler, step_per_batch = self._build_scheduler(
                 optimizer, num_epochs, warmup_epochs,
@@ -1003,14 +1050,27 @@ class TrainerDownstream:
         self.optimizer_name = opt_name
         optimizer = self.build_optimizer(model, {"lr": learning_rate, "weight_decay": weight_decay})
 
-        # Paper uses per-iteration cosine LR + mixup + SoftTargetCrossEntropy
-        # for ALL modes (LP, FT, classic_nn) — not just fine-tuning.
-        use_iter_lr = True
-        for pg in optimizer.param_groups:
-            pg["base_lr"] = pg["lr"]
-        loss_fn = SoftTargetCrossEntropy() if HAS_TIMM else self._build_loss_fn(label_smoothing)
-        mixup_fn = self._build_mixup_fn(self.config["num_classes"]) if HAS_TIMM else None
-        scheduler, step_per_batch = None, False
+        # Per-iteration cosine LR + Mixup only for fine-tuning modes
+        # (linear_probe and classic_nn use standard cosine scheduler, no mixup)
+        # Class weighting: computed from train labels — for balanced datasets
+        # weights ≈ [1,1,...] so numerically identical to unweighted CE.
+        class_weights = self._compute_class_weights(train_dataset).to(self.device)
+        use_iter_lr = self.training_mode in ("full", "loo_finetune")
+        if use_iter_lr:
+            for pg in optimizer.param_groups:
+                pg["base_lr"] = pg["lr"]
+            loss_fn = WeightedSoftTargetCrossEntropy(class_weights) if HAS_TIMM else self._build_loss_fn(label_smoothing, class_weights)
+            mixup_fn = self._build_mixup_fn(self.config["num_classes"]) if HAS_TIMM else None
+            scheduler, step_per_batch = None, False
+        else:
+            loss_fn = self._build_loss_fn(label_smoothing, class_weights)
+            mixup_fn = None
+            scheduler, step_per_batch = self._build_scheduler(
+                optimizer, num_epochs, warmup_epochs,
+                scheduler_type=hp.get("scheduler", "cosine"),
+                steps_per_epoch=len(train_loader),
+                max_lr=learning_rate,
+            )
 
         # Loop through epochs
         for epoch in range(num_epochs):
@@ -1126,12 +1186,31 @@ class TrainerDownstream:
     def run_LOSO(self, participant_number, name_project, train_data_pop, val_data_pop, test_data_sub, save = False):
         """
         LOSO: train on all data from N-1 subjects (both sessions merged),
-        evaluate on held-out subject.
+        with 90/10 stratified split for early stopping + best-model selection.
+        Evaluate on held-out subject.
         """
         hp = self._get_hp()
 
-        from torch.utils.data import ConcatDataset
-        merged_train = ConcatDataset([train_data_pop, val_data_pop])
+        from torch.utils.data import ConcatDataset, Subset
+
+        merged_all = ConcatDataset([train_data_pop, val_data_pop])
+
+        # Extract labels for stratified split
+        all_labels = []
+        for i in range(len(merged_all)):
+            y = merged_all[i][1]
+            all_labels.append(y.item() if hasattr(y, 'item') else int(y))
+        all_labels = np.array(all_labels)
+
+        all_idx = np.arange(len(merged_all))
+        train_idx, val_idx = train_test_split(
+            all_idx, test_size=0.1, random_state=92,
+            shuffle=True,
+            stratify=all_labels if len(np.unique(all_labels)) > 1 else None,
+        )
+
+        merged_train = Subset(merged_all, train_idx)
+        merged_val = Subset(merged_all, val_idx)
 
         # --- FINAL TEST EVALUATION RUN ---
         wandb.init(
@@ -1144,11 +1223,12 @@ class TrainerDownstream:
         )
         wandb.define_metric("epoch")
         wandb.define_metric("train_loss", step_metric="epoch")
+        wandb.define_metric("val_acc", step_metric="epoch")
 
         metrics_sub = self.evaluate_model(
             learning_rate=hp["learning_rate"], opt_name=hp["optimizer"],
             batch_size=hp["batch_size"], num_epochs=hp["num_epochs_eval"],
-            train_dataset=merged_train, val_dataset=None, test_dataset=test_data_sub,
+            train_dataset=merged_train, val_dataset=merged_val, test_dataset=test_data_sub,
         )
 
         wandb.log(self._metrics_to_wandb(metrics_sub, prefix="test"))
@@ -1180,15 +1260,16 @@ class TrainerDownstream:
         self.optimizer_name = opt_name
         optimizer = self.build_optimizer(model, {"lr": learning_rate, "weight_decay": hp["weight_decay"]})
 
+        class_weights = self._compute_class_weights(merged_train).to(self.device)
         use_iter_lr = self.training_mode in ("full", "loo_finetune")
         if use_iter_lr:
             for pg in optimizer.param_groups:
                 pg["base_lr"] = pg["lr"]
-            loss_fn = SoftTargetCrossEntropy() if HAS_TIMM else self._build_loss_fn(label_smoothing)
+            loss_fn = WeightedSoftTargetCrossEntropy(class_weights) if HAS_TIMM else self._build_loss_fn(label_smoothing, class_weights)
             mixup_fn = self._build_mixup_fn(self.config["num_classes"]) if HAS_TIMM else None
             scheduler, step_per_batch = None, False
         else:
-            loss_fn = self._build_loss_fn(label_smoothing)
+            loss_fn = self._build_loss_fn(label_smoothing, class_weights)
             mixup_fn = None
             scheduler, step_per_batch = self._build_scheduler(
                 optimizer, num_epochs, warmup_epochs,

@@ -180,7 +180,7 @@ class ImportBinocularBis(DataImport):
 
             f.attrs["split"] = split_name
             f.attrs["n_samples"] = count
-            f.attrs["sampling_rate"] = 128.0
+            f.attrs["sampling_rate"] = 250.0
             f.attrs["n_channels"] = 64
 
     def _extract_trials(self, path, epoch):
@@ -330,34 +330,57 @@ class ImportBinocular(DataImport): # Inherit from DataImport if needed
 
     def _extract_trials_from_data(self, data_array, epoch_id):
         """
-        Processes a single trial from pre-loaded data.
+        Processes a single trial from pre-loaded data, then applies
+        sliding-window augmentation per the paper:
+          - 1 s window with 0.1 s step over the full 2 s trial
+          - yields 11 overlapping segments per trial
+
+        Returns:
+            trials: list of np.ndarray (C, win_samples)  — 11 segments
+            labels: list of int                           — same label repeated
         """
-        labels = data_array[2]
+        labels_row = data_array[2]
         epochs = data_array[3]
         data   = data_array[4:, :]
 
-        # Selection using the boolean mask logic we discussed
         mask = (epochs == epoch_id)
         trial_data = data[:, mask]
-        
-        # Get the label (assuming it's the same for the whole trial)
-        trial_label = labels[mask][0]
+        trial_label = labels_row[mask][0] - 1  # 0-index: raw labels are 1–40, need 0–39
 
-        # Preprocessing
-        processed_data = self.apply_preprocessing_pretrain(trial_data)
+        # Preprocessing (paper: bandpass 0.1–128 Hz, notch 50/60, keep 250 Hz)
+        processed_data = self._preprocess_binocular(trial_data)
 
-        return [processed_data], [trial_label]
+        # Sliding window: 1 s window, 0.1 s step at 250 Hz
+        # → win = 250 samples, step = 25 samples
+        # → (500 - 250) / 25 + 1 = 11 segments from a 2 s trial
+        C, T = processed_data.shape
+        win = 250   # 1 s at 250 Hz
+        step = 25   # 0.1 s at 250 Hz
 
-    def apply_preprocessing_pretrain(self, array):
+        trials = []
+        labels = []
+        for start in range(0, T - win + 1, step):
+            segment = processed_data[:, start:start + win]
+            trials.append(segment)
+            labels.append(trial_label)
+
+        return trials, labels
+
+    def _preprocess_binocular(self, array):
+        """Paper preprocessing for Binocular SSVEP:
+        - Notch 50 Hz and 60 Hz
+        - Bandpass 0.1–128 Hz (at 250 Hz native, effective upper = ~124 Hz)
+        - Keep native 250 Hz (no resampling — paper: 'kept at 250 Hz')
+        """
         raw_mne_object = self.mne_process.create_mne_object(array, "dataset")
         raw_mne_object.notch_filter(freqs=50, method="iir")
         raw_mne_object.notch_filter(freqs=60, method="iir")
-        raw_mne_object.filter(l_freq=0.1, h_freq=64.0, method="iir")
-        raw_mne_object.resample(sfreq=128.0)
+        raw_mne_object.filter(l_freq=0.1, h_freq=None, method="iir")  # high-pass only; Nyquist already < 128
+        # No resampling — keep at native 250 Hz
         eeg_data = raw_mne_object.get_data()
         return eeg_data
 
 
 if __name__ == "__main__":
     data_import = ImportBinocular()
-    data_import.import_data_to_hdf5(input_dir="/Users/sadeghemami/Downloads/Binocular-Swap_Vision", output_dir="downstream/data/binocular")
+    data_import.import_data_to_hdf5(input_dir="/Volumes/Elements/EEG_data/downstream/Binocular-Swap_Vision", output_dir="downstream/data/binocular")

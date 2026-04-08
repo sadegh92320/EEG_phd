@@ -109,6 +109,28 @@ DATASET_CONFIGS = {
         "data_length": 142,  # ~0.284s * 500Hz
         "sampling_rate": 500,
     },
+    "physio_P300": {
+        "num_classes": 2,
+        "metric": "bacc",
+        "model_path": "downstream/saved_models",
+        "result_output": "downstream/results",
+        "data_path": "downstream/data/physio_P300",
+        "config_yaml": "downstream/info_dataset/physio_P300.yaml",
+        "num_channels": 64,
+        "data_length": 539,  # ~2.1s * 256Hz
+        "sampling_rate": 256,
+    },
+    "binocular": {
+        "num_classes": 40,
+        "metric": "accuracy",
+        "model_path": "downstream/saved_models",
+        "result_output": "downstream/results",
+        "data_path": "downstream/data/binocular",
+        "config_yaml": "downstream/info_dataset/binocular.yaml",
+        "num_channels": 64,
+        "data_length": 250,  # 1s * 250Hz (sliding window segments)
+        "sampling_rate": 250,
+    },
 }
 
 

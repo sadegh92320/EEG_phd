@@ -69,7 +69,7 @@ channel_list:
 frequency: 256
 data_unit: V   # MNE read_raw_edf → get_data() returns Volts
 
-num_participant: 8
+num_participant: 12
 num_classes: 2
 
 data_file: downstream/data/physio_P300

@@ -70,5 +70,6 @@ frequency: 250
 data_unit: uV  # CSV source data already in µV
 
 num_participant: 35
+num_classes: 40
 
 data_file: downstream/data/binocular
