@@ -314,6 +314,7 @@ def build_biot(num_classes, checkpoint_path, num_channels, data_length, **kwargs
         heads=8,
         depth=4,
         n_classes=num_classes,
+        n_channels=18,  # Must match chan_conv output (18) and pretrained checkpoint
     )
 
     if checkpoint_path is not None:

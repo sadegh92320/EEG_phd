@@ -217,7 +217,7 @@ class Pipeline:
                     model, train_loader, enc_dim=512,
                     max_batches=30, eps=1e-2, verbose=True
                 )
-                frechet_R_inv_sqrt = frechet_result['R_inv_sqrt']
+                frechet_R_inv_sqrt = frechet_result['R_inv_sqrt']  # (144, 144)
 
                 frechet_save_path = os.path.join(CKPT_DIR, "frechet_mean.pt")
                 torch.save(frechet_result, frechet_save_path)
@@ -232,17 +232,16 @@ class Pipeline:
                     log_map.register_buffer(
                         'R_inv_sqrt', frechet_R_inv_sqrt.clone()
                     )
-                print(f"[Fréchet] Injected R_inv_sqrt into {len(model.encoder)} layers")
+                print(f"[Fréchet] Injected R_inv_sqrt ({frechet_R_inv_sqrt.shape}) "
+                      f"into {len(model.encoder)} layers")
 
                 # Periodic refresh: recompute R every 10 epochs using current weights
-                # Warm-started from the initial R so first refresh converges in 2-5 iters
                 frechet_callback = FrechetRefreshCallback(
                     train_dataloader=train_loader,
                     refresh_every=10,
-                    max_batches=100,
+                    max_batches=20,
                     enc_dim=512,
                 )
-                frechet_callback._prev_R = frechet_result['R'].numpy()
 
             # ── Run name for wandb (easy to compare in dashboard) ──
             norm_tag = "gnorm" if use_global_norm else "zstd"
