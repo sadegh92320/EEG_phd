@@ -1242,13 +1242,6 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.att_dropout = att_dropout
 
-        # Temporal covariance dynamics bias — mirrors spatial Riemannian bias
-        # on the temporal axis using pairwise Frobenius distance of per-timestep
-        # channel covariances.
-        self.temporal_cov_bias = TemporalCovarianceAttentionBias(
-            num_heads=self.heads_per_branch,
-        )
-
         # Adaptive Riemannian bias for spatial heads (global channel space)
         self.riemannian_bias = AdaptiveRiemannianAttentionBias(
             num_heads=self.heads_per_branch,
@@ -1297,18 +1290,18 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
 
         if temporal_cov_bias is not None:
-            # Pass covariance dynamics bias via attn_mask parameter —
-            # keeps the optimized SDPA kernel path (flash/memory-efficient).
-            # temporal_cov_bias: (B, H2, N, N) → expand to (B*C, H2, N, N)
+            # Downstream fine-tuning: apply covariance dynamics bias.
+            # Uses SDPA attn_mask (switches from flash to math kernel — acceptable
+            # for fine-tuning where speed is less critical than accuracy).
             tcb = temporal_cov_bias.unsqueeze(1).expand(-1, num_chan, -1, -1, -1)
             tcb = tcb.reshape(B * num_chan, H2, N, N)
-
             out_t = F.scaled_dot_product_attention(
                 q_t, k_t, v_t,
-                attn_mask=tcb,
+                attn_mask=tcb.to(q_t.dtype),
                 dropout_p=self.att_dropout if self.training else 0.0,
             )
         else:
+            # Pretraining: pure flash attention, identical to baseline
             out_t = F.scaled_dot_product_attention(
                 q_t, k_t, v_t,
                 dropout_p=self.att_dropout if self.training else 0.0,

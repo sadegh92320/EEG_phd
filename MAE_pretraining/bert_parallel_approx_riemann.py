@@ -34,7 +34,7 @@ import math
 import random
 import os
 import torch.nn.init as init
-from MAE_pretraining.transformer_variants import AdaptiveRiemannianParallelTransformer, TemporalCovarianceAttentionBias
+from MAE_pretraining.transformer_variants import AdaptiveRiemannianParallelTransformer
 
 
 def seed_everything(seed=42):
@@ -175,13 +175,6 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         # Temporal and channel embeddings
         self.channel_embedding_e = ChannelPositionalEmbed(embedding_dim=enc_dim)
         self.temporal_embedding_e = TemporalPositionalEncoding(d_model=enc_dim, max_len=max_embedding)
-        # Temporal covariance dynamics bias — computes pairwise Frobenius
-        # distance between per-timestep covariances. Bias is computed once
-        # from clean patch embeddings and shared across all encoder layers.
-        self.temporal_cov_bias = TemporalCovarianceAttentionBias(
-            num_heads=8 // 2,  # temporal heads = half of total (nhead=8)
-        )
-
         self.criterion = nn.MSELoss()
         self.class_token = nn.Parameter(torch.zeros(1, 1, enc_dim))
         self.norm_pix_loss = norm_pix_loss
@@ -333,11 +326,6 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         L = x.shape[1] * x.shape[2]
         x = x.reshape(B, L, -1)
 
-        # Compute temporal covariance dynamics bias from clean patch embeddings
-        # (before channel/positional embeddings contaminate the spatial structure).
-        # Computed once here, shared across all encoder layers.
-        temporal_cov_bias = self.temporal_cov_bias.compute_bias(x, C)  # (B, H2, N, N)
-
         # Channel embeddings
         if channel_list.dim() == 1:
             channel_list = channel_list.unsqueeze(0).expand(B, -1)
@@ -359,7 +347,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
 
         # Pass through adaptive Riemannian transformer layers
         for transformer in self.encoder:
-            x = transformer(x, C, channel_idx=channel_idx, temporal_cov_bias=temporal_cov_bias)
+            x = transformer(x, C, channel_idx=channel_idx)
 
         x = self.norm_enc(x)
         x = self.fc(x)
@@ -449,14 +437,10 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         mask_ratio = mask.float().mean()
         self.log("mask_ratio", mask_ratio, on_step=False, on_epoch=True, prog_bar=True)
 
-        # Log the learned head scales across layers for analysis
+        # Log the learned spatial head scales across layers for analysis
         for i, layer in enumerate(self.encoder):
-            # Spatial Riemannian bias scales
             s_scales = layer.attn.riemannian_bias.head_scales.detach()
             self.log(f"spatial_scale_mean/layer_{i}", s_scales.mean(), on_step=False, on_epoch=True)
-            # Temporal covariance bias scales
-            t_scales = layer.attn.temporal_cov_bias.head_scales.detach()
-            self.log(f"temporal_scale_mean/layer_{i}", t_scales.mean(), on_step=False, on_epoch=True)
 
         return loss
 
