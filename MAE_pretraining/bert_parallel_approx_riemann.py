@@ -392,33 +392,13 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         return x, pad
 
     def configure_optimizers(self):
-        # Separate param groups: metric_U gets 0.1× learning rate for stability
-        if self.use_riemannian_metric:
-            metric_params = []
-            other_params = []
-            for name, param in self.named_parameters():
-                if 'metric_U' in name:
-                    metric_params.append(param)
-                else:
-                    other_params.append(param)
-            param_groups = [
-                {"params": other_params, "lr": 1e-3, "weight_decay": 0.05},
-                {"params": metric_params, "lr": 1e-4, "weight_decay": 0.0},  # 0.1× lr, no wd
-            ]
-            optimizer = torch.optim.AdamW(param_groups)
-        else:
-            optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, weight_decay=0.05)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, weight_decay=0.05)
 
         total_steps = self.trainer.estimated_stepping_batches
 
-        # OneCycleLR with per-group max_lr: metric_U gets 0.1× to stay stable
-        if self.use_riemannian_metric:
-            max_lr_list = [5e-4, 5e-5]  # [main params, metric_U]
-        else:
-            max_lr_list = 5e-4
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=max_lr_list,
+            max_lr=5e-4,
             total_steps=total_steps,
             pct_start=0.15,
             anneal_strategy='cos',
@@ -461,33 +441,6 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 f"batch {batch_idx}. Check logs above for diagnostics."
             )
 
-        # ── Riemannian metric regularization: λ * Σ ||M_h - I||² ──
-        # Keeps learned metric near identity to prevent collapse/divergence
-        if self.use_riemannian_metric:
-            metric_reg_loss = sum(
-                layer.attn.metric_regularization_loss() for layer in self.encoder
-            )
-            loss = loss + metric_reg_loss
-            self.log("metric_reg_loss", metric_reg_loss, on_step=False, on_epoch=True)
-
-            # Log per-layer metric stats for monitoring
-            for i, layer in enumerate(self.encoder):
-                if layer.attn.use_riemannian_metric:
-                    with torch.no_grad():
-                        U = layer.attn.metric_U  # (H2, d, r)
-                        # ||U||_F per head — how far M has moved from I
-                        u_norm = (U ** 2).sum(dim=(-2, -1)).sqrt().mean()
-                        self.log(f"metric_U_norm/layer_{i}", u_norm,
-                                 on_step=False, on_epoch=True)
-                        # Singular values of U — shows which rank directions are active
-                        # Only compute occasionally (every 100 steps) to save time
-                        if batch_idx % 100 == 0:
-                            sv = torch.linalg.svdvals(U.float())  # (H2, r)
-                            self.log(f"metric_sv_max/layer_{i}", sv[:, 0].mean(),
-                                     on_step=False, on_epoch=True)
-                            self.log(f"metric_sv_min/layer_{i}", sv[:, -1].mean(),
-                                     on_step=False, on_epoch=True)
-
         lr = self.trainer.optimizers[0].param_groups[0]["lr"]
         self.log("lr", lr, on_step=True, prog_bar=False)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -498,9 +451,12 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
 
         # Log the learned head scales across layers for analysis
         for i, layer in enumerate(self.encoder):
-            scales = layer.attn.riemannian_bias.head_scales.detach()
-            self.log(f"head_scale_mean/layer_{i}", scales.mean(), on_step=False, on_epoch=True)
-            self.log(f"head_scale_std/layer_{i}", scales.std(), on_step=False, on_epoch=True)
+            # Spatial Riemannian bias scales
+            s_scales = layer.attn.riemannian_bias.head_scales.detach()
+            self.log(f"spatial_scale_mean/layer_{i}", s_scales.mean(), on_step=False, on_epoch=True)
+            # Temporal covariance bias scales
+            t_scales = layer.attn.temporal_cov_bias.head_scales.detach()
+            self.log(f"temporal_scale_mean/layer_{i}", t_scales.mean(), on_step=False, on_epoch=True)
 
         return loss
 

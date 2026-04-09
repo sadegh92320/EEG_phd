@@ -1242,28 +1242,6 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.att_dropout = att_dropout
 
-        # ── Learned low-rank Riemannian metric for spatial heads ──
-        # Per-head SPD metric M_h = I + U_h @ U_h^T (rank-r correction).
-        # At init U=0 → M=I → standard dot product. During training, U learns
-        # to amplify/suppress directions in the tangent space based on geometric
-        # informativeness. Low-rank is motivated by the intrinsic low
-        # dimensionality of EEG spatial covariance (~8-12 brain rhythm sources).
-        #
-        # Attention: score = Q·M·K^T = Q·K^T + (Q·U)·(K·U)^T
-        # The second term adds two small matmuls (d→r projection), ~5% overhead.
-        self.use_riemannian_metric = use_riemannian_metric
-        self.metric_reg = metric_reg
-        self.metric_rank = 8  # rank of the correction term
-        if use_riemannian_metric:
-            # U: (H2, d, r) — initialized with small random values.
-            # Cannot be zero: the correction Q·U·U^T·K^T is quadratic in U,
-            # so grad w.r.t. U vanishes at U=0 (saddle point).
-            # Scale 0.05 gives M ≈ I + 0.0025·(noise) at init — large enough
-            # that the quadratic gradient Q·U·U^T·K^T can compete with regularization.
-            self.metric_U = nn.Parameter(
-                torch.randn(self.heads_per_branch, self.dim_head, self.metric_rank) * 0.05
-            )
-
         # Temporal covariance dynamics bias — mirrors spatial Riemannian bias
         # on the temporal axis using pairwise Frobenius distance of per-timestep
         # channel covariances.
@@ -1319,19 +1297,17 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
 
         if temporal_cov_bias is not None:
-            # Manual temporal attention with covariance dynamics bias
-            # (mirrors how spatial attention handles the Riemannian bias)
+            # Pass covariance dynamics bias via attn_mask parameter —
+            # keeps the optimized SDPA kernel path (flash/memory-efficient).
             # temporal_cov_bias: (B, H2, N, N) → expand to (B*C, H2, N, N)
             tcb = temporal_cov_bias.unsqueeze(1).expand(-1, num_chan, -1, -1, -1)
             tcb = tcb.reshape(B * num_chan, H2, N, N)
 
-            with torch.amp.autocast('cuda', enabled=False), \
-                 torch.amp.autocast('cpu', enabled=False):
-                score = (q_t.float() @ k_t.float().transpose(-2, -1)) / (d ** 0.5)
-                score = score + tcb.float()
-                score = score.softmax(dim=-1)
-            score = F.dropout(score, p=self.att_dropout, training=self.training)
-            out_t = score.to(v_t.dtype) @ v_t
+            out_t = F.scaled_dot_product_attention(
+                q_t, k_t, v_t,
+                attn_mask=tcb,
+                dropout_p=self.att_dropout if self.training else 0.0,
+            )
         else:
             out_t = F.scaled_dot_product_attention(
                 q_t, k_t, v_t,
@@ -1354,22 +1330,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         # Compute score+softmax in float32 to prevent fp16 overflow
         with torch.amp.autocast('cuda', enabled=False), \
              torch.amp.autocast('cpu', enabled=False):
-            if self.use_riemannian_metric:
-                # Low-rank Riemannian metric: M = I + U @ U^T
-                # score = Q·M·K^T / √d = (Q·K^T + (Q·U)·(K·U)^T) / √d
-                U = self.metric_U                          # (H2, d, r)
-                q_f = q_s.float()
-                k_f = k_s.float()
-                # Standard dot product: Q·K^T
-                score = q_f @ k_f.transpose(-2, -1)
-                # Low-rank correction: (Q·U)·(K·U)^T using @ (not einsum)
-                # @ broadcasts (BN,H2,C,d)@(1,H2,d,r) → (BN,H2,C,r) efficiently
-                U_b = U.unsqueeze(0).float()               # (1, H2, d, r)
-                q_U = q_f @ U_b                            # (BN, H2, C, r)
-                k_U = k_f @ U_b                            # (BN, H2, C, r)
-                score = (score + q_U @ k_U.transpose(-2, -1)) / (d ** 0.5)
-            else:
-                score = (q_s.float() @ k_s.float().transpose(-2, -1)) / (d ** 0.5)
+            score = (q_s.float() @ k_s.float().transpose(-2, -1)) / (d ** 0.5)
             score = score + riem_bias.float()
             score = score.softmax(dim=-1)
         score = F.dropout(score, p=self.att_dropout, training=self.training)
@@ -1383,14 +1344,6 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         out = self.fc(out)
         return self.dropout(out)
 
-    def metric_regularization_loss(self):
-        """Regularization toward identity: λ * ||U||_F² (keeps M close to I).
-        Since M = I + U·U^T, ||M - I||_F² = ||U·U^T||_F². We use the simpler
-        ||U||_F² as a proxy (upper bound), which also penalizes large singular
-        values of U and prevents metric divergence."""
-        if not self.use_riemannian_metric:
-            return 0.0
-        return self.metric_reg * (self.metric_U ** 2).sum()
 
 
 class AdaptiveRiemannianParallelTransformer(nn.Module):
