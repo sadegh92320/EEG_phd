@@ -152,7 +152,7 @@ class Pipeline:
 
     def load_encoder(self, pretrain=True, use_frechet=False, log_mode='pade',
                      use_corr_masking=True, resume_ckpt=None, use_global_norm=False,
-                     clamp_channels=False):
+                     clamp_channels=False, use_temporal_cov=False):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
@@ -192,15 +192,18 @@ class Pipeline:
             # only the geometric signal is ablated.
             if log_mode == 'baseline':
                 print("[Ablation] Parallel attention with Riemannian branch disabled (head_scales=0)")
-                model = ApproxAdaptiveRiemannBert(use_corr_masking=use_corr_masking)
+                model = ApproxAdaptiveRiemannBert(use_corr_masking=use_corr_masking,
+                                                   use_temporal_cov=use_temporal_cov)
                 for layer in model.encoder:
                     layer.attn.riemannian_bias.head_scales.requires_grad = False
                     layer.attn.riemannian_bias.head_scales.zero_()
                 use_frechet = False
             else:
                 masking_str = "corr-masking" if use_corr_masking else "random-masking"
-                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}")
-                model = ApproxAdaptiveRiemannBert(use_corr_masking=use_corr_masking)
+                tcov_str = " + temporal-cov" if use_temporal_cov else ""
+                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}{tcov_str}")
+                model = ApproxAdaptiveRiemannBert(use_corr_masking=use_corr_masking,
+                                                   use_temporal_cov=use_temporal_cov)
                 # Override log_mode in every encoder layer if needed
                 if log_mode == 'approx':
                     for layer in model.encoder:
@@ -249,6 +252,8 @@ class Pipeline:
                     run_name += "-corrmask"
                 if use_frechet and log_mode == 'pade':
                     run_name += "-frechet"
+                if use_temporal_cov:
+                    run_name += "-tcov"
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
@@ -277,6 +282,7 @@ class Pipeline:
                 "use_frechet": use_frechet and log_mode == 'pade',
                 "use_global_norm": use_global_norm,
                 "clamp_channels": clamp_channels,
+                "use_temporal_cov": use_temporal_cov,
             })
 
             callbacks = [TQDMProgressBar(refresh_rate=20), ckpt_callback]

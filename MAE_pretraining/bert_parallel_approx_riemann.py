@@ -34,7 +34,10 @@ import math
 import random
 import os
 import torch.nn.init as init
-from MAE_pretraining.transformer_variants import AdaptiveRiemannianParallelTransformer
+from MAE_pretraining.transformer_variants import (
+    AdaptiveRiemannianParallelTransformer,
+    TemporalCovarianceAttentionBias,
+)
 
 
 def seed_everything(seed=42):
@@ -126,13 +129,14 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                  max_embedding=2000, enc_dim=512, depth_e=8,
                  mask_prob=0.5, patch_size=16, norm_pix_loss=False,
                  use_frechet=False, frechet_path=None,
-                 use_corr_masking=True):
+                 use_corr_masking=True, use_temporal_cov=False):
         super().__init__()
 
         self.config = config
         self.enc_dim = enc_dim
         self.num_channels = num_channels
         self.use_corr_masking = use_corr_masking
+        self.use_temporal_cov = use_temporal_cov
 
         # ── Load frozen Fréchet mean reference (optional) ──
         # When use_frechet=True, the tangent-space projection pre-whitens S
@@ -158,6 +162,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
                 use_frechet=use_frechet,
                 frechet_R_inv_sqrt=frechet_R_inv_sqrt,
+                use_temporal_cov=use_temporal_cov,
             ) for _ in range(depth_e)
         ])
 
@@ -325,6 +330,16 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         # Patch the EEG: (B, C, T) → (B, N, C, D) → (B, N*C, D)
         x = self.patch(x)
         N = x.shape[1]
+
+        # ── Temporal covariance distance (Contribution 2) ──
+        # Compute BEFORE masking and flattening, from clean patch embeddings.
+        # x is (B, N, C, D) at this point — perfect shape for per-timestep cov.
+        temporal_cov_dist = None
+        if self.use_temporal_cov:
+            temporal_cov_dist = TemporalCovarianceAttentionBias.compute_temporal_cov_dist(
+                x, C
+            )  # (B, N, N), float32, no_grad
+
         L = x.shape[1] * x.shape[2]
         x = x.reshape(B, L, -1)
 
@@ -352,7 +367,8 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
 
         # Pass through adaptive Riemannian transformer layers
         for transformer in self.encoder:
-            x = transformer(x, C, channel_idx=channel_idx)
+            x = transformer(x, C, channel_idx=channel_idx,
+                            temporal_cov_dist=temporal_cov_dist)
 
         x = self.norm_enc(x)
         x = self.fc(x)
@@ -446,6 +462,12 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             scales = layer.attn.riemannian_bias.head_scales.detach()
             self.log(f"head_scale_mean/layer_{i}", scales.mean(), on_step=False, on_epoch=True)
             self.log(f"head_scale_std/layer_{i}", scales.std(), on_step=False, on_epoch=True)
+
+            # Log temporal covariance head scales (Contribution 2)
+            if self.use_temporal_cov:
+                tcov_scales = layer.attn.temporal_cov_bias.head_scales.detach()
+                self.log(f"tcov_scale_mean/layer_{i}", tcov_scales.mean(), on_step=False, on_epoch=True)
+                self.log(f"tcov_scale_std/layer_{i}", tcov_scales.std(), on_step=False, on_epoch=True)
 
         return loss
 

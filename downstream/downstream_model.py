@@ -14,6 +14,7 @@ from MAE_pretraining.transformer_variants import (
     RiemannianParallelCrissCrossTransformer,
     AdaptiveRiemannianParallelTransformer,
     EMAGeometricGraph,
+    TemporalCovarianceAttentionBias,
 )
 
 
@@ -387,8 +388,10 @@ class DownstreamRiemannTransformerPara(Downstream):
     aggregation="class" is NOT supported; use "avg" (default).
     """
 
-    def __init__(self, *args, aggregation="avg", use_frechet=False, **kwargs):
+    def __init__(self, *args, aggregation="avg", use_frechet=False,
+                 use_temporal_cov=False, **kwargs):
         self._use_frechet = use_frechet
+        self._use_temporal_cov = use_temporal_cov
         if aggregation == "class":
             raise ValueError(
                 "DownstreamRiemannTransformerPara does not use a [CLS] token. "
@@ -401,13 +404,15 @@ class DownstreamRiemannTransformerPara(Downstream):
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
                 use_frechet=self._use_frechet,
+                use_temporal_cov=self._use_temporal_cov,
             ) for _ in range(depth_e)
         ])
 
-    def _run_encoder(self, x, C, channel_idx=None):
+    def _run_encoder(self, x, C, channel_idx=None, temporal_cov_dist=None):
         """Adaptive Riemannian parallel transformer needs num_chan + channel_idx."""
         for transformer in self.encoder:
-            x = transformer(x, num_chan=C, channel_idx=channel_idx)
+            x = transformer(x, num_chan=C, channel_idx=channel_idx,
+                            temporal_cov_dist=temporal_cov_dist)
         return x
 
     def forward(self, x, channel_list):
@@ -417,6 +422,15 @@ class DownstreamRiemannTransformerPara(Downstream):
         # Patch embed
         x = self.patch(x)
         N = x.shape[1]
+
+        # Compute temporal covariance distance BEFORE flattening
+        # x is (B, N, C, D) here — perfect shape for per-timestep cov
+        temporal_cov_dist = None
+        if self._use_temporal_cov:
+            temporal_cov_dist = TemporalCovarianceAttentionBias.compute_temporal_cov_dist(
+                x, C
+            )  # (B, N, N)
+
         x = rearrange(x, "b n c d -> b (n c) d")
         L = x.shape[1]
 
@@ -438,7 +452,8 @@ class DownstreamRiemannTransformerPara(Downstream):
         channel_idx = channel_list[0]  # (C,) global channel indices
 
         # Encoder (no class token — sequence is exactly N*C)
-        x = self._run_encoder(x, C, channel_idx=channel_idx)
+        x = self._run_encoder(x, C, channel_idx=channel_idx,
+                              temporal_cov_dist=temporal_cov_dist)
         x = self.norm_enc(x)
 
         # Head: cls_out unused for avg pooling, pass None-like placeholder

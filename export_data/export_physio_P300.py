@@ -10,12 +10,15 @@ import h5py
 class ImportPhysioP300(ImportDataDownstream):
     """
     PhysioNet ERP-based BCI (P300 speller) dataset.
-    8 subjects: [2, 3, 4, 5, 6, 7, 9, 11]
+    9 subjects: [1, 2, 3, 4, 5, 6, 7, 9, 11] (matching EEGPT paper).
     Binary classification: target (1) vs non-target (0).
     64 EEG channels, native 2048 Hz → resampled to 256 Hz at export.
     Epoch window: [-0.1, 2.0] s relative to stimulus onset.
     Source: erp-based-brain-computer-interface-recordings-1.0.0
     """
+
+    # Match EEGPT paper: subjects 8, 10, 12 are excluded
+    INCLUDED_SUBJECTS = {1, 2, 3, 4, 5, 6, 7, 9, 11}
 
     NON_EEG = ["EARL", "EARR", "VEOGL", "VEOGR", "HEOGL", "HEOGR"]
 
@@ -65,6 +68,9 @@ class ImportPhysioP300(ImportDataDownstream):
             if m is None:
                 continue
             sub = int(m.group(1))
+            if sub not in self.INCLUDED_SUBJECTS:
+                print(f"Skipping subject {sub} (not in EEGPT subject list)")
+                continue
             for file in sorted(sub_dir.iterdir()):
                 if not self.condition(file):
                     continue
