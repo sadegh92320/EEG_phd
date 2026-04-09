@@ -14,7 +14,9 @@ from MAE_pretraining.transformer_variants import (
     RiemannianParallelCrissCrossTransformer,
     AdaptiveRiemannianParallelTransformer,
     EMAGeometricGraph,
+    TemporalCovarianceAttentionBias,
 )
+from downstream.token_merging import merge_token
 
 
 class RiemannDownstreamHead(nn.Module):
@@ -146,6 +148,11 @@ class Downstream(nn.Module):
         # ── Channel embedding (novelty: nn.Embedding) ──
         self.channel_embedding = ChannelPositionalEmbed(embedding_dim=enc_dim)
 
+        # ── Temporal covariance dynamics bias ──
+        self.temporal_cov_bias = TemporalCovarianceAttentionBias(
+            num_heads=n_head // 2,  # temporal heads = half of total
+        )
+
         # ── Load pretrained weights ──
         if checkpoint_path is not None:
             self._load_pretrained(checkpoint_path)
@@ -183,7 +190,8 @@ class Downstream(nn.Module):
 
     def _freeze_encoder(self):
         """Freeze all pretrained encoder parameters."""
-        for module in [self.patch, self.channel_embedding, self.encoder, self.norm_enc, self.temporal_embedding]:
+        for module in [self.patch, self.channel_embedding, self.encoder, self.norm_enc,
+                       self.temporal_embedding]:
             for p in module.parameters():
                 p.requires_grad = False
         self.class_token.requires_grad = False
@@ -214,6 +222,7 @@ class Downstream(nn.Module):
             "decoder.", "encoder_decoder.", "mask_token",
             "channel_embedding_d.", "temporal_embedding_d.",
             "norm_dec.", "fc.", "criterion.",
+            "cov_temporal_embedding.",  # old CovRoPE — replaced by temporal_cov_bias
         )
 
         # ── Remap encoder embedding names ──
@@ -388,10 +397,11 @@ class DownstreamRiemannTransformerPara(Downstream):
     """
 
     def __init__(self, *args, aggregation="avg", use_frechet=False, log_mode='pade',
-                 use_riemannian_metric=False, **kwargs):
+                 use_riemannian_metric=False, merge_k=0, **kwargs):
         self._use_frechet = use_frechet
         self._log_mode = log_mode
         self._use_riemannian_metric = use_riemannian_metric
+        self._merge_k = merge_k  # total tokens to merge (ToME-style, spread across layers)
         if aggregation == "class":
             raise ValueError(
                 "DownstreamRiemannTransformerPara does not use a [CLS] token. "
@@ -408,10 +418,36 @@ class DownstreamRiemannTransformerPara(Downstream):
             ) for _ in range(depth_e)
         ])
 
-    def _run_encoder(self, x, C, channel_idx=None):
-        """Adaptive Riemannian parallel transformer needs num_chan + channel_idx."""
-        for transformer in self.encoder:
-            x = transformer(x, num_chan=C, channel_idx=channel_idx)
+    def _run_encoder(self, x, C, channel_idx=None, temporal_cov_bias=None):
+        """
+        Adaptive Riemannian parallel transformer needs num_chan + channel_idx.
+
+        ToME-style progressive token merging: distributes merge_k total merges
+        evenly across encoder layers. After each layer, merge r tokens (temporal
+        dimension only, preserving channel structure). Remainder merges are
+        applied in the last layers (same as ToME).
+        """
+        num_layers = len(self.encoder)
+        k = self._merge_k
+
+        if k > 0:
+            # Distribute merges across layers (ToME: spread evenly, remainder to later layers)
+            r_per_layer = [k // num_layers] * num_layers
+            for i in range(k % num_layers):
+                r_per_layer[num_layers - 1 - i] += 1
+        else:
+            r_per_layer = [0] * num_layers
+
+        for layer_idx, transformer in enumerate(self.encoder):
+            x = transformer(x, num_chan=C, channel_idx=channel_idx,
+                            temporal_cov_bias=temporal_cov_bias)
+            if r_per_layer[layer_idx] > 0:
+                x = merge_token(x, num_channels=C, k=r_per_layer[layer_idx])
+                # After merging, temporal_cov_bias is invalid (N changed).
+                # Set to None — remaining layers run without it.
+                # This is acceptable: the bias's main value is in early layers
+                # where full temporal resolution is available.
+                temporal_cov_bias = None
         return x
 
     def forward(self, x, channel_list):
@@ -424,12 +460,15 @@ class DownstreamRiemannTransformerPara(Downstream):
         x = rearrange(x, "b n c d -> b (n c) d")
         L = x.shape[1]
 
+        # Compute temporal covariance dynamics bias from clean patch embeddings
+        temporal_cov_bias = self.temporal_cov_bias.compute_bias(x, C)  # (B, H2, N, N)
+
         # Channel embedding
         if channel_list.dim() == 1:
             channel_list = channel_list.unsqueeze(0).expand(B, -1)
         x = x + self._get_channel_embedding(channel_list, N, B, L)
 
-        # Temporal embedding
+        # Sinusoidal temporal embedding
         seq_idx = torch.arange(0, N, device=device).unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
         x = x + self.temporal_embedding(seq_idx)
 
@@ -442,7 +481,7 @@ class DownstreamRiemannTransformerPara(Downstream):
         channel_idx = channel_list[0]  # (C,) global channel indices
 
         # Encoder (no class token — sequence is exactly N*C)
-        x = self._run_encoder(x, C, channel_idx=channel_idx)
+        x = self._run_encoder(x, C, channel_idx=channel_idx, temporal_cov_bias=temporal_cov_bias)
         x = self.norm_enc(x)
 
         # Head: cls_out unused for avg pooling, pass None-like placeholder
@@ -542,6 +581,7 @@ class DownstreamRiemannEMA(Downstream):
             "decoder.", "encoder_decoder.", "mask_token",
             "channel_embedding_d.", "temporal_embedding_d.",
             "norm_dec.", "fc.", "criterion.",
+            "cov_temporal_embedding.",  # old CovRoPE — replaced by temporal_cov_bias
         )
 
         # Remap encoder embedding names

@@ -34,7 +34,7 @@ import math
 import random
 import os
 import torch.nn.init as init
-from MAE_pretraining.transformer_variants import AdaptiveRiemannianParallelTransformer
+from MAE_pretraining.transformer_variants import AdaptiveRiemannianParallelTransformer, TemporalCovarianceAttentionBias
 
 
 def seed_everything(seed=42):
@@ -175,6 +175,12 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         # Temporal and channel embeddings
         self.channel_embedding_e = ChannelPositionalEmbed(embedding_dim=enc_dim)
         self.temporal_embedding_e = TemporalPositionalEncoding(d_model=enc_dim, max_len=max_embedding)
+        # Temporal covariance dynamics bias — computes pairwise Frobenius
+        # distance between per-timestep covariances. Bias is computed once
+        # from clean patch embeddings and shared across all encoder layers.
+        self.temporal_cov_bias = TemporalCovarianceAttentionBias(
+            num_heads=n_head // 2,  # temporal heads = half of total
+        )
 
         self.criterion = nn.MSELoss()
         self.class_token = nn.Parameter(torch.zeros(1, 1, enc_dim))
@@ -211,38 +217,31 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         return x, mask
 
     def mask_corr_channels(self, x, corr, num_chan, seed_prob=0.2,
-                           patch_mask_prob=0.15, min_channels=8):
+                           chan_mask_ratio=0.2, min_channels=8):
         """
-        Anti-correlated (connectivity-aware) channel masking.
+        Anti-correlated (connectivity-aware) channel masking + random patch masking.
 
-        Motivation: Standard random masking lets the model reconstruct masked
-        patches by copying from nearby correlated electrodes — a spatial
-        interpolation shortcut. This method masks spatially INDEPENDENT channels,
-        preserving local correlated clusters while removing cross-region diversity.
+        Two-round masking that trains BOTH spatial and temporal attention:
 
-        The model must reconstruct independent brain regions from their correlated
-        neighbors, forcing cross-regional inference through the Riemannian spatial
-        attention. This directly stress-tests the geometric pathway.
+        Round 1 — Channel masking (anti-correlated):
+            Masks ~20% of channels (all time patches for those channels).
+            Targets independent/uncorrelated channels preferentially using
+            Gumbel-top-k sampling on inverted connectivity scores.
+            → Trains spatial attention (Riemannian branch)
 
-        Strategy:
-            1. Compute per-channel "independence score" = mean |correlation| with
-               all other channels. Low score = channel is independent of others.
-            2. Channels with LOW independence scores (uncorrelated with the rest)
-               get HIGHER mask probability — they're the hardest to reconstruct.
-            3. Sample channel mask using these probabilities, targeting mask_prob
-               overall ratio.
-            4. Expand to all time patches + add random patch masking on survivors.
+        Round 2 — Random patch masking on survivors:
+            Masks random individual patches among the ~80% surviving tokens
+            to bring total masking to self.mask_prob (50%).
+            → Trains temporal attention
 
-        This preserves local spatial clusters (correlated channels stay visible
-        together) while removing globally independent channels, forcing the model
-        to learn long-range cross-region connectivity.
+        Total masking = self.mask_prob (50%), split across both rounds.
 
         Args:
             x:               (B, L, D) embedded tokens, L = N * C
             corr:            (B, C, C) per-sample Pearson correlation matrix
             num_chan:         C — number of EEG channels in this batch
             seed_prob:       (unused, kept for API compat)
-            patch_mask_prob: probability of masking visible tokens in round 2
+            chan_mask_ratio:  fraction of channels to mask in round 1 (default 0.2)
             min_channels:    minimum C to use correlation masking
 
         Returns:
@@ -258,7 +257,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             return self.mask_bert(x)
 
         # ══════════════════════════════════════════════════════════════
-        # ROUND 1: Anti-correlated channel masking
+        # ROUND 1: Anti-correlated channel masking (~30% of tokens)
         # ══════════════════════════════════════════════════════════════
 
         with torch.no_grad():
@@ -269,28 +268,22 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             abs_corr.diagonal(dim1=-2, dim2=-1).zero_()  # ignore self-correlation
             connectivity = abs_corr.mean(dim=-1)  # (B, C) — mean |corr| per channel
 
-            # 1b. Convert to mask probabilities: independent channels masked more
-            #     Invert connectivity: low connectivity → high mask prob
-            #     Use softmax with temperature to control sharpness
-            #     Temperature=1.0: moderate preference for independent channels
-            #     Temperature=0.5: strong preference
+            # 1b. Invert connectivity: independent channels get higher scores
             temperature = 1.0
-            inv_connectivity = 1.0 - connectivity  # high = independent
+            inv_connectivity = 1.0 - connectivity
             mask_logits = inv_connectivity / temperature
 
-            # 1c. Sample target number of channels to mask (match self.mask_prob)
-            num_to_mask = max(1, round(self.mask_prob * num_chan))
+            # 1c. Number of channels to mask in round 1
+            num_chan_mask = max(1, round(chan_mask_ratio * num_chan))
 
-            # 1d. Use Gumbel-top-k trick for differentiable-friendly sampling
-            #     Add Gumbel noise to logits, take top-k → stochastic but biased
-            #     toward independent channels
+            # 1d. Gumbel-top-k: stochastic but biased toward independent channels
             gumbel_noise = -torch.log(-torch.log(
                 torch.rand_like(mask_logits).clamp(min=1e-8)
             ))
             noisy_scores = mask_logits + gumbel_noise  # (B, C)
 
-            # 1e. Select top-k channels with highest noisy scores (most independent)
-            _, topk_idx = noisy_scores.topk(num_to_mask, dim=-1)  # (B, num_to_mask)
+            # 1e. Select top-k most independent channels
+            _, topk_idx = noisy_scores.topk(num_chan_mask, dim=-1)
 
             # 1f. Build boolean channel mask
             chan_mask = torch.zeros(B, num_chan, device=device, dtype=torch.bool)
@@ -306,8 +299,16 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         x = x * (1 - mask_float) + mask_tok * mask_float
 
         # ══════════════════════════════════════════════════════════════
-        # ROUND 2: Random patch masking on visible (surviving) tokens
+        # ROUND 2: Random patch masking on survivors → reach self.mask_prob total
         # ══════════════════════════════════════════════════════════════
+        # After round 1: (1 - chan_mask_ratio) fraction of tokens survive.
+        # We need (self.mask_prob - chan_mask_ratio) more tokens masked.
+        # So patch_prob = (target - round1) / (1 - round1)
+        #              = (0.50 - 0.20) / (1 - 0.20) = 0.30 / 0.80 = 0.375
+
+        remaining_frac = 1.0 - chan_mask_ratio
+        extra_needed = self.mask_prob - chan_mask_ratio
+        patch_mask_prob = max(0.0, extra_needed / remaining_frac)
 
         noise = torch.rand(B, L, device=device)
         noise[token_mask] = 1.0                    # already masked → never re-mask
@@ -326,21 +327,16 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         device = x.device
         channel_list = torch.tensor(channel_list, dtype=torch.long, device=device) if not isinstance(channel_list, torch.Tensor) else channel_list.to(device)
 
-        # ── Compute per-sample channel correlation from RAW EEG ──
-        # Only needed when correlation-aware masking is enabled.
-        # The correlation matrix is the same geometric object that
-        # the Riemannian attention branch operates on (covariance → SPD).
-        if self.use_corr_masking:
-            with torch.no_grad():
-                x_centered = x - x.mean(dim=-1, keepdim=True)          # (B, C, T)
-                x_normed = x_centered / (x_centered.std(dim=-1, keepdim=True) + 1e-8)
-                corr = torch.bmm(x_normed, x_normed.transpose(-1, -2)) / T  # (B, C, C)
-
         # Patch the EEG: (B, C, T) → (B, N, C, D) → (B, N*C, D)
         x = self.patch(x)
         N = x.shape[1]
         L = x.shape[1] * x.shape[2]
         x = x.reshape(B, L, -1)
+
+        # Compute temporal covariance dynamics bias from clean patch embeddings
+        # (before channel/positional embeddings contaminate the spatial structure).
+        # Computed once here, shared across all encoder layers.
+        temporal_cov_bias = self.temporal_cov_bias.compute_bias(x, C)  # (B, H2, N, N)
 
         # Channel embeddings
         if channel_list.dim() == 1:
@@ -349,24 +345,21 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         chan_embedding = self.channel_embedding_e(chan_id)
         x += chan_embedding
 
-        # Temporal embeddings
+        # Sinusoidal temporal embeddings
         seq_idx = torch.arange(0, N, device=device, dtype=torch.long)
         eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
         tp = self.temporal_embedding_e(eeg_seq_indices)
         x += tp
 
-        # ── Masking ──
-        if self.use_corr_masking:
-            x, mask = self.mask_corr_channels(x, corr, C)
-        else:
-            x, mask = self.mask_bert(x)
+        # ── Masking (standard random BERT masking) ──
+        x, mask = self.mask_bert(x)
 
         # Extract channel indices for the adaptive Riemannian reference
         channel_idx = channel_list[0]  # (C,) global channel indices
 
         # Pass through adaptive Riemannian transformer layers
         for transformer in self.encoder:
-            x = transformer(x, C, channel_idx=channel_idx)
+            x = transformer(x, C, channel_idx=channel_idx, temporal_cov_bias=temporal_cov_bias)
 
         x = self.norm_enc(x)
         x = self.fc(x)
