@@ -127,7 +127,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                  mask_prob=0.5, patch_size=16, norm_pix_loss=False,
                  use_frechet=False, frechet_path=None,
                  use_corr_masking=True,
-                 use_riemannian_metric=False, metric_reg=0.01):
+                 use_riemannian_metric=False, metric_reg=0.001):
         super().__init__()
 
         self.config = config
@@ -408,9 +408,14 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
 
         total_steps = self.trainer.estimated_stepping_batches
 
+        # OneCycleLR with per-group max_lr: metric_U gets 0.1× to stay stable
+        if self.use_riemannian_metric:
+            max_lr_list = [5e-4, 5e-5]  # [main params, metric_U]
+        else:
+            max_lr_list = 5e-4
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=5e-4,
+            max_lr=max_lr_list,
             total_steps=total_steps,
             pct_start=0.15,
             anneal_strategy='cos',

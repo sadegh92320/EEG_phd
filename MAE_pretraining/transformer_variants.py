@@ -1224,7 +1224,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
                  dropout=0.1, att_dropout=0.1, spd_eps=1e-5,
                  log_mode='eigh', use_approx=False,
                  use_frechet=False, frechet_R_inv_sqrt=None,
-                 use_riemannian_metric=False, metric_reg=0.01):
+                 use_riemannian_metric=False, metric_reg=0.001):
         super().__init__()
         assert num_heads % 2 == 0, "num_heads must be even for parallel split"
         assert embed_dim % num_heads == 0
@@ -1258,9 +1258,10 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             # U: (H2, d, r) — initialized with small random values.
             # Cannot be zero: the correction Q·U·U^T·K^T is quadratic in U,
             # so grad w.r.t. U vanishes at U=0 (saddle point).
-            # Scale 0.01 keeps M ≈ I + 0.0001·(noise) at init → near-identity start.
+            # Scale 0.05 gives M ≈ I + 0.0025·(noise) at init — large enough
+            # that the quadratic gradient Q·U·U^T·K^T can compete with regularization.
             self.metric_U = nn.Parameter(
-                torch.randn(self.heads_per_branch, self.dim_head, self.metric_rank) * 0.01
+                torch.randn(self.heads_per_branch, self.dim_head, self.metric_rank) * 0.05
             )
 
         # Adaptive Riemannian bias for spatial heads (global channel space)
@@ -1395,7 +1396,7 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
                  mlp_ratio=4, drop=0.0, att_drop=0.0, drop_path=0.0, act=nn.GELU,
                  norm=nn.LayerNorm, spd_eps=1e-5, log_mode='eigh', use_approx=False,
                  use_frechet=False, frechet_R_inv_sqrt=None,
-                 use_riemannian_metric=False, metric_reg=0.01):
+                 use_riemannian_metric=False, metric_reg=0.001):
         super().__init__()
 
         self.attn = AdaptiveRiemannianParallelAttention(
