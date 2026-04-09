@@ -126,15 +126,13 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                  max_embedding=2000, enc_dim=512, depth_e=8,
                  mask_prob=0.5, patch_size=16, norm_pix_loss=False,
                  use_frechet=False, frechet_path=None,
-                 use_corr_masking=True,
-                 use_riemannian_metric=False, metric_reg=0.001):
+                 use_corr_masking=True):
         super().__init__()
 
         self.config = config
         self.enc_dim = enc_dim
         self.num_channels = num_channels
         self.use_corr_masking = use_corr_masking
-        self.use_riemannian_metric = use_riemannian_metric
 
         # ── Load frozen Fréchet mean reference (optional) ──
         # When use_frechet=True, the tangent-space projection pre-whitens S
@@ -160,8 +158,6 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
                 use_frechet=use_frechet,
                 frechet_R_inv_sqrt=frechet_R_inv_sqrt,
-                use_riemannian_metric=use_riemannian_metric,
-                metric_reg=metric_reg,
             ) for _ in range(depth_e)
         ])
 
@@ -175,6 +171,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         # Temporal and channel embeddings
         self.channel_embedding_e = ChannelPositionalEmbed(embedding_dim=enc_dim)
         self.temporal_embedding_e = TemporalPositionalEncoding(d_model=enc_dim, max_len=max_embedding)
+
         self.criterion = nn.MSELoss()
         self.class_token = nn.Parameter(torch.zeros(1, 1, enc_dim))
         self.norm_pix_loss = norm_pix_loss
@@ -210,31 +207,40 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         return x, mask
 
     def mask_corr_channels(self, x, corr, num_chan, seed_prob=0.2,
-                           chan_mask_ratio=0.2, min_channels=8):
+                           patch_mask_prob=0.15, min_channels=8):
         """
-        Anti-correlated (connectivity-aware) channel masking + random patch masking.
+        Correlation-aware channel masking with two-round strategy.
 
-        Two-round masking that trains BOTH spatial and temporal attention:
+        Motivation: EEG electrodes have high spatial correlation. With random
+        masking, the model can reconstruct a masked patch by copying from a
+        neighboring electrode at the same timestep — a shortcut that produces
+        low loss without learning deep temporal/spectral features.
 
-        Round 1 — Channel masking (anti-correlated):
-            Masks ~20% of channels (all time patches for those channels).
-            Targets independent/uncorrelated channels preferentially using
-            Gumbel-top-k sampling on inverted connectivity scores.
-            → Trains spatial attention (Riemannian branch)
+        This method masks entire correlated channel groups, eliminating the
+        shortcut. It uses the same covariance structure that feeds the
+        Riemannian attention branch — a unified geometric framework.
 
-        Round 2 — Random patch masking on survivors:
-            Masks random individual patches among the ~80% surviving tokens
-            to bring total masking to self.mask_prob (50%).
-            → Trains temporal attention
+        Round 1 — Channel masking:
+            Pick random seed channels, mask them + their most correlated
+            partner + the partner's most correlated partner (correlation chain).
+            All time patches of masked channels are replaced with [MASK].
 
-        Total masking = self.mask_prob (50%), split across both rounds.
+        Round 2 — Patch masking on survivors:
+            Among the remaining visible tokens, randomly mask an additional
+            patch_mask_prob fraction. This adds temporal reconstruction pressure
+            so the model also learns within-channel temporal dynamics.
+
+        Fallback:
+            When num_chan < min_channels (e.g., BCI 2b with 3 channels),
+            correlation masking is meaningless — falls back to standard
+            random patch masking.
 
         Args:
             x:               (B, L, D) embedded tokens, L = N * C
             corr:            (B, C, C) per-sample Pearson correlation matrix
             num_chan:         C — number of EEG channels in this batch
-            seed_prob:       (unused, kept for API compat)
-            chan_mask_ratio:  fraction of channels to mask in round 1 (default 0.2)
+            seed_prob:       fraction of C to use as random seeds
+            patch_mask_prob: probability of masking visible tokens in round 2
             min_channels:    minimum C to use correlation masking
 
         Returns:
@@ -250,58 +256,44 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             return self.mask_bert(x)
 
         # ══════════════════════════════════════════════════════════════
-        # ROUND 1: Anti-correlated channel masking (~30% of tokens)
+        # ROUND 1: Correlation-aware channel masking
         # ══════════════════════════════════════════════════════════════
 
-        with torch.no_grad():
-            # 1a. Compute per-channel independence score
-            #     High |corr| with neighbors = well-connected = easy to reconstruct
-            #     Low |corr| = independent = hard to reconstruct → mask these
-            abs_corr = corr.abs()
-            abs_corr.diagonal(dim1=-2, dim2=-1).zero_()  # ignore self-correlation
-            connectivity = abs_corr.mean(dim=-1)  # (B, C) — mean |corr| per channel
+        # 1a. Pick random seed channels per sample
+        num_seed = max(1, math.ceil(seed_prob * num_chan))
+        shuffle = torch.argsort(torch.rand(B, num_chan, device=device), dim=-1)
+        seeds = shuffle[:, :num_seed]  # (B, num_seed)
 
-            # 1b. Invert connectivity: independent channels get higher scores
-            temperature = 1.0
-            inv_connectivity = 1.0 - connectivity
-            mask_logits = inv_connectivity / temperature
+        # 1b. Zero diagonal so a channel can't match itself
+        corr_clean = corr.clone()
+        corr_clean.diagonal(dim1=-2, dim2=-1).zero_()
 
-            # 1c. Number of channels to mask in round 1
-            num_chan_mask = max(1, round(chan_mask_ratio * num_chan))
+        # 1c. For every channel, find its most correlated partner
+        best_match = corr_clean.argmax(dim=-1)  # (B, C)
 
-            # 1d. Gumbel-top-k: stochastic but biased toward independent channels
-            gumbel_noise = -torch.log(-torch.log(
-                torch.rand_like(mask_logits).clamp(min=1e-8)
-            ))
-            noisy_scores = mask_logits + gumbel_noise  # (B, C)
+        # 1d. Build the correlation chain:
+        #     seed → partner → partner's partner
+        partners = best_match.gather(dim=-1, index=seeds)           # (B, num_seed)
+        partners_partners = best_match.gather(dim=-1, index=partners)  # (B, num_seed)
 
-            # 1e. Select top-k most independent channels
-            _, topk_idx = noisy_scores.topk(num_chan_mask, dim=-1)
+        # 1e. Union all into a boolean channel mask
+        chan_mask = torch.zeros(B, num_chan, device=device, dtype=torch.bool)
+        chan_mask.scatter_(dim=-1, index=seeds, value=True)
+        chan_mask.scatter_(dim=-1, index=partners, value=True)
+        chan_mask.scatter_(dim=-1, index=partners_partners, value=True)
 
-            # 1f. Build boolean channel mask
-            chan_mask = torch.zeros(B, num_chan, device=device, dtype=torch.bool)
-            chan_mask.scatter_(dim=-1, index=topk_idx, value=True)
-
-        # 1g. Expand channel mask to all time patches
+        # 1f. Expand channel mask to all time patches
         #     Token layout: [t0_c0, t0_c1, …, t0_cC, t1_c0, …]
         token_mask = chan_mask.unsqueeze(1).expand(-1, N, -1).reshape(B, L)
 
-        # 1h. Apply round-1 mask
+        # 1g. Apply round-1 mask
         mask_float = token_mask.unsqueeze(-1).float()
         mask_tok = self.mask_token.expand_as(x)
         x = x * (1 - mask_float) + mask_tok * mask_float
 
         # ══════════════════════════════════════════════════════════════
-        # ROUND 2: Random patch masking on survivors → reach self.mask_prob total
+        # ROUND 2: Random patch masking on visible (surviving) tokens
         # ══════════════════════════════════════════════════════════════
-        # After round 1: (1 - chan_mask_ratio) fraction of tokens survive.
-        # We need (self.mask_prob - chan_mask_ratio) more tokens masked.
-        # So patch_prob = (target - round1) / (1 - round1)
-        #              = (0.50 - 0.20) / (1 - 0.20) = 0.30 / 0.80 = 0.375
-
-        remaining_frac = 1.0 - chan_mask_ratio
-        extra_needed = self.mask_prob - chan_mask_ratio
-        patch_mask_prob = max(0.0, extra_needed / remaining_frac)
 
         noise = torch.rand(B, L, device=device)
         noise[token_mask] = 1.0                    # already masked → never re-mask
@@ -320,6 +312,16 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         device = x.device
         channel_list = torch.tensor(channel_list, dtype=torch.long, device=device) if not isinstance(channel_list, torch.Tensor) else channel_list.to(device)
 
+        # ── Compute per-sample channel correlation from RAW EEG ──
+        # Only needed when correlation-aware masking is enabled.
+        # The correlation matrix is the same geometric object that
+        # the Riemannian attention branch operates on (covariance → SPD).
+        if self.use_corr_masking:
+            with torch.no_grad():
+                x_centered = x - x.mean(dim=-1, keepdim=True)          # (B, C, T)
+                x_normed = x_centered / (x_centered.std(dim=-1, keepdim=True) + 1e-8)
+                corr = torch.bmm(x_normed, x_normed.transpose(-1, -2)) / T  # (B, C, C)
+
         # Patch the EEG: (B, C, T) → (B, N, C, D) → (B, N*C, D)
         x = self.patch(x)
         N = x.shape[1]
@@ -333,14 +335,17 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         chan_embedding = self.channel_embedding_e(chan_id)
         x += chan_embedding
 
-        # Sinusoidal temporal embeddings
+        # Temporal embeddings
         seq_idx = torch.arange(0, N, device=device, dtype=torch.long)
         eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
         tp = self.temporal_embedding_e(eeg_seq_indices)
         x += tp
 
-        # ── Masking (standard random BERT masking) ──
-        x, mask = self.mask_bert(x)
+        # ── Masking ──
+        if self.use_corr_masking:
+            x, mask = self.mask_corr_channels(x, corr, C)
+        else:
+            x, mask = self.mask_bert(x)
 
         # Extract channel indices for the adaptive Riemannian reference
         channel_idx = channel_list[0]  # (C,) global channel indices
@@ -381,7 +386,6 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, weight_decay=0.05)
-
         total_steps = self.trainer.estimated_stepping_batches
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -437,10 +441,11 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         mask_ratio = mask.float().mean()
         self.log("mask_ratio", mask_ratio, on_step=False, on_epoch=True, prog_bar=True)
 
-        # Log the learned spatial head scales across layers for analysis
+        # Log the learned head scales across layers for analysis
         for i, layer in enumerate(self.encoder):
-            s_scales = layer.attn.riemannian_bias.head_scales.detach()
-            self.log(f"spatial_scale_mean/layer_{i}", s_scales.mean(), on_step=False, on_epoch=True)
+            scales = layer.attn.riemannian_bias.head_scales.detach()
+            self.log(f"head_scale_mean/layer_{i}", scales.mean(), on_step=False, on_epoch=True)
+            self.log(f"head_scale_std/layer_{i}", scales.std(), on_step=False, on_epoch=True)
 
         return loss
 

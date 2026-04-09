@@ -1223,8 +1223,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
     def __init__(self, embed_dim, num_heads=8, total_channels=TOTAL_GLOBAL_CHANNELS,
                  dropout=0.1, att_dropout=0.1, spd_eps=1e-5,
                  log_mode='eigh', use_approx=False,
-                 use_frechet=False, frechet_R_inv_sqrt=None,
-                 use_riemannian_metric=False, metric_reg=0.001):
+                 use_frechet=False, frechet_R_inv_sqrt=None):
         super().__init__()
         assert num_heads % 2 == 0, "num_heads must be even for parallel split"
         assert embed_dim % num_heads == 0
@@ -1253,8 +1252,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             frechet_R_inv_sqrt=frechet_R_inv_sqrt,
         )
 
-    def forward(self, x_norm, num_chan, residual=None, channel_idx=None, ema_ref=None,
-                temporal_cov_bias=None):
+    def forward(self, x_norm, num_chan, residual=None, channel_idx=None, ema_ref=None):
         """
         Args:
             x_norm: (B, L, D) normalized input (post-LayerNorm) — used for QKV
@@ -1265,8 +1263,6 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
                          Required for the adaptive reference submatrix extraction.
             ema_ref: optional (C, C) population covariance from EMAGeometricGraph.
                      Used as the tangent space reference point in approx mode.
-            temporal_cov_bias: optional (B, H2, N, N) temporal covariance dynamics bias.
-                               Computed once per forward pass, shared across all layers.
         """
         B, L, D = x_norm.shape
         assert L % num_chan == 0
@@ -1284,28 +1280,15 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         k_t, k_s = k[:, :H2], k[:, H2:]
         v_t, v_s = v[:, :H2], v[:, H2:]
 
-        # ── Temporal attention (with covariance dynamics bias) ──
+        # ── Temporal attention (Euclidean) ──
         q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
         k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
         v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
 
-        if temporal_cov_bias is not None:
-            # Downstream fine-tuning: apply covariance dynamics bias.
-            # Uses SDPA attn_mask (switches from flash to math kernel — acceptable
-            # for fine-tuning where speed is less critical than accuracy).
-            tcb = temporal_cov_bias.unsqueeze(1).expand(-1, num_chan, -1, -1, -1)
-            tcb = tcb.reshape(B * num_chan, H2, N, N)
-            out_t = F.scaled_dot_product_attention(
-                q_t, k_t, v_t,
-                attn_mask=tcb.to(q_t.dtype),
-                dropout_p=self.att_dropout if self.training else 0.0,
-            )
-        else:
-            # Pretraining: pure flash attention, identical to baseline
-            out_t = F.scaled_dot_product_attention(
-                q_t, k_t, v_t,
-                dropout_p=self.att_dropout if self.training else 0.0,
-            )
+        out_t = F.scaled_dot_product_attention(
+            q_t, k_t, v_t,
+            dropout_p=self.att_dropout if self.training else 0.0,
+        )
         out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=num_chan)
 
         # ── Spatial attention (Riemannian-biased) ──
@@ -1338,7 +1321,6 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         return self.dropout(out)
 
 
-
 class AdaptiveRiemannianParallelTransformer(nn.Module):
     """
     Parallel head-split transformer with adaptive Riemannian spatial attention.
@@ -1366,8 +1348,7 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
     def __init__(self, embed_dim, nhead=8, total_channels=TOTAL_GLOBAL_CHANNELS,
                  mlp_ratio=4, drop=0.0, att_drop=0.0, drop_path=0.0, act=nn.GELU,
                  norm=nn.LayerNorm, spd_eps=1e-5, log_mode='eigh', use_approx=False,
-                 use_frechet=False, frechet_R_inv_sqrt=None,
-                 use_riemannian_metric=False, metric_reg=0.001):
+                 use_frechet=False, frechet_R_inv_sqrt=None):
         super().__init__()
 
         self.attn = AdaptiveRiemannianParallelAttention(
@@ -1381,8 +1362,6 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
             use_approx=use_approx,
             use_frechet=use_frechet,
             frechet_R_inv_sqrt=frechet_R_inv_sqrt,
-            use_riemannian_metric=use_riemannian_metric,
-            metric_reg=metric_reg,
         )
 
         self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
@@ -1394,7 +1373,7 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
         hidden_size = int(embed_dim * mlp_ratio)
         self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
 
-    def forward(self, x, num_chan, channel_idx=None, ema_ref=None, temporal_cov_bias=None):
+    def forward(self, x, num_chan, channel_idx=None, ema_ref=None):
         """
         Args:
             x: (B, L, D) input tensor where L = N * num_chan
@@ -1403,13 +1382,11 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
             ema_ref: optional (C, C) population covariance from EMAGeometricGraph.
                      Used as the tangent space reference point in approx mode.
                      If None, falls back to identity (S - I).
-            temporal_cov_bias: optional (B, H2, N, N) temporal covariance dynamics bias.
         """
         # Pass normalized input for QKV, raw residual for Riemannian bias
         x = x + self.drop_path1(
             self.attn(self.norm1(x), num_chan, residual=x,
-                      channel_idx=channel_idx, ema_ref=ema_ref,
-                      temporal_cov_bias=temporal_cov_bias)
+                      channel_idx=channel_idx, ema_ref=ema_ref)
         )
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
         return x
@@ -1499,121 +1476,3 @@ class EMAGeometricGraph(nn.Module):
         """
         idx = channel_idx.long()
         return self.G_ema[idx.unsqueeze(1), idx.unsqueeze(0)]  # (C, C)
-
-
-# ════════════════════════════════════════════════════════════════
-# Covariance-variation rotary temporal embedding (CovRoPE)
-# ════════════════════════════════════════════════════════════════
-
-class TemporalCovarianceAttentionBias(nn.Module):
-    """
-    Covariance-dynamics attention bias for temporal heads.
-
-    Mirrors the Riemannian spatial bias (Contribution 1) on the temporal axis:
-      - Spatial bias: per-sample channel covariance → tangent space → (C, C) bias
-      - Temporal bias: per-timestep covariance distance → (N, N) bias
-
-    For each pair of time steps (t, s), compute the Frobenius distance between
-    their channel covariance matrices:
-
-        D_{ts} = ||S_t - S_s||_F
-
-    Then convert to a per-head attention bias via a learned affine transform:
-
-        bias_{h,ts} = α_h · D_{ts} + β_h
-
-    where α_h and β_h are per-head learnable scalars (initialized to 0 so the
-    model starts as standard attention and gradually learns to use the bias).
-
-    Interpretation:
-      - Spatial bias tells the model WHICH channels relate (structure)
-      - Temporal bias tells the model WHEN brain states change (dynamics)
-
-    Frobenius distance on SPD matrices is a valid metric (lower bound on the
-    affine-invariant geodesic distance). Between nearby time steps the
-    approximation is tight because covariance evolves smoothly.
-
-    Computational overhead: one (B,N,C,D)×(B,N,D,C) matmul for per-timestep
-    covariance, then pairwise Frobenius distance via the identity:
-        ||A - B||_F² = tr(A²) + tr(B²) - 2·tr(AB)
-    using the vectorized upper triangle — O(N²·C²) which is small for typical
-    N=30-60 and C=19-128.
-
-    Applied only to the temporal attention branch. The spatial branch already
-    has the Riemannian bias.
-    """
-
-    def __init__(self, num_heads):
-        """
-        Args:
-            num_heads: number of temporal attention heads (H2 = total_heads // 2)
-        """
-        super().__init__()
-        # Per-head learnable scale and offset — initialized to 0 so the model
-        # starts as standard Euclidean attention and learns to use the bias.
-        # Same initialization strategy as the spatial Riemannian bias (head_scales=0).
-        self.head_scales = nn.Parameter(torch.zeros(num_heads))   # α_h
-        self.head_offsets = nn.Parameter(torch.zeros(num_heads))  # β_h
-
-    def compute_bias(self, x, num_chan):
-        """
-        Compute pairwise temporal covariance distance bias.
-
-        Args:
-            x: (B, L, D) patch embeddings (before channel/temporal embeddings)
-               where L = N * C
-            num_chan: int C — number of channels
-
-        Returns:
-            bias: (B, H2, N, N) attention bias for temporal heads
-        """
-        B, L, D = x.shape
-        C = num_chan
-        N = L // C
-        H2 = self.head_scales.shape[0]
-
-        x_4d = x.view(B, N, C, D)
-
-        # MUST disable autocast and use float32 — covariance operations
-        # overflow fp16 (S_flat**2 summed over C² entries easily exceeds 65504).
-        # Same pattern as AdaptiveRiemannianAttentionBias.forward().
-        with torch.no_grad(), \
-             torch.amp.autocast('cuda', enabled=False), \
-             torch.amp.autocast('cpu', enabled=False):
-            x_f32 = x_4d.float()
-
-            # Per-time-step covariance: S_t = X_t @ X_t^T / D → (B, N, C, C)
-            S = x_f32 @ x_f32.transpose(-1, -2) / D
-
-            # Pairwise Frobenius distance using:
-            #   ||S_t - S_s||_F² = ||S_t||_F² + ||S_s||_F² - 2·tr(S_t · S_s^T)
-            # Since S is symmetric, S^T = S, so tr(S_t · S_s) = <vec(S_t), vec(S_s)>
-
-            # Flatten covariance to vectors: (B, N, C*C)
-            S_flat = S.reshape(B, N, C * C)
-
-            # ||S_t||_F² for each t: (B, N)
-            S_norm_sq = (S_flat ** 2).sum(dim=-1)
-
-            # Pairwise inner product: tr(S_t · S_s) = vec(S_t)^T · vec(S_s)
-            # (B, N, C²) @ (B, C², N) → (B, N, N)
-            S_inner = S_flat @ S_flat.transpose(-1, -2)
-
-            # ||S_t - S_s||_F² = ||S_t||² + ||S_s||² - 2·tr(S_t·S_s)
-            dist_sq = S_norm_sq.unsqueeze(-1) + S_norm_sq.unsqueeze(-2) - 2 * S_inner
-
-            # Clamp for numerical stability then sqrt
-            dist = dist_sq.clamp(min=0).sqrt()  # (B, N, N)
-
-            # Normalize by C so the scale is comparable across datasets with
-            # different channel counts (19 vs 128)
-            dist = dist / C
-
-        # Learnable per-head affine: bias_h = α_h · D + β_h
-        # dist: (B, N, N) → (B, 1, N, N)
-        # scales: (H2,) → (1, H2, 1, 1)
-        scales = self.head_scales.view(1, H2, 1, 1)
-        offsets = self.head_offsets.view(1, H2, 1, 1)
-        bias = scales * dist.unsqueeze(1) + offsets  # (B, H2, N, N)
-
-        return bias

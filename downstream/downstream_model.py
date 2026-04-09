@@ -148,11 +148,6 @@ class Downstream(nn.Module):
         # ── Channel embedding (novelty: nn.Embedding) ──
         self.channel_embedding = ChannelPositionalEmbed(embedding_dim=enc_dim)
 
-        # ── Temporal covariance dynamics bias ──
-        self.temporal_cov_bias = TemporalCovarianceAttentionBias(
-            num_heads=n_head // 2,  # temporal heads = half of total
-        )
-
         # ── Load pretrained weights ──
         if checkpoint_path is not None:
             self._load_pretrained(checkpoint_path)
@@ -418,7 +413,7 @@ class DownstreamRiemannTransformerPara(Downstream):
             ) for _ in range(depth_e)
         ])
 
-    def _run_encoder(self, x, C, channel_idx=None, temporal_cov_bias=None):
+    def _run_encoder(self, x, C, channel_idx=None, temporal_cov_dist=None):
         """
         Adaptive Riemannian parallel transformer needs num_chan + channel_idx.
 
@@ -440,14 +435,12 @@ class DownstreamRiemannTransformerPara(Downstream):
 
         for layer_idx, transformer in enumerate(self.encoder):
             x = transformer(x, num_chan=C, channel_idx=channel_idx,
-                            temporal_cov_bias=temporal_cov_bias)
+                            temporal_cov_dist=temporal_cov_dist)
             if r_per_layer[layer_idx] > 0:
                 x = merge_token(x, num_channels=C, k=r_per_layer[layer_idx])
-                # After merging, temporal_cov_bias is invalid (N changed).
+                # After merging, temporal_cov_dist is invalid (N changed).
                 # Set to None — remaining layers run without it.
-                # This is acceptable: the bias's main value is in early layers
-                # where full temporal resolution is available.
-                temporal_cov_bias = None
+                temporal_cov_dist = None
         return x
 
     def forward(self, x, channel_list):
@@ -460,8 +453,8 @@ class DownstreamRiemannTransformerPara(Downstream):
         x = rearrange(x, "b n c d -> b (n c) d")
         L = x.shape[1]
 
-        # Compute temporal covariance dynamics bias from clean patch embeddings
-        temporal_cov_bias = self.temporal_cov_bias.compute_bias(x, C)  # (B, H2, N, N)
+        # Compute temporal covariance distance from clean patch embeddings
+        temporal_cov_dist = TemporalCovarianceAttentionBias.compute_distance(x, C)  # (B, N, N)
 
         # Channel embedding
         if channel_list.dim() == 1:
@@ -481,7 +474,7 @@ class DownstreamRiemannTransformerPara(Downstream):
         channel_idx = channel_list[0]  # (C,) global channel indices
 
         # Encoder (no class token — sequence is exactly N*C)
-        x = self._run_encoder(x, C, channel_idx=channel_idx, temporal_cov_bias=temporal_cov_bias)
+        x = self._run_encoder(x, C, channel_idx=channel_idx, temporal_cov_dist=temporal_cov_dist)
         x = self.norm_enc(x)
 
         # Head: cls_out unused for avg pooling, pass None-like placeholder

@@ -152,7 +152,7 @@ class Pipeline:
 
     def load_encoder(self, pretrain=True, use_frechet=False, log_mode='pade',
                      use_corr_masking=True, resume_ckpt=None, use_global_norm=False,
-                     clamp_channels=False, use_riemannian_metric=False, metric_reg=0.001):
+                     clamp_channels=False):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
@@ -161,23 +161,20 @@ class Pipeline:
             2. approx (S-I)                            → log_mode='approx', use_corr_masking=False
             3. pade                                    → log_mode='pade',   use_corr_masking=False
             4. pade + correlation masking               → log_mode='pade',   use_corr_masking=True
-            5. pade + riemannian metric                 → log_mode='pade',   use_riemannian_metric=True
+            5. pade + corr masking + fréchet            → log_mode='pade',   use_corr_masking=True, use_frechet=True
 
         Args:
-            pretrain:               if True, train from scratch; else load existing ckpt
-            use_frechet:            if True, compute Fréchet mean before training
-            log_mode:               'pade', 'approx', or 'baseline'
-            use_corr_masking:       if True, use correlation-aware channel masking;
-                                    if False, use standard random BERT masking
-            resume_ckpt:            path to checkpoint to resume from (None = from scratch)
-            use_global_norm:        if True, use global normalization (preserves channel
-                                    variance ratios); if False, use z-standardization
-            clamp_channels:         if True, clamp channels with variance > 10× median
-                                    (only applies when use_global_norm=True). Use if
-                                    training is unstable due to noisy electrodes.
-            use_riemannian_metric:  if True, use learned per-head low-rank SPD metric
-                                    M = I + U·U^T in spatial attention (Q·M·K^T)
-            metric_reg:             regularization weight toward identity for M
+            pretrain:         if True, train from scratch; else load existing ckpt
+            use_frechet:      if True, compute Fréchet mean before training
+            log_mode:         'pade', 'approx', or 'baseline'
+            use_corr_masking: if True, use correlation-aware channel masking;
+                              if False, use standard random BERT masking
+            resume_ckpt:      path to checkpoint to resume from (None = from scratch)
+            use_global_norm:  if True, use global normalization (preserves channel
+                              variance ratios); if False, use z-standardization
+            clamp_channels:   if True, clamp channels with variance > 10× median
+                              (only applies when use_global_norm=True). Use if
+                              training is unstable due to noisy electrodes.
         """
         assert log_mode in ('pade', 'approx', 'baseline'), \
             f"log_mode must be 'pade', 'approx', or 'baseline', got '{log_mode}'"
@@ -202,13 +199,8 @@ class Pipeline:
                 use_frechet = False
             else:
                 masking_str = "corr-masking" if use_corr_masking else "random-masking"
-                metric_str = "+riem-metric" if use_riemannian_metric else ""
-                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}{metric_str}")
-                model = ApproxAdaptiveRiemannBert(
-                    use_corr_masking=use_corr_masking,
-                    use_riemannian_metric=use_riemannian_metric,
-                    metric_reg=metric_reg,
-                )
+                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}")
+                model = ApproxAdaptiveRiemannBert(use_corr_masking=use_corr_masking)
                 # Override log_mode in every encoder layer if needed
                 if log_mode == 'approx':
                     for layer in model.encoder:
@@ -223,9 +215,9 @@ class Pipeline:
                 print("[Fréchet] Computing initial R from embedding-space covariances...")
                 frechet_result = compute_frechet_mean_from_model(
                     model, train_loader, enc_dim=512,
-                    max_batches=30, eps=0.1, verbose=True
+                    max_batches=200, verbose=True
                 )
-                frechet_R_inv_sqrt = frechet_result['R_inv_sqrt']  # (144, 144)
+                frechet_R_inv_sqrt = frechet_result['R_inv_sqrt']
 
                 frechet_save_path = os.path.join(CKPT_DIR, "frechet_mean.pt")
                 torch.save(frechet_result, frechet_save_path)
@@ -234,20 +226,16 @@ class Pipeline:
                 for layer in model.encoder:
                     log_map = layer.attn.riemannian_bias.adaptive_log
                     log_map.use_frechet = True
-                    # Remove existing attribute before registering as buffer
-                    if hasattr(log_map, 'R_inv_sqrt'):
-                        delattr(log_map, 'R_inv_sqrt')
                     log_map.register_buffer(
                         'R_inv_sqrt', frechet_R_inv_sqrt.clone()
                     )
-                print(f"[Fréchet] Injected R_inv_sqrt ({frechet_R_inv_sqrt.shape}) "
-                      f"into {len(model.encoder)} layers")
+                print(f"[Fréchet] Injected R_inv_sqrt into {len(model.encoder)} layers")
 
                 # Periodic refresh: recompute R every 10 epochs using current weights
                 frechet_callback = FrechetRefreshCallback(
                     train_dataloader=train_loader,
                     refresh_every=10,
-                    max_batches=20,
+                    max_batches=100,
                     enc_dim=512,
                 )
 
@@ -261,8 +249,6 @@ class Pipeline:
                     run_name += "-corrmask"
                 if use_frechet and log_mode == 'pade':
                     run_name += "-frechet"
-                if use_riemannian_metric:
-                    run_name += "-metric"
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
@@ -291,8 +277,6 @@ class Pipeline:
                 "use_frechet": use_frechet and log_mode == 'pade',
                 "use_global_norm": use_global_norm,
                 "clamp_channels": clamp_channels,
-                "use_riemannian_metric": use_riemannian_metric,
-                "metric_reg": metric_reg if use_riemannian_metric else 0.0,
             })
 
             callbacks = [TQDMProgressBar(refresh_rate=20), ckpt_callback]
@@ -310,7 +294,6 @@ class Pipeline:
 
             trainer.fit(model, train_dataloaders=train_loader,
                         val_dataloaders=valid_loader,
-                        
                         )
 
             self.checkpoint_path = ckpt_callback.best_model_path
