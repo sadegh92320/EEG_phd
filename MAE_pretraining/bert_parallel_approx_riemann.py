@@ -179,7 +179,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         # distance between per-timestep covariances. Bias is computed once
         # from clean patch embeddings and shared across all encoder layers.
         self.temporal_cov_bias = TemporalCovarianceAttentionBias(
-            num_heads=n_head // 2,  # temporal heads = half of total
+            num_heads=8 // 2,  # temporal heads = half of total (nhead=8)
         )
 
         self.criterion = nn.MSELoss()
