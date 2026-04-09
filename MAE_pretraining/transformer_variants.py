@@ -1628,9 +1628,16 @@ class TemporalCovarianceAttentionBias(nn.Module):
 
         x_4d = x.view(B, N, C, D)
 
-        with torch.no_grad():
+        # MUST disable autocast and use float32 — covariance operations
+        # overflow fp16 (S_flat**2 summed over C² entries easily exceeds 65504).
+        # Same pattern as AdaptiveRiemannianAttentionBias.forward().
+        with torch.no_grad(), \
+             torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False):
+            x_f32 = x_4d.float()
+
             # Per-time-step covariance: S_t = X_t @ X_t^T / D → (B, N, C, C)
-            S = x_4d @ x_4d.transpose(-1, -2) / D
+            S = x_f32 @ x_f32.transpose(-1, -2) / D
 
             # Pairwise Frobenius distance using:
             #   ||S_t - S_s||_F² = ||S_t||_F² + ||S_s||_F² - 2·tr(S_t · S_s^T)
