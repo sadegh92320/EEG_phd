@@ -213,37 +213,35 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
     def mask_corr_channels(self, x, corr, num_chan, seed_prob=0.2,
                            patch_mask_prob=0.15, min_channels=8):
         """
-        Correlation-aware channel masking with two-round strategy.
+        Anti-correlated (connectivity-aware) channel masking.
 
-        Motivation: EEG electrodes have high spatial correlation. With random
-        masking, the model can reconstruct a masked patch by copying from a
-        neighboring electrode at the same timestep — a shortcut that produces
-        low loss without learning deep temporal/spectral features.
+        Motivation: Standard random masking lets the model reconstruct masked
+        patches by copying from nearby correlated electrodes — a spatial
+        interpolation shortcut. This method masks spatially INDEPENDENT channels,
+        preserving local correlated clusters while removing cross-region diversity.
 
-        This method masks entire correlated channel groups, eliminating the
-        shortcut. It uses the same covariance structure that feeds the
-        Riemannian attention branch — a unified geometric framework.
+        The model must reconstruct independent brain regions from their correlated
+        neighbors, forcing cross-regional inference through the Riemannian spatial
+        attention. This directly stress-tests the geometric pathway.
 
-        Round 1 — Channel masking:
-            Pick random seed channels, mask them + their most correlated
-            partner + the partner's most correlated partner (correlation chain).
-            All time patches of masked channels are replaced with [MASK].
+        Strategy:
+            1. Compute per-channel "independence score" = mean |correlation| with
+               all other channels. Low score = channel is independent of others.
+            2. Channels with LOW independence scores (uncorrelated with the rest)
+               get HIGHER mask probability — they're the hardest to reconstruct.
+            3. Sample channel mask using these probabilities, targeting mask_prob
+               overall ratio.
+            4. Expand to all time patches + add random patch masking on survivors.
 
-        Round 2 — Patch masking on survivors:
-            Among the remaining visible tokens, randomly mask an additional
-            patch_mask_prob fraction. This adds temporal reconstruction pressure
-            so the model also learns within-channel temporal dynamics.
-
-        Fallback:
-            When num_chan < min_channels (e.g., BCI 2b with 3 channels),
-            correlation masking is meaningless — falls back to standard
-            random patch masking.
+        This preserves local spatial clusters (correlated channels stay visible
+        together) while removing globally independent channels, forcing the model
+        to learn long-range cross-region connectivity.
 
         Args:
             x:               (B, L, D) embedded tokens, L = N * C
             corr:            (B, C, C) per-sample Pearson correlation matrix
             num_chan:         C — number of EEG channels in this batch
-            seed_prob:       fraction of C to use as random seeds
+            seed_prob:       (unused, kept for API compat)
             patch_mask_prob: probability of masking visible tokens in round 2
             min_channels:    minimum C to use correlation masking
 
@@ -260,37 +258,49 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             return self.mask_bert(x)
 
         # ══════════════════════════════════════════════════════════════
-        # ROUND 1: Correlation-aware channel masking
+        # ROUND 1: Anti-correlated channel masking
         # ══════════════════════════════════════════════════════════════
 
-        # 1a. Pick random seed channels per sample
-        num_seed = max(1, math.ceil(seed_prob * num_chan))
-        shuffle = torch.argsort(torch.rand(B, num_chan, device=device), dim=-1)
-        seeds = shuffle[:, :num_seed]  # (B, num_seed)
+        with torch.no_grad():
+            # 1a. Compute per-channel independence score
+            #     High |corr| with neighbors = well-connected = easy to reconstruct
+            #     Low |corr| = independent = hard to reconstruct → mask these
+            abs_corr = corr.abs()
+            abs_corr.diagonal(dim1=-2, dim2=-1).zero_()  # ignore self-correlation
+            connectivity = abs_corr.mean(dim=-1)  # (B, C) — mean |corr| per channel
 
-        # 1b. Zero diagonal so a channel can't match itself
-        corr_clean = corr.clone()
-        corr_clean.diagonal(dim1=-2, dim2=-1).zero_()
+            # 1b. Convert to mask probabilities: independent channels masked more
+            #     Invert connectivity: low connectivity → high mask prob
+            #     Use softmax with temperature to control sharpness
+            #     Temperature=1.0: moderate preference for independent channels
+            #     Temperature=0.5: strong preference
+            temperature = 1.0
+            inv_connectivity = 1.0 - connectivity  # high = independent
+            mask_logits = inv_connectivity / temperature
 
-        # 1c. For every channel, find its most correlated partner
-        best_match = corr_clean.argmax(dim=-1)  # (B, C)
+            # 1c. Sample target number of channels to mask (match self.mask_prob)
+            num_to_mask = max(1, round(self.mask_prob * num_chan))
 
-        # 1d. Build the correlation chain:
-        #     seed → partner → partner's partner
-        partners = best_match.gather(dim=-1, index=seeds)           # (B, num_seed)
-        partners_partners = best_match.gather(dim=-1, index=partners)  # (B, num_seed)
+            # 1d. Use Gumbel-top-k trick for differentiable-friendly sampling
+            #     Add Gumbel noise to logits, take top-k → stochastic but biased
+            #     toward independent channels
+            gumbel_noise = -torch.log(-torch.log(
+                torch.rand_like(mask_logits).clamp(min=1e-8)
+            ))
+            noisy_scores = mask_logits + gumbel_noise  # (B, C)
 
-        # 1e. Union all into a boolean channel mask
-        chan_mask = torch.zeros(B, num_chan, device=device, dtype=torch.bool)
-        chan_mask.scatter_(dim=-1, index=seeds, value=True)
-        chan_mask.scatter_(dim=-1, index=partners, value=True)
-        chan_mask.scatter_(dim=-1, index=partners_partners, value=True)
+            # 1e. Select top-k channels with highest noisy scores (most independent)
+            _, topk_idx = noisy_scores.topk(num_to_mask, dim=-1)  # (B, num_to_mask)
 
-        # 1f. Expand channel mask to all time patches
+            # 1f. Build boolean channel mask
+            chan_mask = torch.zeros(B, num_chan, device=device, dtype=torch.bool)
+            chan_mask.scatter_(dim=-1, index=topk_idx, value=True)
+
+        # 1g. Expand channel mask to all time patches
         #     Token layout: [t0_c0, t0_c1, …, t0_cC, t1_c0, …]
         token_mask = chan_mask.unsqueeze(1).expand(-1, N, -1).reshape(B, L)
 
-        # 1g. Apply round-1 mask
+        # 1h. Apply round-1 mask
         mask_float = token_mask.unsqueeze(-1).float()
         mask_tok = self.mask_token.expand_as(x)
         x = x * (1 - mask_float) + mask_tok * mask_float
