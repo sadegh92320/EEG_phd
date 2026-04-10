@@ -155,11 +155,13 @@ def build_riemann_transformer_para(num_classes, checkpoint_path, num_channels, d
     log_mode = kwargs.get("log_mode", "pade")
     use_frechet = kwargs.get("use_frechet", False)
     use_riemannian_metric = kwargs.get("use_riemannian_metric", False)
+    use_temporal_cov = kwargs.get("use_temporal_cov", False)
     merge_k = kwargs.get("merge_k", 0)
     model = DownstreamRiemannTransformerPara(
         num_classes=num_classes, checkpoint_path=checkpoint_path,
         log_mode=log_mode, use_frechet=use_frechet,
         use_riemannian_metric=use_riemannian_metric,
+        use_temporal_cov=use_temporal_cov,
         merge_k=merge_k,
     )
     return model
@@ -1040,6 +1042,11 @@ def main():
         help="ToME-style token merging: total number of temporal token pairs to merge, "
              "distributed evenly across encoder layers. 0 = disabled (default).",
     )
+    parser.add_argument(
+        "--use_temporal_cov", action="store_true", default=False,
+        help="Enable temporal covariance attention bias on temporal heads. "
+             "Must match the pretraining config (use_temporal_cov=True).",
+    )
 
     args = parser.parse_args()
 
@@ -1095,6 +1102,7 @@ def main():
         use_frechet=args.use_frechet,
         use_riemannian_metric=args.use_riemannian_metric,
         merge_k=args.merge_k,
+        use_temporal_cov=args.use_temporal_cov,
     )
 
     print(f"\n{'='*60}")
