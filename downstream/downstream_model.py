@@ -390,6 +390,10 @@ class DownstreamRiemannTransformerPara(Downstream):
 
     def __init__(self, *args, aggregation="avg", use_frechet=False,
                  use_temporal_cov=False, **kwargs):
+        # Pop kwargs that are specific to this subclass and not accepted by base Downstream
+        kwargs.pop("log_mode", None)
+        kwargs.pop("use_riemannian_metric", None)
+        kwargs.pop("merge_k", None)
         self._use_frechet = use_frechet
         self._use_temporal_cov = use_temporal_cov
         if aggregation == "class":
