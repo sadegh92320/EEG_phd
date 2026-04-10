@@ -262,7 +262,7 @@ class ImportFACED(DataImport):
 
 if __name__ == "__main__":
     data_import = ImportFACED()
-    data_import.import_data_to_hdf5(input_dir="/Users/sadeghemami/Downloads/FACEDprocess", window_sec=None)
+    data_import.import_data_to_hdf5(input_dir="/Users/sadeghemami/Downloads/FACEDprocess", window_sec=10)
     for split in ['train', 'val']:
         with h5py.File(f'downstream/data/faced/{split}.h5', 'r') as f:
             print(f'=== {split}.h5 ===')
