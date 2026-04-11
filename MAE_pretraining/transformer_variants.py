@@ -1118,8 +1118,11 @@ class AdaptiveLogMap(nn.Module):
         else:
             # Padé [1,1] approximant of matrix logarithm:
             # log(S) ≈ 2(S - I)(I + S)^{-1}
-            X = S - I
-            T = torch.linalg.solve(I + S, 2 * X)
+            # Must disable autocast — linalg.solve has no fp16 CUDA kernel
+            with torch.amp.autocast('cuda', enabled=False), \
+                 torch.amp.autocast('cpu', enabled=False):
+                X = S.float() - I.float()
+                T = torch.linalg.solve(I.float() + S.float(), 2 * X)
 
             # ── NaN/Inf guard after Padé ──
             if torch.isnan(T).any() or torch.isinf(T).any():
