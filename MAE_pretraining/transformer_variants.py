@@ -1202,20 +1202,29 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
 
 class TemporalCovarianceAttentionBias(nn.Module):
     """
-    Contribution 2: Temporal dynamics of spatial covariance.
+    Contribution 2: Temporal dynamics of spatial covariance (Log-Euclidean).
 
     Captures HOW the brain's spatial structure evolves over time by computing
-    per-timestep channel covariance matrices and their pairwise Frobenius
-    distances. This (N, N) distance matrix is a data-dependent temporal
-    signal: "timesteps t and s have similar/different spatial configurations."
+    per-timestep channel covariance matrices, projecting each to the tangent
+    space at identity via Pade [1,1] log map, then measuring pairwise
+    Log-Euclidean distance: d(t,s) = ||log(S_t) - log(S_s)||_F.
 
-    Implementation: additive bias on temporal attention logits (same pattern
-    as the Riemannian spatial bias), with learned per-head scales initialized
-    near zero for safe warm-up.
+    This is a proper Riemannian metric on SPD(C), and uses the SAME Pade
+    log map as the spatial Riemannian bias, unifying both contributions
+    under one geometric framework.
+
+    Computed per-layer from the residual stream (pre-LayerNorm), matching
+    exactly how the spatial Riemannian bias operates. This avoids information
+    leakage about masked tokens during pretraining.
+
+    Implementation: additive bias on temporal attention logits with learned
+    per-head scales initialized near zero for safe warm-up.
 
     Unified geometric framework:
-        - Spatial heads: Riemannian bias from per-sample channel covariance
-        - Temporal heads: bias from dynamics of that same covariance over time
+        - Spatial heads: log(S) as (C,C) attention bias (channel structure)
+        - Temporal heads: ||log(S_t) - log(S_s)||_F as (N,N) attention bias
+          (how channel structure evolves over time)
+        - Both use Pade [1,1]: log(S) ~ 2(S-I)(I+S)^{-1}
     """
     def __init__(self, num_heads):
         super().__init__()
@@ -1225,29 +1234,44 @@ class TemporalCovarianceAttentionBias(nn.Module):
 
     @staticmethod
     @torch.no_grad()
-    def compute_temporal_cov_dist(x_patches, num_chan):
+    def compute_temporal_cov_dist(residual, num_chan):
         """
-        Compute pairwise Frobenius distance between per-timestep covariances.
+        Compute pairwise Log-Euclidean distance between per-timestep
+        covariances, using Pade [1,1] tangent-space projection.
+
+        Computed from the residual stream (pre-LayerNorm) at each layer,
+        consistent with how the spatial Riemannian bias operates.
 
         Args:
-            x_patches: (B, N, C, D) patch embeddings BEFORE masking
-            num_chan: C
+            residual: (B, L, D) residual stream where L = N * C
+            num_chan: C (number of EEG channels)
 
         Returns:
-            dist: (B, N, N) pairwise Frobenius distance matrix (float32)
+            dist: (B, N, N) pairwise Log-Euclidean distance matrix (float32)
         """
-        # All in float32 to avoid fp16 overflow in covariance computation
-        x = x_patches.float()  # (B, N, C, D)
-        B, N, C, D = x.shape
+        B, L, D = residual.shape
+        C = num_chan
+        N = L // C
 
-        # Per-timestep covariance: S_t = X_t X_t^T / D
+        # Reshape to (B, N, C, D) for per-timestep covariance
+        x = rearrange(residual.float(), 'b (n c) d -> b n c d', c=C)
+
+        # Per-timestep covariance: S_t = X_t X_t^T / D + eps*I
         cov = torch.matmul(x, x.transpose(-1, -2)) / D  # (B, N, C, C)
+        eye = torch.eye(C, device=cov.device, dtype=cov.dtype)
+        cov = cov + 1e-5 * eye  # SPD regularization
 
-        # Pairwise Frobenius distance: ||S_t - S_s||_F
-        # Efficient: ||A-B||_F^2 = ||A||_F^2 + ||B||_F^2 - 2*tr(A^T B)
-        cov_flat = cov.reshape(B, N, C * C)  # (B, N, C*C)
-        norms_sq = (cov_flat ** 2).sum(dim=-1)  # (B, N)
-        cross = torch.bmm(cov_flat, cov_flat.transpose(-1, -2))  # (B, N, N)
+        # Pade [1,1] log map: log(S) ~ 2(S - I)(I + S)^{-1}
+        # Same tangent-space projection as spatial Riemannian bias
+        X = cov - eye  # (B, N, C, C)
+        # Solve (I + S) L = 2X  =>  L = (I + S)^{-1} 2X
+        tangent = torch.linalg.solve(eye + cov, 2.0 * X)  # (B, N, C, C)
+
+        # Pairwise Frobenius distance in tangent space (= Log-Euclidean distance)
+        # ||L_t - L_s||_F^2 = ||L_t||_F^2 + ||L_s||_F^2 - 2*tr(L_t^T L_s)
+        tangent_flat = tangent.reshape(B, N, C * C)  # (B, N, C*C)
+        norms_sq = (tangent_flat ** 2).sum(dim=-1)  # (B, N)
+        cross = torch.bmm(tangent_flat, tangent_flat.transpose(-1, -2))  # (B, N, N)
         dist_sq = norms_sq.unsqueeze(-1) + norms_sq.unsqueeze(-2) - 2 * cross
         dist_sq = dist_sq.clamp(min=0)  # numerical safety
         dist = torch.sqrt(dist_sq + 1e-8)  # (B, N, N)
@@ -1259,7 +1283,7 @@ class TemporalCovarianceAttentionBias(nn.Module):
         Compute per-head additive bias from temporal covariance distance.
 
         Args:
-            temporal_cov_dist: (B, N, N) pairwise Frobenius distance
+            temporal_cov_dist: (B, N, N) pairwise Log-Euclidean distance
 
         Returns:
             bias: (B, H, N, N) additive bias for temporal attention logits
@@ -1338,14 +1362,15 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             x_norm: (B, L, D) normalized input (post-LayerNorm) — used for QKV
             num_chan: number of EEG channels C in this batch
             residual: (B, L, D) raw residual stream (pre-LayerNorm) — used for
-                      Riemannian bias. If None, falls back to x_norm.
+                      both Riemannian spatial bias and temporal covariance bias.
+                      If None, falls back to x_norm.
             channel_idx: (C,) long tensor — global channel indices for this batch.
                          Required for the adaptive reference submatrix extraction.
             ema_ref: optional (C, C) population covariance from EMAGeometricGraph.
                      Used as the tangent space reference point in approx mode.
-            temporal_cov_dist: optional (B, N, N) pairwise Frobenius distance
-                     between per-timestep covariance matrices. When provided and
-                     use_temporal_cov=True, added as bias to temporal attention.
+            temporal_cov_dist: optional (B, N, N) precomputed temporal covariance
+                     distance. If None and use_temporal_cov=True, computed
+                     per-layer from the residual stream (preferred).
         """
         B, L, D = x_norm.shape
         assert L % num_chan == 0
@@ -1367,6 +1392,14 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
         k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
         v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
+
+        # Compute temporal covariance distance per-layer from residual stream
+        # (same pattern as spatial Riemannian bias: both from residual, per-layer)
+        if self.use_temporal_cov and temporal_cov_dist is None:
+            bias_source = residual if residual is not None else x_norm
+            temporal_cov_dist = TemporalCovarianceAttentionBias.compute_temporal_cov_dist(
+                bias_source, num_chan
+            )  # (B, N, N)
 
         if self.use_temporal_cov and temporal_cov_dist is not None:
             # Manual temporal attention with covariance bias (same pattern as spatial)
@@ -1486,10 +1519,12 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
             ema_ref: optional (C, C) population covariance from EMAGeometricGraph.
                      Used as the tangent space reference point in approx mode.
                      If None, falls back to identity (S - I).
-            temporal_cov_dist: optional (B, N, N) temporal covariance distance.
-                     Passed to temporal attention heads as additive bias.
+            temporal_cov_dist: optional (B, N, N) precomputed temporal covariance
+                     distance. If None and use_temporal_cov=True, the attention
+                     layer computes it per-layer from the residual stream.
         """
         # Pass normalized input for QKV, raw residual for Riemannian bias
+        # Temporal cov dist is computed per-layer inside attn from residual
         x = x + self.drop_path1(
             self.attn(self.norm1(x), num_chan, residual=x,
                       channel_idx=channel_idx, ema_ref=ema_ref,

@@ -14,11 +14,11 @@ def merge_token(x, num_channels, k):
     spatial information and should be merged.
 
     Criterion: for each time step t, compute the channel covariance
-    S_t = X_t @ X_t^T / D (a C×C SPD matrix), project to the tangent space
-    at identity via T_t = S_t - I (consistent with the S - I Riemannian bias
-    used in pretraining), then measure similarity between tangent vectors.
-    This ties token merging directly to the same geometric framework as the
-    Riemannian spatial attention.
+    S_t = X_t @ X_t^T / D (a C*C SPD matrix), project to the tangent space
+    at identity via Pade [1,1] log map: L_t = 2(S_t - I)(I + S_t)^{-1},
+    then measure cosine similarity between tangent vectors.
+    This ties token merging directly to the same geometric framework as
+    the Riemannian spatial attention bias and temporal covariance bias.
 
     Merging is done at the time-step level (all channels for a time step are
     merged together), not per-channel independently.
@@ -34,7 +34,7 @@ def merge_token(x, num_channels, k):
     B, L, D = x.shape
     C = num_channels
 
-    # Reshape to (B, N, C, D) — time steps × channels × embedding
+    # Reshape to (B, N, C, D) — time steps x channels x embedding
     x = rearrange(x, "b (n c) d -> b n c d", c=C)
     B, N, C, D = x.shape
 
@@ -49,16 +49,23 @@ def merge_token(x, num_channels, k):
     # --- Covariance-based bipartite matching (no gradients through routing) ---
     with torch.no_grad():
         # Compute per-time-step channel covariance: S_t = X_t @ X_t^T / D
-        # x_even: (B, N_even, C, D) → cov_even: (B, N_even, C, C)
-        cov_even = x_even @ x_even.transpose(-1, -2) / D
-        cov_odd = x_odd @ x_odd.transpose(-1, -2) / D
+        # x_even: (B, N_even, C, D) -> cov_even: (B, N_even, C, C)
+        cov_even = x_even.float() @ x_even.float().transpose(-1, -2) / D
+        cov_odd = x_odd.float() @ x_odd.float().transpose(-1, -2) / D
 
-        # Project to tangent space at identity: T = S - I
-        eye = torch.eye(C, device=x.device, dtype=x.dtype)
-        tan_even = cov_even - eye  # (B, N_even, C, C)
-        tan_odd = cov_odd - eye    # (B, N_odd, C, C)
+        # SPD regularization
+        eye = torch.eye(C, device=x.device, dtype=torch.float32)
+        cov_even = cov_even + 1e-5 * eye
+        cov_odd = cov_odd + 1e-5 * eye
 
-        # Vectorize upper triangle (symmetric → vector)
+        # Project to tangent space via Pade [1,1]: log(S) ~ 2(S-I)(I+S)^{-1}
+        # Same log map used by spatial Riemannian bias and temporal cov bias
+        X_even = cov_even - eye
+        X_odd = cov_odd - eye
+        tan_even = torch.linalg.solve(eye + cov_even, 2.0 * X_even)  # (B, N_even, C, C)
+        tan_odd = torch.linalg.solve(eye + cov_odd, 2.0 * X_odd)    # (B, N_odd, C, C)
+
+        # Vectorize upper triangle (symmetric -> vector)
         # This avoids redundant lower-triangle entries
         idx = torch.triu_indices(C, C, device=x.device)
         vec_even = tan_even[:, :, idx[0], idx[1]]  # (B, N_even, C*(C+1)/2)

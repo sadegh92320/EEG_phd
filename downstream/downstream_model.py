@@ -14,7 +14,6 @@ from MAE_pretraining.transformer_variants import (
     RiemannianParallelCrissCrossTransformer,
     AdaptiveRiemannianParallelTransformer,
     EMAGeometricGraph,
-    TemporalCovarianceAttentionBias,
 )
 
 
@@ -412,11 +411,12 @@ class DownstreamRiemannTransformerPara(Downstream):
             ) for _ in range(depth_e)
         ])
 
-    def _run_encoder(self, x, C, channel_idx=None, temporal_cov_dist=None):
-        """Adaptive Riemannian parallel transformer needs num_chan + channel_idx."""
+    def _run_encoder(self, x, C, channel_idx=None):
+        """Adaptive Riemannian parallel transformer needs num_chan + channel_idx.
+        Temporal covariance distance is computed per-layer inside each
+        transformer from the residual stream when use_temporal_cov=True."""
         for transformer in self.encoder:
-            x = transformer(x, num_chan=C, channel_idx=channel_idx,
-                            temporal_cov_dist=temporal_cov_dist)
+            x = transformer(x, num_chan=C, channel_idx=channel_idx)
         return x
 
     def forward(self, x, channel_list):
@@ -427,13 +427,9 @@ class DownstreamRiemannTransformerPara(Downstream):
         x = self.patch(x)
         N = x.shape[1]
 
-        # Compute temporal covariance distance BEFORE flattening
-        # x is (B, N, C, D) here — perfect shape for per-timestep cov
-        temporal_cov_dist = None
-        if self._use_temporal_cov:
-            temporal_cov_dist = TemporalCovarianceAttentionBias.compute_temporal_cov_dist(
-                x, C
-            )  # (B, N, N)
+        # Temporal covariance distance is NOT precomputed here.
+        # Each transformer layer computes it per-layer from the residual
+        # stream (pre-LayerNorm), matching the spatial Riemannian bias pattern.
 
         x = rearrange(x, "b n c d -> b (n c) d")
         L = x.shape[1]
@@ -456,8 +452,7 @@ class DownstreamRiemannTransformerPara(Downstream):
         channel_idx = channel_list[0]  # (C,) global channel indices
 
         # Encoder (no class token — sequence is exactly N*C)
-        x = self._run_encoder(x, C, channel_idx=channel_idx,
-                              temporal_cov_dist=temporal_cov_dist)
+        x = self._run_encoder(x, C, channel_idx=channel_idx)
         x = self.norm_enc(x)
 
         # Head: cls_out unused for avg pooling, pass None-like placeholder

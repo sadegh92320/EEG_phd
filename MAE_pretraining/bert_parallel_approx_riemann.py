@@ -332,13 +332,10 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         N = x.shape[1]
 
         # ── Temporal covariance distance (Contribution 2) ──
-        # Compute BEFORE masking and flattening, from clean patch embeddings.
-        # x is (B, N, C, D) at this point — perfect shape for per-timestep cov.
-        temporal_cov_dist = None
-        if self.use_temporal_cov:
-            temporal_cov_dist = TemporalCovarianceAttentionBias.compute_temporal_cov_dist(
-                x, C
-            )  # (B, N, N), float32, no_grad
+        # NOT precomputed here. Each transformer layer computes it per-layer
+        # from the residual stream (pre-LayerNorm), matching the spatial
+        # Riemannian bias pattern. This avoids information leakage about
+        # masked tokens during pretraining.
 
         L = x.shape[1] * x.shape[2]
         x = x.reshape(B, L, -1)
@@ -366,9 +363,10 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         channel_idx = channel_list[0]  # (C,) global channel indices
 
         # Pass through adaptive Riemannian transformer layers
+        # Temporal cov dist is computed per-layer inside each transformer
+        # from the residual stream when use_temporal_cov=True
         for transformer in self.encoder:
-            x = transformer(x, C, channel_idx=channel_idx,
-                            temporal_cov_dist=temporal_cov_dist)
+            x = transformer(x, C, channel_idx=channel_idx)
 
         x = self.norm_enc(x)
         x = self.fc(x)
