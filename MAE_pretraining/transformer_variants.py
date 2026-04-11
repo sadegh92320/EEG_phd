@@ -1253,28 +1253,32 @@ class TemporalCovarianceAttentionBias(nn.Module):
         C = num_chan
         N = L // C
 
-        # Reshape to (B, N, C, D) for per-timestep covariance
-        x = rearrange(residual.float(), 'b (n c) d -> b n c d', c=C)
+        # All computation in float32 — disable autocast to prevent
+        # mixed-precision downcasting (linalg.solve requires float32)
+        with torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False):
+            # Reshape to (B, N, C, D) for per-timestep covariance
+            x = rearrange(residual.float(), 'b (n c) d -> b n c d', c=C)
 
-        # Per-timestep covariance: S_t = X_t X_t^T / D + eps*I
-        cov = torch.matmul(x, x.transpose(-1, -2)) / D  # (B, N, C, C)
-        eye = torch.eye(C, device=cov.device, dtype=cov.dtype)
-        cov = cov + 1e-5 * eye  # SPD regularization
+            # Per-timestep covariance: S_t = X_t X_t^T / D + eps*I
+            cov = torch.matmul(x, x.transpose(-1, -2)) / D  # (B, N, C, C)
+            eye = torch.eye(C, device=cov.device, dtype=cov.dtype)
+            cov = cov + 1e-5 * eye  # SPD regularization
 
-        # Pade [1,1] log map: log(S) ~ 2(S - I)(I + S)^{-1}
-        # Same tangent-space projection as spatial Riemannian bias
-        X = cov - eye  # (B, N, C, C)
-        # Solve (I + S) L = 2X  =>  L = (I + S)^{-1} 2X
-        tangent = torch.linalg.solve(eye + cov, 2.0 * X)  # (B, N, C, C)
+            # Pade [1,1] log map: log(S) ~ 2(S - I)(I + S)^{-1}
+            # Same tangent-space projection as spatial Riemannian bias
+            X = cov - eye  # (B, N, C, C)
+            # Solve (I + S) L = 2X  =>  L = (I + S)^{-1} 2X
+            tangent = torch.linalg.solve(eye + cov, 2.0 * X)  # (B, N, C, C)
 
-        # Pairwise Frobenius distance in tangent space (= Log-Euclidean distance)
-        # ||L_t - L_s||_F^2 = ||L_t||_F^2 + ||L_s||_F^2 - 2*tr(L_t^T L_s)
-        tangent_flat = tangent.reshape(B, N, C * C)  # (B, N, C*C)
-        norms_sq = (tangent_flat ** 2).sum(dim=-1)  # (B, N)
-        cross = torch.bmm(tangent_flat, tangent_flat.transpose(-1, -2))  # (B, N, N)
-        dist_sq = norms_sq.unsqueeze(-1) + norms_sq.unsqueeze(-2) - 2 * cross
-        dist_sq = dist_sq.clamp(min=0)  # numerical safety
-        dist = torch.sqrt(dist_sq + 1e-8)  # (B, N, N)
+            # Pairwise Frobenius distance in tangent space (= Log-Euclidean distance)
+            # ||L_t - L_s||_F^2 = ||L_t||_F^2 + ||L_s||_F^2 - 2*tr(L_t^T L_s)
+            tangent_flat = tangent.reshape(B, N, C * C)  # (B, N, C*C)
+            norms_sq = (tangent_flat ** 2).sum(dim=-1)  # (B, N)
+            cross = torch.bmm(tangent_flat, tangent_flat.transpose(-1, -2))  # (B, N, N)
+            dist_sq = norms_sq.unsqueeze(-1) + norms_sq.unsqueeze(-2) - 2 * cross
+            dist_sq = dist_sq.clamp(min=0)  # numerical safety
+            dist = torch.sqrt(dist_sq + 1e-8)  # (B, N, N)
 
         return dist
 
