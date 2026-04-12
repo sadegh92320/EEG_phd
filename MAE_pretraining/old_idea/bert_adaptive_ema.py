@@ -40,7 +40,7 @@ import os
 import torch.nn.init as init
 from MAE_pretraining.transformer_variants import (
     AdaptiveRiemannianParallelTransformer,
-    EMAGeometricGraph,
+   
 )
 
 
@@ -143,10 +143,7 @@ class AdaptiveRiemannEMABert(pl.LightningModule):
 
         # EMA geometric graph — population-level channel connectivity
         # num_heads=4 because spatial heads = total_heads // 2 = 8 // 2 = 4
-        self.ema_graph = EMAGeometricGraph(
-            total_channels=144, momentum=ema_momentum, num_heads=4
-        )
-
+       
         self.mask_prob = mask_prob
         self.patch_size = patch_size
         self.patch = PatchEEG(patch_size=patch_size, embed_dim=enc_dim)
