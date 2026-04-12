@@ -1129,6 +1129,7 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
             channel_idx: (C,) long tensor — global channel indices for this batch
         Returns:
             bias: (B*N, num_heads, C, C) attention bias per head
+            L: (B*N, C, C) raw tangent vectors (reused for cross-channel mixing)
         """
         BN, C, D = x.shape
 
@@ -1148,7 +1149,7 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         scales = self.head_scales.view(1, self.num_heads, 1, 1)
         bias = L.unsqueeze(1) * scales
 
-        return bias
+        return bias, L
 
 
 
@@ -1258,28 +1259,14 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             mask_space = rearrange(mask, 'b (n c) -> (b n) c', c=num_chan)
             x_space = x_space * (~mask_space).unsqueeze(-1).float()
 
-        # Compute Riemannian bias — returns (B*N, H2, C, C)
-        # Internally computes S_n and L_n = log(S_n) via Padé [1,1]
-        riem_bias = self.riemannian_bias(x_space, channel_idx)
+        # Compute Riemannian bias + raw tangent vectors L_n (computed once, reused)
+        # riem_bias: (B*N, H2, C, C) — spatial attention bias
+        # L_n: (B*N, C, C) — tangent vectors reused for cross-channel mixing
+        riem_bias, L_n = self.riemannian_bias(x_space, channel_idx)
 
         # ── Contribution 2: Geometric Cross-Channel Mixing ──
-        # Extract L_n from the adaptive_log map for reuse
-        # Recompute S and L_n for the mixing (lightweight — just bmm + Padé)
-        with torch.no_grad():
-            BN, C, D_space = x_space.shape
-            with torch.amp.autocast('cuda', enabled=False), \
-                 torch.amp.autocast('cpu', enabled=False):
-                x_f32 = x_space.float()
-                S_n = torch.bmm(x_f32, x_f32.transpose(-2, -1)) / D_space
-                eps = self.riemannian_bias.eps
-                S_n = S_n + eps * torch.eye(C, device=S_n.device, dtype=S_n.dtype).unsqueeze(0)
-                # Padé [1,1]: log(S) ≈ 2(S - I)(I + S)^{-1}
-                I = torch.eye(C, device=S_n.device, dtype=S_n.dtype).unsqueeze(0)
-                X_cov = S_n - I
-                L_chol = torch.linalg.cholesky(I + S_n)
-                L_n = torch.cholesky_solve(2.0 * X_cov, L_chol)  # (B*N, C, C)
-
-        # Apply geometric mixing: G = L_n @ x_norm (cross-channel structure)
+        # Reuse L_n from the spatial bias computation (no redundant Padé)
+        BN = L_n.shape[0]
         x_norm_space = rearrange(x_norm, 'b (n c) d -> (b n) c d', c=num_chan)
         G = torch.bmm(L_n.detach().to(x_norm_space.dtype), x_norm_space)  # (B*N, C, D)
 
