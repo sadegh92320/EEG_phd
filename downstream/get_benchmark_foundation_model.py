@@ -31,7 +31,6 @@ from downstream.training_model import TrainerDownstream, EarlyStopper, FIXED_HP
 from downstream.downstream_model import (
     Downstream, DownstreamGNN, DownstreamRiemannLoss,
     DownstreamRiemannTransformerPara, DownstreamRiemannTransformerSeq,
-    DownstreamRiemannEMA,
 )
 
 # ────────────────────────────────────────────────────────────────
@@ -163,18 +162,9 @@ def build_riemann_loss(num_classes, checkpoint_path, num_channels, data_length, 
     return model
 
 def build_riemann_transformer_para(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
-    """Adaptive Riemannian parallel transformer (Padé log map, learned SPD reference)."""
-    log_mode = kwargs.get("log_mode", "pade")
-    use_frechet = kwargs.get("use_frechet", False)
-    use_riemannian_metric = kwargs.get("use_riemannian_metric", False)
-    use_temporal_cov = kwargs.get("use_temporal_cov", False)
-    merge_k = kwargs.get("merge_k", 0)
+    """Adaptive Riemannian parallel transformer (Padé log map + geometric cross-channel mixing)."""
     model = DownstreamRiemannTransformerPara(
         num_classes=num_classes, checkpoint_path=checkpoint_path,
-        log_mode=log_mode, use_frechet=use_frechet,
-        use_riemannian_metric=use_riemannian_metric,
-        use_temporal_cov=use_temporal_cov,
-        merge_k=merge_k,
     )
     return model
 
@@ -182,10 +172,6 @@ def build_riemann_transformer_seq(num_classes, checkpoint_path, num_channels, da
     model = DownstreamRiemannTransformerSeq(num_classes=num_classes, checkpoint_path=checkpoint_path)
     return model
 
-def build_riemann_ema(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
-    """Adaptive Riemannian parallel transformer + EMA population covariance as reference."""
-    model = DownstreamRiemannEMA(num_classes=num_classes, checkpoint_path=checkpoint_path)
-    return model
 
 def _partial_unfreeze(model, block_container, num_total_blocks, finetune_layers, head_modules):
     """
@@ -634,7 +620,6 @@ MODEL_BUILDERS = {
     "riemann_loss": build_riemann_loss,
     "riemann_para": build_riemann_transformer_para,
     "riemann_adaptive": build_riemann_transformer_para,  # alias — same model
-    "riemann_ema": build_riemann_ema,
     "riemann_seq": build_riemann_transformer_seq,
 }
 
@@ -1117,24 +1102,9 @@ def main():
              "If not set, uses the default from MODEL_PREPROCESS_CONFIG for the model.",
     )
     parser.add_argument(
-        "--use_frechet", action="store_true", default=False,
-        help="Enable Fréchet whitening for riemann_para/riemann_adaptive models. "
-             "The R_inv_sqrt buffer is loaded from the checkpoint automatically.",
-    )
-    parser.add_argument(
-        "--use_riemannian_metric", action="store_true", default=False,
-        help="Enable learned per-head Riemannian metric M in spatial attention. "
-             "M = L @ L^T (Cholesky-parameterized SPD). Loaded from checkpoint.",
-    )
-    parser.add_argument(
         "--merge_k", type=int, default=0,
         help="ToME-style token merging: total number of temporal token pairs to merge, "
              "distributed evenly across encoder layers. 0 = disabled (default).",
-    )
-    parser.add_argument(
-        "--use_temporal_cov", action="store_true", default=False,
-        help="Enable temporal covariance attention bias on temporal heads. "
-             "Must match the pretraining config (use_temporal_cov=True).",
     )
 
     args = parser.parse_args()
@@ -1189,10 +1159,7 @@ def main():
         training_mode=args.training_mode,
         config_yaml=ds_cfg["config_yaml"],
         log_mode=args.log_mode,
-        use_frechet=args.use_frechet,
-        use_riemannian_metric=args.use_riemannian_metric,
         merge_k=args.merge_k,
-        use_temporal_cov=args.use_temporal_cov,
     )
 
     print(f"\n{'='*60}")

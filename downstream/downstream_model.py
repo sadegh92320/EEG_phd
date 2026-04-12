@@ -13,7 +13,6 @@ from MAE_pretraining.transformer_variants import (
     RiemannianCrissCrossTransformer,
     RiemannianParallelCrissCrossTransformer,
     AdaptiveRiemannianParallelTransformer,
-    EMAGeometricGraph,
 )
 
 
@@ -387,14 +386,13 @@ class DownstreamRiemannTransformerPara(Downstream):
     aggregation="class" is NOT supported; use "avg" (default).
     """
 
-    def __init__(self, *args, aggregation="avg", use_frechet=False,
-                 use_temporal_cov=False, **kwargs):
+    def __init__(self, *args, aggregation="avg", **kwargs):
         # Pop kwargs that are specific to this subclass and not accepted by base Downstream
         kwargs.pop("log_mode", None)
         kwargs.pop("use_riemannian_metric", None)
         kwargs.pop("merge_k", None)
-        self._use_frechet = use_frechet
-        self._use_temporal_cov = use_temporal_cov
+        kwargs.pop("use_frechet", None)
+        kwargs.pop("use_temporal_cov", None)
         if aggregation == "class":
             raise ValueError(
                 "DownstreamRiemannTransformerPara does not use a [CLS] token. "
@@ -406,15 +404,12 @@ class DownstreamRiemannTransformerPara(Downstream):
         return nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
-                use_frechet=self._use_frechet,
-                use_temporal_cov=self._use_temporal_cov,
             ) for _ in range(depth_e)
         ])
 
     def _run_encoder(self, x, C, channel_idx=None):
         """Adaptive Riemannian parallel transformer needs num_chan + channel_idx.
-        Temporal covariance distance is computed per-layer inside each
-        transformer from the residual stream when use_temporal_cov=True."""
+        No mask during downstream (inference only)."""
         for transformer in self.encoder:
             x = transformer(x, num_chan=C, channel_idx=channel_idx)
         return x
@@ -426,10 +421,6 @@ class DownstreamRiemannTransformerPara(Downstream):
         # Patch embed
         x = self.patch(x)
         N = x.shape[1]
-
-        # Temporal covariance distance is NOT precomputed here.
-        # Each transformer layer computes it per-layer from the residual
-        # stream (pre-LayerNorm), matching the spatial Riemannian bias pattern.
 
         x = rearrange(x, "b n c d -> b (n c) d")
         L = x.shape[1]
@@ -464,173 +455,6 @@ class DownstreamRiemannTransformerPara(Downstream):
         else:
             return self.head(cls_out, patch_out)
 
-
-# ════════════════════════════════════════════════════════════════
-# Novelty 4b — Parallel Riemannian Transformer + EMA Reference
-# ════════════════════════════════════════════════════════════════
-
-class DownstreamRiemannEMA(Downstream):
-    """
-    Encoder: AdaptiveRiemannianParallelTransformer with EMA Geometric Graph
-    as the tangent space reference point.
-
-    The EMA graph (144×144 population covariance) is loaded from the
-    pretrained checkpoint and kept frozen. At forward time, the relevant
-    (C, C) submatrix is extracted and passed as ema_ref to every encoder
-    layer, so the Riemannian bias computes S - G_ema (deviation from
-    population average) instead of S - I.
-
-    Channel encoding: nn.Embedding (inherited from base).
-    """
-
-    def __init__(self, checkpoint_path, config=None,
-                 max_embedding=2000, enc_dim=512, depth_e=8,
-                 patch_size=16, aggregation="avg", num_classes=9,
-                 head_dropout=0.1, head_choice='linear',
-                 ema_momentum=0.99):
-        if aggregation == "class":
-            raise ValueError(
-                "DownstreamRiemannEMA does not use a [CLS] token. "
-                "Use aggregation='avg' instead."
-            )
-        # Build base (delay checkpoint loading)
-        super().__init__(
-            checkpoint_path=None, config=config, max_embedding=max_embedding,
-            enc_dim=enc_dim, depth_e=depth_e, patch_size=patch_size,
-            aggregation=aggregation, num_classes=num_classes,
-            head_dropout=head_dropout, head_choice=head_choice,
-        )
-
-        # EMA geometric graph — will be populated from pretrained checkpoint
-        self.ema_graph = EMAGeometricGraph(
-            total_channels=144, momentum=ema_momentum
-        )
-
-        # Load pretrained weights (encoder + ema_graph.G_ema buffer)
-        if checkpoint_path is not None:
-            self._load_pretrained(checkpoint_path)
-
-        # Freeze encoder + EMA graph (the graph is a buffer so already frozen,
-        # but this makes intent explicit)
-        self._freeze_encoder()
-
-    @staticmethod
-    def _build_encoder(enc_dim, depth_e):
-        return nn.ModuleList([
-            AdaptiveRiemannianParallelTransformer(
-                enc_dim, nhead=8, mlp_ratio=4, log_mode='pade'
-            ) for _ in range(depth_e)
-        ])
-
-    def _run_encoder(self, x, C, channel_idx=None, ema_ref=None):
-        """Adaptive Riemannian parallel transformer with EMA reference."""
-        for transformer in self.encoder:
-            x = transformer(x, num_chan=C, channel_idx=channel_idx, ema_ref=ema_ref)
-        return x
-
-    def _load_pretrained(self, checkpoint_path):
-        """
-        Load encoder weights + EMA graph from a pretrained EMA checkpoint.
-
-        Handles:
-          - Lightning checkpoints (state_dict under "state_dict" key)
-          - Key remapping: pretraining uses *_e suffix for encoder embeddings
-          - EMA graph buffer: ema_graph.G_ema, ema_graph.update_count
-          - Skips all decoder-related keys
-        """
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-
-        if "model" in ckpt:
-            state_dict = ckpt["model"]
-        elif "state_dict" in ckpt:
-            state_dict = ckpt["state_dict"]
-        else:
-            state_dict = ckpt
-
-        # Skip decoder + irrelevant keys
-        SKIP_PREFIXES = (
-            "decoder.", "encoder_decoder.", "mask_token",
-            "channel_embedding_d.", "temporal_embedding_d.",
-            "norm_dec.", "fc.", "criterion.",
-        )
-
-        # Remap encoder embedding names
-        KEY_REMAP = {
-            "channel_embedding_e.": "channel_embedding.",
-            "temporal_embedding_e.": "temporal_embedding.",
-        }
-
-        encoder_keys = {}
-        for k, v in state_dict.items():
-            if any(k.startswith(p) or k == p for p in SKIP_PREFIXES):
-                continue
-
-            new_k = k
-            for old_prefix, new_prefix in KEY_REMAP.items():
-                if k.startswith(old_prefix):
-                    new_k = new_prefix + k[len(old_prefix):]
-                    break
-
-            encoder_keys[new_k] = v
-
-        missing, unexpected = self.load_state_dict(encoder_keys, strict=False)
-
-        # head/fc are expected to be missing (new classification head)
-        missing_real = [k for k in missing
-                        if not k.startswith("fc") and not k.startswith("head")]
-        if missing_real:
-            print(f"  [DownstreamRiemannEMA] Missing keys: {missing_real}")
-        if unexpected:
-            print(f"  [DownstreamRiemannEMA] Unexpected keys (ignored): {unexpected}")
-
-        # Report EMA graph status
-        if "ema_graph.G_ema" in encoder_keys:
-            G = encoder_keys["ema_graph.G_ema"]
-            n_updated = (G.diag() != 1.0).sum().item()
-            print(f"  [DownstreamRiemannEMA] Loaded EMA graph: "
-                  f"{n_updated}/{G.shape[0]} channels have non-identity covariance")
-        else:
-            print(f"  [DownstreamRiemannEMA] WARNING: No EMA graph found in checkpoint, "
-                  f"using identity (equivalent to no EMA)")
-
-        print(f"  [DownstreamRiemannEMA] Loaded pretrained encoder from {checkpoint_path}")
-
-    def forward(self, x, channel_list):
-        B, C, T = x.shape
-        device = x.device
-
-        # Patch embed
-        x = self.patch(x)
-        N = x.shape[1]
-        x = rearrange(x, "b n c d -> b (n c) d")
-        L = x.shape[1]
-
-        # Channel embedding
-        if channel_list.dim() == 1:
-            channel_list = channel_list.unsqueeze(0).expand(B, -1)
-        x = x + self._get_channel_embedding(channel_list, N, B, L)
-
-        # Temporal embedding
-        seq_idx = torch.arange(0, N, device=device).unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
-        x = x + self.temporal_embedding(seq_idx)
-
-        # No class token — adaptive Riemannian attention requires L = N * C
-
-        # Extract global channel indices + EMA reference
-        channel_idx = channel_list[0]  # (C,) global channel indices
-        ema_ref = self.ema_graph.get_ref(channel_idx)  # (C, C) population covariance
-
-        # Encoder with EMA reference as tangent space base point
-        x = self._run_encoder(x, C, channel_idx=channel_idx, ema_ref=ema_ref)
-        x = self.norm_enc(x)
-
-        # Head
-        cls_out = x[:, :1, :]   # first patch token as dummy CLS
-        patch_out = x            # all tokens are patch tokens
-        if self.head_choice == "riemann":
-            return self.head(patch_out, C)
-        else:
-            return self.head(cls_out, patch_out)
 
 
 # ════════════════════════════════════════════════════════════════

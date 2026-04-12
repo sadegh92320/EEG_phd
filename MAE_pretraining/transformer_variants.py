@@ -1031,27 +1031,11 @@ class AdaptiveLogMap(nn.Module):
         'pade'   — Padé [1,1]: 2(S-I)(I+S)^{-1}  (good accuracy near I)
         'eigh'   — full eigendecomposition  (exact, expensive)
 
-    Optional Fréchet mean pre-whitening (use_frechet=True):
-        Instead of projecting at the identity, project at the offline
-        Fréchet mean R of the training covariance distribution:
-            S̃ = R^{-1/2} S R^{-1/2}     (whiten — brings S̃ close to I)
-            log(S̃) ≈ Padé(S̃)             (now accurate because S̃ ≈ I)
-
-        This is geometrically principled: R is the intrinsic center of
-        the data on the SPD manifold, so whitening minimizes the distance
-        ||S̃ - I|| across the training set, maximizing Padé accuracy.
-
-        The frozen R^{-1/2} is loaded from a precomputed file and stored
-        as a buffer (no gradients, moves with .to(device) automatically).
-
     Args:
         total_channels: Size of the global channel space (default 144)
         eps: Regularization constant for numerical stability
         log_mode: 'approx', 'pade', or 'eigh'
         use_approx: DEPRECATED — kept for backward compat.
-        use_frechet: If True, pre-whiten S with frozen Fréchet mean
-        frechet_R_inv_sqrt: (C, C) tensor — precomputed R^{-1/2}.
-                            Required if use_frechet=True. Register as buffer.
     """
     def __init__(self, total_channels=TOTAL_GLOBAL_CHANNELS, eps=1e-5,
                  log_mode='eigh', use_approx=False,
@@ -1059,7 +1043,6 @@ class AdaptiveLogMap(nn.Module):
         super().__init__()
         self.eps = eps
         self.total_channels = total_channels
-        self.use_frechet = use_frechet
 
         # Backward compat: use_approx=True overrides log_mode
         if use_approx:
@@ -1067,50 +1050,17 @@ class AdaptiveLogMap(nn.Module):
         else:
             self.log_mode = log_mode
 
-        # Frozen Fréchet mean reference (no gradients, moves with device)
-        if use_frechet and frechet_R_inv_sqrt is not None:
-            self.register_buffer('R_inv_sqrt', frechet_R_inv_sqrt)
-        else:
-            self.R_inv_sqrt = None
-
-    def forward(self, S, channel_idx=None, ema_ref=None):
+    def forward(self, S, channel_idx=None):
         """
         Args:
             S: (batch, C, C) batch of SPD matrices
-            channel_idx: (C,) global channel indices — used to extract
-                         the correct submatrix of R^{-1/2} when use_frechet=True
-            ema_ref: unused, kept for API compatibility
+            channel_idx: (C,) global channel indices (unused, kept for API compat)
         Returns:
             (batch, C, C) tangent vectors
         """
         orig_dtype = S.dtype
         C = S.shape[-1]
         I = torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
-
-        # ── Optional Fréchet pre-whitening ──
-        # S̃ = R^{-1/2} S R^{-1/2}  (centered at Fréchet mean, close to I)
-        S_before = S  # keep original in case whitening fails
-        if self.use_frechet and self.R_inv_sqrt is not None:
-            # Extract the C×C submatrix for this batch's channels
-            if channel_idx is not None and self.R_inv_sqrt.shape[0] > C:
-                R_sub = self.R_inv_sqrt[channel_idx][:, channel_idx]  # (C, C)
-            else:
-                R_sub = self.R_inv_sqrt[:C, :C]  # fallback: take first C
-            R_sub = R_sub.to(S.dtype).unsqueeze(0)  # (1, C, C)
-            S = R_sub @ S @ R_sub.transpose(-1, -2)
-            # Re-symmetrize (numerical safety after two matmuls)
-            S = 0.5 * (S + S.transpose(-1, -2))
-
-            # ── NaN/Inf guard after whitening ──
-            if torch.isnan(S).any() or torch.isinf(S).any():
-                print(f"[AdaptiveLogMap] NaN/Inf AFTER Fréchet whitening!")
-                print(f"  S_whitened range: [{S[~torch.isnan(S)].min().item():.4f}, "
-                      f"{S[~torch.isnan(S)].max().item():.4f}]")
-                print(f"  R_sub range: [{R_sub.min().item():.4f}, {R_sub.max().item():.4f}]")
-                print(f"  S_original diag: [{S_before.diagonal(dim1=-2,dim2=-1).min().item():.4f}, "
-                      f"{S_before.diagonal(dim1=-2,dim2=-1).max().item():.4f}]")
-                # Fall back to un-whitened S to avoid crash
-                S = S_before
 
         # ── Tangent-space projection ──
         if self.log_mode == 'approx':
@@ -1156,8 +1106,6 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         eps: Regularization for SPD matrix
         log_mode: 'approx', 'pade', or 'eigh' (see AdaptiveLogMap)
         use_approx: DEPRECATED — kept for backward compat.
-        use_frechet: If True, pre-whiten S with frozen Fréchet mean
-        frechet_R_inv_sqrt: (C, C) tensor — precomputed R^{-1/2}
     """
     def __init__(self, num_heads, total_channels=TOTAL_GLOBAL_CHANNELS,
                  eps=1e-5, log_mode='eigh', use_approx=False,
@@ -1168,24 +1116,19 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         self.adaptive_log = AdaptiveLogMap(
             total_channels=total_channels, eps=eps,
             log_mode=log_mode, use_approx=use_approx,
-            use_frechet=use_frechet,
-            frechet_R_inv_sqrt=frechet_R_inv_sqrt,
         )
 
         # Per-head learnable scaling — initialized to 0 so the model starts
         # as standard Euclidean attention and learns to use the bias
         self.head_scales = nn.Parameter(torch.zeros(num_heads))
 
-    def forward(self, x, channel_idx, return_covariance=False, ema_ref=None):
+    def forward(self, x, channel_idx):
         """
         Args:
             x: (B*N, C, D) channel embeddings (from residual stream)
             channel_idx: (C,) long tensor — global channel indices for this batch
-            return_covariance: if True, also return the raw covariance S
-            ema_ref: optional (C, C) population covariance from EMAGeometricGraph
         Returns:
             bias: (B*N, num_heads, C, C) attention bias per head
-            S (optional): (B*N, C, C) raw covariance (only if return_covariance=True)
         """
         BN, C, D = x.shape
 
@@ -1198,123 +1141,35 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
             S = torch.bmm(x_f32, x_f32.transpose(-2, -1)) / D
             S = S + self.eps * torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
 
-        # Step 2: Project to tangent space at reference (EMA population or identity)
-        L = self.adaptive_log(S, channel_idx, ema_ref=ema_ref)  # (B*N, C, C)
+        # Step 2: Project to tangent space at identity via Padé [1,1]
+        L = self.adaptive_log(S, channel_idx)  # (B*N, C, C)
 
         # Step 3: Per-head scaling
         scales = self.head_scales.view(1, self.num_heads, 1, 1)
         bias = L.unsqueeze(1) * scales
 
-        if return_covariance:
-            return bias, S
         return bias
 
-
-class TemporalCovarianceAttentionBias(nn.Module):
-    """
-    Contribution 2: Temporal dynamics of spatial covariance (Log-Euclidean).
-
-    Captures HOW the brain's spatial structure evolves over time by computing
-    per-timestep channel covariance matrices, projecting each to the tangent
-    space at identity via Pade [1,1] log map, then measuring pairwise
-    Log-Euclidean distance: d(t,s) = ||log(S_t) - log(S_s)||_F.
-
-    This is a proper Riemannian metric on SPD(C), and uses the SAME Pade
-    log map as the spatial Riemannian bias, unifying both contributions
-    under one geometric framework.
-
-    Computed per-layer from the residual stream (pre-LayerNorm), matching
-    exactly how the spatial Riemannian bias operates. This avoids information
-    leakage about masked tokens during pretraining.
-
-    Implementation: additive bias on temporal attention logits with learned
-    per-head scales initialized near zero for safe warm-up.
-
-    Unified geometric framework:
-        - Spatial heads: log(S) as (C,C) attention bias (channel structure)
-        - Temporal heads: ||log(S_t) - log(S_s)||_F as (N,N) attention bias
-          (how channel structure evolves over time)
-        - Both use Pade [1,1]: log(S) ~ 2(S-I)(I+S)^{-1}
-    """
-    def __init__(self, num_heads):
-        super().__init__()
-        # Learned per-head scale, initialized near zero so at start
-        # of training the model behaves identically to baseline
-        self.head_scales = nn.Parameter(torch.full((num_heads,), 0.01))
-
-    @staticmethod
-    @torch.no_grad()
-    def compute_temporal_cov_dist(residual, num_chan):
-        """
-        Compute pairwise Log-Euclidean distance between per-timestep
-        covariances, using Pade [1,1] tangent-space projection.
-
-        Computed from the residual stream (pre-LayerNorm) at each layer,
-        consistent with how the spatial Riemannian bias operates.
-
-        Args:
-            residual: (B, L, D) residual stream where L = N * C
-            num_chan: C (number of EEG channels)
-
-        Returns:
-            dist: (B, N, N) pairwise Log-Euclidean distance matrix (float32)
-        """
-        B, L, D = residual.shape
-        C = num_chan
-        N = L // C
-
-        # All computation in float32 — disable autocast to prevent
-        # mixed-precision downcasting (linalg.solve requires float32)
-        with torch.amp.autocast('cuda', enabled=False), \
-             torch.amp.autocast('cpu', enabled=False):
-            # Reshape to (B, N, C, D) for per-timestep covariance
-            x = rearrange(residual.float(), 'b (n c) d -> b n c d', c=C)
-
-            # Per-timestep covariance: S_t = X_t X_t^T / D + eps*I
-            cov = torch.matmul(x, x.transpose(-1, -2)) / D  # (B, N, C, C)
-            eye = torch.eye(C, device=cov.device, dtype=cov.dtype)
-            cov = cov + 1e-5 * eye  # SPD regularization
-
-            # Pade [1,1] log map: log(S) ~ 2(S - I)(I + S)^{-1}
-            # Same tangent-space projection as spatial Riemannian bias
-            X = cov - eye  # (B, N, C, C)
-            # Cholesky solve: I+S is SPD → Cholesky is stable and avoids
-            # CUDA misaligned-address bugs in linalg.solve
-            cov_cont = cov.contiguous()
-            L_chol = torch.linalg.cholesky(eye + cov_cont)
-            tangent = torch.cholesky_solve(2.0 * X, L_chol)  # (B, N, C, C)
-
-            # Pairwise Frobenius distance in tangent space (= Log-Euclidean distance)
-            # ||L_t - L_s||_F^2 = ||L_t||_F^2 + ||L_s||_F^2 - 2*tr(L_t^T L_s)
-            tangent_flat = tangent.reshape(B, N, C * C)  # (B, N, C*C)
-            norms_sq = (tangent_flat ** 2).sum(dim=-1)  # (B, N)
-            cross = torch.bmm(tangent_flat, tangent_flat.transpose(-1, -2))  # (B, N, N)
-            dist_sq = norms_sq.unsqueeze(-1) + norms_sq.unsqueeze(-2) - 2 * cross
-            dist_sq = dist_sq.clamp(min=0)  # numerical safety
-            dist = torch.sqrt(dist_sq + 1e-8)  # (B, N, N)
-
-        return dist
-
-    def forward(self, temporal_cov_dist):
-        """
-        Compute per-head additive bias from temporal covariance distance.
-
-        Args:
-            temporal_cov_dist: (B, N, N) pairwise Log-Euclidean distance
-
-        Returns:
-            bias: (B, H, N, N) additive bias for temporal attention logits
-        """
-        # dist: (B, N, N) -> (B, 1, N, N) * (1, H, 1, 1) -> (B, H, N, N)
-        scales = self.head_scales.view(1, -1, 1, 1)
-        # Negate: closer covariance = higher attention, farther = lower
-        bias = -temporal_cov_dist.unsqueeze(1) * scales
-        return bias
 
 
 class AdaptiveRiemannianParallelAttention(nn.Module):
     """
-    Parallel spatial-temporal attention with adaptive Riemannian bias.
+    Parallel spatial-temporal attention with:
+      - Contribution 1: Adaptive Riemannian bias on spatial heads
+      - Contribution 2: Geometric Cross-Channel Mixing on temporal heads
+
+    Geometric Cross-Channel Mixing injects brain-state awareness into temporal
+    attention. Each temporal head normally sees only one channel at a time
+    (B*C, N, D). The mixing enriches each token with cross-channel covariance
+    structure before temporal QKV projection:
+
+        L_n = log(S_n)  via Padé [1,1]  (already computed for spatial bias)
+        G = L_n @ x_norm                (geometric cross-channel mixing)
+        x_enriched = x_norm + α * normalize(G)
+
+    Temporal QKV is computed from x_enriched; spatial QKV from x_norm.
+    This gives temporal heads awareness of the full brain state geometry
+    at each time step without changing the spatial attention pathway.
 
     Supports variable channel counts across batches. The Riemannian reference
     lives in the global 144-channel space; each batch's channel indices select
@@ -1329,8 +1184,6 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         spd_eps: SPD regularization constant
         log_mode: 'approx', 'pade', or 'eigh' (see AdaptiveLogMap)
         use_approx: DEPRECATED — kept for backward compat.
-        use_frechet: If True, pre-whiten S with frozen Fréchet mean
-        frechet_R_inv_sqrt: (C, C) tensor — precomputed R^{-1/2}
     """
     def __init__(self, embed_dim, num_heads=8, total_channels=TOTAL_GLOBAL_CHANNELS,
                  dropout=0.1, att_dropout=0.1, spd_eps=1e-5,
@@ -1346,16 +1199,21 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.dim_head = embed_dim // num_heads
         self.embed_dim = embed_dim
         self.half_dim = self.heads_per_branch * self.dim_head
-        self.use_temporal_cov = use_temporal_cov
 
-        # Shared QKV projection
-        self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
-        # Output projection
+        # Separate QKV projections for temporal (enriched) and spatial (original)
+        self.qkv_temporal = nn.Linear(embed_dim, 3 * self.half_dim)
+        self.qkv_spatial = nn.Linear(embed_dim, 3 * self.half_dim)
+        # Output projection (full dimension — concatenation of both branches)
         self.fc = nn.Linear(embed_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
         self.att_dropout = att_dropout
 
+        # Contribution 2: Geometric cross-channel mixing scale
+        # Initialized small so the model starts close to standard attention
+        self.alpha = nn.Parameter(torch.full((1,), 0.01))
+
         # Adaptive Riemannian bias for spatial heads (global channel space)
+        # Also provides L_n (tangent vectors) reused for cross-channel mixing
         self.riemannian_bias = AdaptiveRiemannianAttentionBias(
             num_heads=self.heads_per_branch,
             total_channels=total_channels,
@@ -1366,28 +1224,18 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             frechet_R_inv_sqrt=frechet_R_inv_sqrt,
         )
 
-        # Temporal covariance bias for temporal heads (Contribution 2)
-        if use_temporal_cov:
-            self.temporal_cov_bias = TemporalCovarianceAttentionBias(
-                num_heads=self.heads_per_branch,
-            )
-
     def forward(self, x_norm, num_chan, residual=None, channel_idx=None,
-                ema_ref=None, temporal_cov_dist=None):
+                mask=None):
         """
         Args:
-            x_norm: (B, L, D) normalized input (post-LayerNorm) — used for QKV
+            x_norm: (B, L, D) normalized input (post-LayerNorm)
             num_chan: number of EEG channels C in this batch
             residual: (B, L, D) raw residual stream (pre-LayerNorm) — used for
-                      both Riemannian spatial bias and temporal covariance bias.
-                      If None, falls back to x_norm.
+                      Riemannian bias computation. If None, falls back to x_norm.
             channel_idx: (C,) long tensor — global channel indices for this batch.
-                         Required for the adaptive reference submatrix extraction.
-            ema_ref: optional (C, C) population covariance from EMAGeometricGraph.
-                     Used as the tangent space reference point in approx mode.
-            temporal_cov_dist: optional (B, N, N) precomputed temporal covariance
-                     distance. If None and use_temporal_cov=True, computed
-                     per-layer from the residual stream (preferred).
+            mask: (B, L) boolean — True = masked token. Used to zero out masked
+                  channels before covariance computation (pretraining only).
+                  None during downstream (no masking).
         """
         B, L, D = x_norm.shape
         assert L % num_chan == 0
@@ -1396,50 +1244,73 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         H2 = self.heads_per_branch
         d = self.dim_head
 
-        # Shared QKV from normalized input
-        qkv = self.qkv(x_norm).reshape(B, L, 3, H, d).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        # ── Compute Riemannian tangent vectors L_n from residual stream ──
+        # These serve double duty:
+        #   1. Spatial attention bias (Contribution 1)
+        #   2. Cross-channel mixing for temporal enrichment (Contribution 2)
+        bias_source = residual if residual is not None else x_norm
+        x_space = rearrange(bias_source, 'b (n c) d -> (b n) c d', c=num_chan)
 
-        # Split heads: first H2 for temporal, last H2 for spatial
-        q_t, q_s = q[:, :H2], q[:, H2:]
-        k_t, k_s = k[:, :H2], k[:, H2:]
-        v_t, v_s = v[:, :H2], v[:, H2:]
+        # Zero out masked channels before covariance (pretraining only)
+        # This prevents the mask token embedding from contaminating the
+        # covariance geometry — masked channels should not contribute
+        if mask is not None:
+            mask_space = rearrange(mask, 'b (n c) -> (b n) c', c=num_chan)
+            x_space = x_space * (~mask_space).unsqueeze(-1).float()
 
-        # ── Temporal attention ──
+        # Compute Riemannian bias — returns (B*N, H2, C, C)
+        # Internally computes S_n and L_n = log(S_n) via Padé [1,1]
+        riem_bias = self.riemannian_bias(x_space, channel_idx)
+
+        # ── Contribution 2: Geometric Cross-Channel Mixing ──
+        # Extract L_n from the adaptive_log map for reuse
+        # Recompute S and L_n for the mixing (lightweight — just bmm + Padé)
+        with torch.no_grad():
+            BN, C, D_space = x_space.shape
+            with torch.amp.autocast('cuda', enabled=False), \
+                 torch.amp.autocast('cpu', enabled=False):
+                x_f32 = x_space.float()
+                S_n = torch.bmm(x_f32, x_f32.transpose(-2, -1)) / D_space
+                eps = self.riemannian_bias.eps
+                S_n = S_n + eps * torch.eye(C, device=S_n.device, dtype=S_n.dtype).unsqueeze(0)
+                # Padé [1,1]: log(S) ≈ 2(S - I)(I + S)^{-1}
+                I = torch.eye(C, device=S_n.device, dtype=S_n.dtype).unsqueeze(0)
+                X_cov = S_n - I
+                L_chol = torch.linalg.cholesky(I + S_n)
+                L_n = torch.cholesky_solve(2.0 * X_cov, L_chol)  # (B*N, C, C)
+
+        # Apply geometric mixing: G = L_n @ x_norm (cross-channel structure)
+        x_norm_space = rearrange(x_norm, 'b (n c) d -> (b n) c d', c=num_chan)
+        G = torch.bmm(L_n.detach().to(x_norm_space.dtype), x_norm_space)  # (B*N, C, D)
+
+        # Frobenius normalization to prevent scale explosion
+        G_flat = G.reshape(BN, -1)  # (B*N, C*D)
+        G_norm = torch.norm(G_flat, p=2, dim=1, keepdim=True).unsqueeze(-1) + 1e-6  # (B*N, 1, 1)
+        G = G / G_norm
+
+        # Enriched input for temporal QKV
+        G_seq = rearrange(G, '(b n) c d -> b (n c) d', b=B)
+        x_enriched = x_norm + self.alpha * G_seq
+
+        # ── Temporal QKV from enriched input ──
+        qkv_t = self.qkv_temporal(x_enriched)  # (B, L, 3 * half_dim)
+        qkv_t = qkv_t.reshape(B, L, 3, H2, d).permute(2, 0, 3, 1, 4)
+        q_t, k_t, v_t = qkv_t[0], qkv_t[1], qkv_t[2]
+
+        # ── Spatial QKV from original normalized input ──
+        qkv_s = self.qkv_spatial(x_norm)  # (B, L, 3 * half_dim)
+        qkv_s = qkv_s.reshape(B, L, 3, H2, d).permute(2, 0, 3, 1, 4)
+        q_s, k_s, v_s = qkv_s[0], qkv_s[1], qkv_s[2]
+
+        # ── Temporal attention (Euclidean, but from geometry-enriched tokens) ──
         q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
         k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
         v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
 
-        # Compute temporal covariance distance per-layer from residual stream
-        # (same pattern as spatial Riemannian bias: both from residual, per-layer)
-        if self.use_temporal_cov and temporal_cov_dist is None:
-            bias_source = residual if residual is not None else x_norm
-            temporal_cov_dist = TemporalCovarianceAttentionBias.compute_temporal_cov_dist(
-                bias_source, num_chan
-            )  # (B, N, N)
-
-        if self.use_temporal_cov and temporal_cov_dist is not None:
-            # Manual temporal attention with covariance bias (same pattern as spatial)
-            # Compute per-head additive bias: (B, H2, N, N)
-            tcov_bias = self.temporal_cov_bias(temporal_cov_dist)  # (B, H2, N, N)
-            # Expand across channels: (B, H2, N, N) -> (B*C, H2, N, N)
-            tcov_bias = tcov_bias.unsqueeze(1).expand(-1, num_chan, -1, -1, -1)
-            tcov_bias = tcov_bias.reshape(B * num_chan, H2, N, N)
-
-            # Manual attention in float32 (same as spatial branch)
-            with torch.amp.autocast('cuda', enabled=False), \
-                 torch.amp.autocast('cpu', enabled=False):
-                score_t = (q_t.float() @ k_t.float().transpose(-2, -1)) / (d ** 0.5)
-                score_t = score_t + tcov_bias.float()
-                score_t = score_t.softmax(dim=-1)
-            score_t = F.dropout(score_t, p=self.att_dropout, training=self.training)
-            out_t = score_t.to(v_t.dtype) @ v_t
-        else:
-            # Standard flash SDPA (no bias needed)
-            out_t = F.scaled_dot_product_attention(
-                q_t, k_t, v_t,
-                dropout_p=self.att_dropout if self.training else 0.0,
-            )
+        out_t = F.scaled_dot_product_attention(
+            q_t, k_t, v_t,
+            dropout_p=self.att_dropout if self.training else 0.0,
+        )
         out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=num_chan)
 
         # ── Spatial attention (Riemannian-biased) ──
@@ -1447,14 +1318,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         k_s = rearrange(k_s, 'b h (n c) d -> (b n) h c d', c=num_chan)
         v_s = rearrange(v_s, 'b h (n c) d -> (b n) h c d', c=num_chan)
 
-        # Compute Riemannian bias from RESIDUAL STREAM (pre-LayerNorm)
-        # ema_ref changes the tangent space reference from identity to population average
-        bias_source = residual if residual is not None else x_norm
-        x_space = rearrange(bias_source, 'b (n c) d -> (b n) c d', c=num_chan)
-        riem_bias = self.riemannian_bias(x_space, channel_idx, ema_ref=ema_ref)  # (B*N, H2, C, C)
-
         # Manual spatial attention with Riemannian bias
-        # Compute score+softmax in float32 to prevent fp16 overflow
         with torch.amp.autocast('cuda', enabled=False), \
              torch.amp.autocast('cpu', enabled=False):
             score = (q_s.float() @ k_s.float().transpose(-2, -1)) / (d ** 0.5)
@@ -1526,112 +1390,20 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
         hidden_size = int(embed_dim * mlp_ratio)
         self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
 
-    def forward(self, x, num_chan, channel_idx=None, ema_ref=None,
-                temporal_cov_dist=None):
+    def forward(self, x, num_chan, channel_idx=None, mask=None):
         """
         Args:
             x: (B, L, D) input tensor where L = N * num_chan
             num_chan: number of channels C in this batch
             channel_idx: (C,) long tensor — global channel indices
-            ema_ref: optional (C, C) population covariance from EMAGeometricGraph.
-                     Used as the tangent space reference point in approx mode.
-                     If None, falls back to identity (S - I).
-            temporal_cov_dist: optional (B, N, N) precomputed temporal covariance
-                     distance. If None and use_temporal_cov=True, the attention
-                     layer computes it per-layer from the residual stream.
+            mask: (B, L) boolean — True = masked token (pretraining only).
+                  Passed to attention for mask-aware covariance. None during
+                  downstream inference.
         """
         # Pass normalized input for QKV, raw residual for Riemannian bias
-        # Temporal cov dist is computed per-layer inside attn from residual
         x = x + self.drop_path1(
             self.attn(self.norm1(x), num_chan, residual=x,
-                      channel_idx=channel_idx, ema_ref=ema_ref,
-                      temporal_cov_dist=temporal_cov_dist)
+                      channel_idx=channel_idx, mask=mask)
         )
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
         return x
-
-
-# ════════════════════════════════════════════════════════════════
-# EMA Geometric Graph — population-level channel connectivity
-# ════════════════════════════════════════════════════════════════
-
-class EMAGeometricGraph(nn.Module):
-    """
-    Maintains a running EMA of channel-channel covariance across the entire
-    training corpus. Lives in the global 144-channel space — each batch updates
-    the submatrix corresponding to its channel set.
-
-    The EMA graph captures population-level spatial structure that individual
-    per-sample covariances cannot: averaged over thousands of segments, subjects,
-    and datasets, it converges to the true population covariance pattern.
-
-    Used as the REFERENCE POINT for the adaptive log map tangent space projection:
-        tangent = S_sample - G_ema_sub  (instead of S_sample - I)
-
-    This means the Riemannian bias measures per-sample DEVIATION from population
-    average, not absolute covariance. More informative: identity treats all
-    channels as uncorrelated, but EEG channels are always correlated.
-
-    Args:
-        total_channels: Size of global channel space (default 144)
-        momentum: EMA decay factor (higher = slower update, more stable)
-        num_heads: DEPRECATED — kept for backward compat, no longer used.
-    """
-    def __init__(self, total_channels=TOTAL_GLOBAL_CHANNELS, momentum=0.99,
-                 num_heads=4):
-        super().__init__()
-        self.total_channels = total_channels
-        self.momentum = momentum
-
-        # Running EMA of channel covariance — initialized to identity
-        # (uninformative prior: all channels equally connected)
-        # At init, get_ref returns identity → S - I (same as before EMA warms up)
-        self.register_buffer(
-            'G_ema', torch.eye(total_channels, dtype=torch.float32)
-        )
-        # Track how many updates each channel pair has seen
-        self.register_buffer(
-            'update_count', torch.zeros(total_channels, dtype=torch.long)
-        )
-
-    @torch.no_grad()
-    def update(self, S_batch, channel_idx):
-        """
-        Update the EMA graph with a batch of covariance matrices.
-
-        Args:
-            S_batch: (B*N, C, C) or (B, C, C) per-sample covariance matrices
-            channel_idx: (C,) long tensor — global channel indices for this batch
-        """
-        if not self.training:
-            return
-
-        # Average across batch dimension → single (C, C) population estimate
-        S_mean = S_batch.float().mean(dim=0)  # (C, C)
-
-        # Update the relevant submatrix of G_ema
-        idx = channel_idx.long()
-        m = self.momentum
-        sub = self.G_ema[idx.unsqueeze(1), idx.unsqueeze(0)]  # (C, C)
-        self.G_ema[idx.unsqueeze(1), idx.unsqueeze(0)] = m * sub + (1 - m) * S_mean
-        self.update_count[idx] += 1
-
-    def get_ref(self, channel_idx):
-        """
-        Extract the EMA submatrix for the current channel set as the tangent
-        space reference point.
-
-        Returns the raw (C, C) population covariance — no scaling, no reshaping.
-        The per-sample Riemannian bias's own head_scales handle magnitude.
-
-        At init (before any updates), G_ema = I → tangent = S - I (standard).
-        As training progresses, G_ema converges to population average →
-        tangent = S - G_pop (measures per-sample deviation).
-
-        Args:
-            channel_idx: (C,) long tensor — global channel indices
-        Returns:
-            (C, C) population covariance submatrix
-        """
-        idx = channel_idx.long()
-        return self.G_ema[idx.unsqueeze(1), idx.unsqueeze(0)]  # (C, C)

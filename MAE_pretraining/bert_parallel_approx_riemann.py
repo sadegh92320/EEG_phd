@@ -36,7 +36,6 @@ import os
 import torch.nn.init as init
 from MAE_pretraining.transformer_variants import (
     AdaptiveRiemannianParallelTransformer,
-    TemporalCovarianceAttentionBias,
 )
 
 
@@ -128,41 +127,21 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
     def __init__(self, config=None, num_channels=64,
                  max_embedding=2000, enc_dim=512, depth_e=8,
                  mask_prob=0.5, patch_size=16, norm_pix_loss=False,
-                 use_frechet=False, frechet_path=None,
-                 use_corr_masking=True, use_temporal_cov=False):
+                 use_corr_masking=True):
         super().__init__()
 
         self.config = config
         self.enc_dim = enc_dim
         self.num_channels = num_channels
         self.use_corr_masking = use_corr_masking
-        self.use_temporal_cov = use_temporal_cov
-
-        # ── Load frozen Fréchet mean reference (optional) ──
-        # When use_frechet=True, the tangent-space projection pre-whitens S
-        # using R^{-1/2} computed offline from the training covariance
-        # distribution. This makes Padé [1,1] accurate by centering S near I.
-        # When use_frechet=False, projection is at identity (no pre-whitening).
-        frechet_R_inv_sqrt = None
-        if use_frechet and frechet_path is not None:
-            frechet_data = torch.load(frechet_path, map_location='cpu')
-            frechet_R_inv_sqrt = frechet_data['R_inv_sqrt']
-            print(f"[Fréchet] Loaded R^(-1/2) from {frechet_path}, "
-                  f"shape={frechet_R_inv_sqrt.shape}")
-        elif use_frechet:
-            print("[Fréchet] WARNING: use_frechet=True but no frechet_path "
-                  "provided. Falling back to identity reference.")
-            use_frechet = False
 
         # Adaptive Riemannian parallel transformer layers
         # log_mode='pade' → Padé [1,1] approximant: log(S) ≈ 2(S-I)(I+S)^{-1}
-        # use_frechet=True → pre-whiten S with offline Fréchet mean (more accurate)
+        # Contribution 1: Riemannian spatial attention bias
+        # Contribution 2: Geometric cross-channel mixing for temporal heads
         self.encoder = nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
-                use_frechet=use_frechet,
-                frechet_R_inv_sqrt=frechet_R_inv_sqrt,
-                use_temporal_cov=use_temporal_cov,
             ) for _ in range(depth_e)
         ])
 
@@ -331,12 +310,6 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         x = self.patch(x)
         N = x.shape[1]
 
-        # ── Temporal covariance distance (Contribution 2) ──
-        # NOT precomputed here. Each transformer layer computes it per-layer
-        # from the residual stream (pre-LayerNorm), matching the spatial
-        # Riemannian bias pattern. This avoids information leakage about
-        # masked tokens during pretraining.
-
         L = x.shape[1] * x.shape[2]
         x = x.reshape(B, L, -1)
 
@@ -363,10 +336,10 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         channel_idx = channel_list[0]  # (C,) global channel indices
 
         # Pass through adaptive Riemannian transformer layers
-        # Temporal cov dist is computed per-layer inside each transformer
-        # from the residual stream when use_temporal_cov=True
+        # mask is passed so that masked channels are zeroed before covariance
+        # computation (prevents mask token contaminating geometry)
         for transformer in self.encoder:
-            x = transformer(x, C, channel_idx=channel_idx)
+            x = transformer(x, C, channel_idx=channel_idx, mask=mask)
 
         x = self.norm_enc(x)
         x = self.fc(x)
@@ -432,16 +405,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             print(f"  pred has NaN: {torch.isnan(pred).any().item()}, "
                   f"Inf: {torch.isinf(pred).any().item()}")
             print(f"  pred range: [{pred.min().item():.4f}, {pred.max().item():.4f}]")
-            # Check Fréchet whitening output in each layer
-            for i, layer in enumerate(self.encoder):
-                log_map = layer.attn.riemannian_bias.adaptive_log
-                if log_map.use_frechet and log_map.R_inv_sqrt is not None:
-                    R = log_map.R_inv_sqrt
-                    print(f"  Layer {i} R_inv_sqrt range: "
-                          f"[{R.min().item():.4f}, {R.max().item():.4f}], "
-                          f"cond≈{R.norm():.2f}")
             print(f"{'='*60}\n")
-            # Raise to stop training — Lightning will catch and report
             raise ValueError(
                 f"NaN/Inf detected in training loss at epoch {self.current_epoch}, "
                 f"batch {batch_idx}. Check logs above for diagnostics."
@@ -457,15 +421,14 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
 
         # Log the learned head scales across layers for analysis
         for i, layer in enumerate(self.encoder):
+            # Spatial Riemannian bias head scales (Contribution 1)
             scales = layer.attn.riemannian_bias.head_scales.detach()
             self.log(f"head_scale_mean/layer_{i}", scales.mean(), on_step=False, on_epoch=True)
             self.log(f"head_scale_std/layer_{i}", scales.std(), on_step=False, on_epoch=True)
 
-            # Log temporal covariance head scales (Contribution 2)
-            if self.use_temporal_cov:
-                tcov_scales = layer.attn.temporal_cov_bias.head_scales.detach()
-                self.log(f"tcov_scale_mean/layer_{i}", tcov_scales.mean(), on_step=False, on_epoch=True)
-                self.log(f"tcov_scale_std/layer_{i}", tcov_scales.std(), on_step=False, on_epoch=True)
+            # Geometric cross-channel mixing alpha (Contribution 2)
+            alpha = layer.attn.alpha.detach()
+            self.log(f"alpha/layer_{i}", alpha.item(), on_step=False, on_epoch=True)
 
         return loss
 

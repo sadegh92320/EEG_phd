@@ -150,22 +150,24 @@ class Pipeline:
         return train_loader, valid_loader
 
 
-    def load_encoder(self, pretrain=True, use_frechet=False, log_mode='pade',
+    def load_encoder(self, pretrain=True, log_mode='pade',
                      use_corr_masking=True, resume_ckpt=None, use_global_norm=False,
-                     clamp_channels=False, use_temporal_cov=False):
+                     clamp_channels=False):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
-        Ablation table (5 rows):
+        Contributions:
+            1. Riemannian spatial attention bias (Padé [1,1] log map)
+            2. Geometric cross-channel mixing for temporal heads
+
+        Ablation table:
             1. baseline (parallel attn, no Riemannian) → log_mode='baseline'
             2. approx (S-I)                            → log_mode='approx', use_corr_masking=False
             3. pade                                    → log_mode='pade',   use_corr_masking=False
             4. pade + correlation masking               → log_mode='pade',   use_corr_masking=True
-            5. pade + corr masking + fréchet            → log_mode='pade',   use_corr_masking=True, use_frechet=True
 
         Args:
             pretrain:         if True, train from scratch; else load existing ckpt
-            use_frechet:      if True, compute Fréchet mean before training
             log_mode:         'pade', 'approx', or 'baseline'
             use_corr_masking: if True, use correlation-aware channel masking;
                               if False, use standard random BERT masking
@@ -187,60 +189,25 @@ class Pipeline:
 
             # ── Select model variant ──
             # All variants use the same parallel attention architecture.
-            # The baseline freezes head_scales=0 so the Riemannian branch
-            # has zero contribution — same architecture, same param count,
-            # only the geometric signal is ablated.
+            # The baseline freezes head_scales=0 and alpha=0 so both
+            # Riemannian and cross-channel mixing branches have zero
+            # contribution — same architecture, same param count.
             if log_mode == 'baseline':
-                print("[Ablation] Parallel attention with Riemannian branch disabled (head_scales=0)")
-                model = ApproxAdaptiveRiemannBert(use_corr_masking=use_corr_masking,
-                                                   use_temporal_cov=use_temporal_cov)
+                print("[Ablation] Parallel attention with Riemannian + cross-channel mixing disabled")
+                model = ApproxAdaptiveRiemannBert(use_corr_masking=use_corr_masking)
                 for layer in model.encoder:
                     layer.attn.riemannian_bias.head_scales.requires_grad = False
                     layer.attn.riemannian_bias.head_scales.zero_()
-                use_frechet = False
+                    layer.attn.alpha.requires_grad = False
+                    layer.attn.alpha.zero_()
             else:
                 masking_str = "corr-masking" if use_corr_masking else "random-masking"
-                tcov_str = " + temporal-cov" if use_temporal_cov else ""
-                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}{tcov_str}")
-                model = ApproxAdaptiveRiemannBert(use_corr_masking=use_corr_masking,
-                                                   use_temporal_cov=use_temporal_cov)
+                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}")
+                model = ApproxAdaptiveRiemannBert(use_corr_masking=use_corr_masking)
                 # Override log_mode in every encoder layer if needed
                 if log_mode == 'approx':
                     for layer in model.encoder:
                         layer.attn.riemannian_bias.adaptive_log.log_mode = 'approx'
-
-            # ── Fréchet mean (only for Riemannian + pade) ──
-            frechet_callback = None
-            if use_frechet and log_mode == 'pade':
-                from MAE_pretraining.frechet_mean import (
-                    compute_frechet_mean_from_model, FrechetRefreshCallback
-                )
-                print("[Fréchet] Computing initial R from embedding-space covariances...")
-                frechet_result = compute_frechet_mean_from_model(
-                    model, train_loader, enc_dim=512,
-                    max_batches=200, verbose=True
-                )
-                frechet_R_inv_sqrt = frechet_result['R_inv_sqrt']
-
-                frechet_save_path = os.path.join(CKPT_DIR, "frechet_mean.pt")
-                torch.save(frechet_result, frechet_save_path)
-                print(f"[Fréchet] Saved to {frechet_save_path}")
-
-                for layer in model.encoder:
-                    log_map = layer.attn.riemannian_bias.adaptive_log
-                    log_map.use_frechet = True
-                    log_map.register_buffer(
-                        'R_inv_sqrt', frechet_R_inv_sqrt.clone()
-                    )
-                print(f"[Fréchet] Injected R_inv_sqrt into {len(model.encoder)} layers")
-
-                # Periodic refresh: recompute R every 10 epochs using current weights
-                frechet_callback = FrechetRefreshCallback(
-                    train_dataloader=train_loader,
-                    refresh_every=10,
-                    max_batches=100,
-                    enc_dim=512,
-                )
 
             # ── Run name for wandb (easy to compare in dashboard) ──
             norm_tag = "gnorm" if use_global_norm else "zstd"
@@ -250,10 +217,6 @@ class Pipeline:
                 run_name = f"riemann-{log_mode}-{norm_tag}"
                 if use_corr_masking:
                     run_name += "-corrmask"
-                if use_frechet and log_mode == 'pade':
-                    run_name += "-frechet"
-                if use_temporal_cov:
-                    run_name += "-tcov"
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
@@ -279,15 +242,11 @@ class Pipeline:
                 "patch_size": 16,
                 "log_mode": log_mode,
                 "use_corr_masking": use_corr_masking,
-                "use_frechet": use_frechet and log_mode == 'pade',
                 "use_global_norm": use_global_norm,
                 "clamp_channels": clamp_channels,
-                "use_temporal_cov": use_temporal_cov,
             })
 
             callbacks = [TQDMProgressBar(refresh_rate=20), ckpt_callback]
-            if frechet_callback is not None:
-                callbacks.append(frechet_callback)
 
             trainer = Trainer(
                 callbacks=callbacks,
@@ -300,7 +259,7 @@ class Pipeline:
 
             trainer.fit(model, train_dataloaders=train_loader,
                         val_dataloaders=valid_loader,
-                        ckpt_path="/content/drive/MyDrive/checkpoints_pretraining/last-v34.ckpt"
+                        ckpt_path=resume_ckpt,
                         )
 
             self.checkpoint_path = ckpt_callback.best_model_path
