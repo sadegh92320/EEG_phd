@@ -1,0 +1,29 @@
+name_dataset: seed_vig
+
+channel_list:
+  - FT7
+  - FT8
+  - T7
+  - T8
+  - TP7
+  - TP8
+  - CP1
+  - CP2
+  - P1
+  - PZ
+  - P2
+  - PO3
+  - POZ
+  - PO4
+  - O1
+  - OZ
+  - O2
+
+frequency: 200
+data_unit: V
+
+num_participant: 23
+num_classes: 1  # regression task (continuous PERCLOS label)
+task: regression
+
+data_file: downstream/data/seed_vig

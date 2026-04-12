@@ -124,6 +124,18 @@ DATASET_CONFIGS = {
         "data_length": 250,  # 1s * 250Hz (sliding window segments)
         "sampling_rate": 250,
     },
+    "seed_vig": {
+        "num_classes": 1,  # regression: single continuous output
+        "metric": "pearson",
+        "task_type": "regression",
+        "model_path": "downstream/saved_models",
+        "result_output": "downstream/results",
+        "data_path": "downstream/data/seed_vig",
+        "config_yaml": "downstream/info_dataset/seed_vig.yaml",
+        "num_channels": 17,
+        "data_length": 1000,  # 5s * 200Hz
+        "sampling_rate": 200,
+    },
 }
 
 
@@ -403,6 +415,7 @@ def main():
         "model_path": ds_cfg["model_path"],
         "result_output": ds_cfg["result_output"],
         "dataset_name": args.dataset,
+        "task_type": ds_cfg.get("task_type", "classification"),
     }
 
     # ── Data loader (no per-model normalization for DL baselines) ──

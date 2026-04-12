@@ -62,8 +62,10 @@ def merge_token(x, num_channels, k):
         # Same log map used by spatial Riemannian bias and temporal cov bias
         X_even = cov_even - eye
         X_odd = cov_odd - eye
-        tan_even = torch.linalg.solve(eye + cov_even, 2.0 * X_even)  # (B, N_even, C, C)
-        tan_odd = torch.linalg.solve(eye + cov_odd, 2.0 * X_odd)    # (B, N_odd, C, C)
+        L_even = torch.linalg.cholesky(eye + cov_even)
+        tan_even = torch.cholesky_solve(2.0 * X_even, L_even)  # (B, N_even, C, C)
+        L_odd = torch.linalg.cholesky(eye + cov_odd)
+        tan_odd = torch.cholesky_solve(2.0 * X_odd, L_odd)    # (B, N_odd, C, C)
 
         # Vectorize upper triangle (symmetric -> vector)
         # This avoids redundant lower-triangle entries

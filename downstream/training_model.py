@@ -42,7 +42,39 @@ class WeightedSoftTargetCrossEntropy(torch.nn.Module):
         if self.class_weights is not None:
             loss = loss * self.class_weights.unsqueeze(0)  # (B, C) * (1, C)
         return loss.sum(dim=-1).mean()
+
+
+class RegressionLoss(torch.nn.Module):
+    """MSE + Pearson correlation loss for regression tasks.
+
+    Following STEEGFormer's simple_regression_loss:
+        loss = mse_weight * MSE + corr_weight * 0.5*(1 - pearson_r)
+
+    When pearson_r = 1 (perfect correlation), correlation loss = 0.
+    """
+    def __init__(self, mse_weight=0.5, corr_weight=0.5):
+        super().__init__()
+        self.mse_weight = mse_weight
+        self.corr_weight = corr_weight
+
+    def forward(self, pred, target):
+        # pred: (B, 1) or (B,), target: (B,)
+        pred = pred.squeeze()
+        target = target.squeeze()
+        mse = F.mse_loss(pred, target)
+        # Pearson correlation
+        pred_z = pred - pred.mean()
+        tgt_z = target - target.mean()
+        cov = (pred_z * tgt_z).sum()
+        sigma_pred = torch.sqrt((pred_z ** 2).sum() + 1e-8)
+        sigma_tgt = torch.sqrt((tgt_z ** 2).sum() + 1e-8)
+        pearson_r = cov / (sigma_pred * sigma_tgt)
+        corr_loss = 0.5 * (1.0 - pearson_r)
+        return self.mse_weight * mse + self.corr_weight * corr_loss
+
+
 from torchmetrics import Accuracy, Recall, Precision, F1Score, ConfusionMatrix, AUROC
+from torchmetrics import MeanSquaredError, MeanAbsoluteError, PearsonCorrCoef
 from torchmetrics.classification import CohenKappa
 import sys
 from collections import Counter
@@ -368,13 +400,18 @@ class TrainerDownstream:
             num_classes=num_classes,
         )
 
+    def _is_regression(self):
+        """Check if current task is regression (e.g., SEED-VIG)."""
+        return self.config.get("task_type", "classification") == "regression"
+
     def _build_loss_fn(self, label_smoothing=0.0, class_weights=None):
         """Build loss function with optional label smoothing and class weighting.
 
-        class_weights: optional tensor of per-class weights (computed from
-        inverse class frequency).  For balanced datasets the weights are ~1.0
-        everywhere, so numerically identical to unweighted CE.
+        For regression tasks (task_type == 'regression'): returns MSE + Pearson loss.
+        For classification: returns CrossEntropyLoss with optional weights/smoothing.
         """
+        if self._is_regression():
+            return RegressionLoss(mse_weight=0.5, corr_weight=0.5)
         if label_smoothing > 0:
             return torch.nn.CrossEntropyLoss(
                 weight=class_weights, label_smoothing=label_smoothing)
@@ -382,14 +419,16 @@ class TrainerDownstream:
             return torch.nn.CrossEntropyLoss(weight=class_weights)
         return self.loss_fn
 
-    @staticmethod
-    def _compute_class_weights(dataset):
+    def _compute_class_weights(self, dataset):
         """Compute inverse-frequency class weights from a dataset.
 
         Returns a float32 tensor of shape (num_classes,) where each weight is
         proportional to 1/count, normalized so they sum to num_classes.
         For a perfectly balanced dataset this gives [1.0, 1.0, ...].
+        Returns None for regression tasks (no class weights needed).
         """
+        if self._is_regression():
+            return None
         labels = []
         for i in range(len(dataset)):
             y = dataset[i][1]
@@ -649,17 +688,20 @@ class TrainerDownstream:
                 channel_list = None
 
             x = x.float().to(self.device)
-            y = y.long().to(self.device)
+            if self._is_regression():
+                y = y.float().to(self.device)
+            else:
+                y = y.long().to(self.device)
 
             # Skip single-sample batches (paper does this — causes issues with BN/mixup)
             if x.size(0) == 1:
                 continue
 
-            # Apply Mixup if enabled; on odd-sized batches fall back to label smoothing
-            # (paper: drop_last=False, odd batch gets smoothed soft targets, not raw mixup)
-            if mixup_fn is not None and x.size(0) % 2 == 0:
+            # Apply Mixup if enabled (classification only — not used for regression)
+            # On odd-sized batches fall back to label smoothing
+            if mixup_fn is not None and not self._is_regression() and x.size(0) % 2 == 0:
                 x, y = mixup_fn(x, y)
-            elif mixup_fn is not None:
+            elif mixup_fn is not None and not self._is_regression():
                 # odd batch: no spatial mix, but still convert to soft targets with label smoothing
                 y = mixup_target(y, mixup_fn.num_classes, lam=1.0, smoothing=mixup_fn.label_smoothing)
 
@@ -686,10 +728,16 @@ class TrainerDownstream:
 
     def get_metrics(self):
         """
-        Evaluation metrics — original + paper metrics:
-          Original: accuracy, recall, precision, f1_score, confusion, roc_auc, kappa
-          Paper:    acc1 (top-1), acc2 (top-2), bacc (balanced accuracy)
+        Evaluation metrics.
+        Classification: accuracy, recall, precision, f1_score, confusion, roc_auc, kappa, acc1, acc2, bacc
+        Regression:     mse, mae, pearson
         """
+        if self._is_regression():
+            return {
+                "mse":     MeanSquaredError(),
+                "mae":     MeanAbsoluteError(),
+                "pearson": PearsonCorrCoef(),
+            }
         nc = self.config["num_classes"]
         metrics = {
             # ── Original metrics ──
@@ -709,7 +757,14 @@ class TrainerDownstream:
 
     def update_metrics(self, metrics, pred, probs, y):
         """Update the torchmetric metrics"""
-        # Metrics that need full probability distribution (not argmax)
+        if self._is_regression():
+            # Regression: all metrics take raw predictions (squeezed to 1D)
+            pred_flat = pred.squeeze()
+            y_flat = y.squeeze()
+            for k, v in metrics.items():
+                v.update(pred_flat, y_flat)
+            return self
+        # Classification: metrics that need full probability distribution (not argmax)
         PROB_METRICS = {"roc_auc", "acc2", "auc"}
         for k, v in metrics.items():
             if k in PROB_METRICS:
@@ -757,17 +812,24 @@ class TrainerDownstream:
                     channel_list = None
 
                 x = x.float().to(self.device)
-                y = y.long().to(self.device)
+                if self._is_regression():
+                    y = y.float().to(self.device)
+                else:
+                    y = y.long().to(self.device)
 
                 if self._model_uses_channels and channel_list is not None:
                     pred = model(x, channel_list)
                 else:
                     pred = model(x)
-                probs = F.softmax(pred, dim = 1)
-                pred_labels = pred.argmax(dim=1)
 
-                #Update the metrics using the evaluation result
-                self.update_metrics(metrics, pred_labels, probs, y)
+                if self._is_regression():
+                    # Regression: raw predictions, no softmax/argmax
+                    self.update_metrics(metrics, pred, pred, y)
+                else:
+                    probs = F.softmax(pred, dim = 1)
+                    pred_labels = pred.argmax(dim=1)
+                    #Update the metrics using the evaluation result
+                    self.update_metrics(metrics, pred_labels, probs, y)
                 
         #Compute print all metrics
         metrics_comp = self.compute_metrics(metrics)
@@ -776,21 +838,27 @@ class TrainerDownstream:
         return {k: v.item() if v.dim() == 0 else v for k, v in metrics_comp.items()}
 
 
-    @staticmethod
-    def _extract_labels(dataset):
-        """Extract all labels from a dataset for stratification (handles Subset, ConcatDataset, etc.)."""
+    def _extract_labels(self, dataset):
+        """Extract all labels from a dataset for stratification (handles Subset, ConcatDataset, etc.).
+        For regression tasks, returns float labels (no int cast)."""
         labels = []
         for i in range(len(dataset)):
             item = dataset[i]
             y = item[1]
-            labels.append(y.item() if hasattr(y, 'item') else int(y))
+            if self._is_regression():
+                labels.append(y.item() if hasattr(y, 'item') else float(y))
+            else:
+                labels.append(y.item() if hasattr(y, 'item') else int(y))
         return np.array(labels)
 
     @time
     def tune_params_cv(self, folds, trial, eval_scheme,name_project,save = False, train_dataset = None):
-        """Cross validation of the model with stratified kfold."""
-        skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=92)
+        """Cross validation of the model with stratified kfold (KFold for regression)."""
         all_labels = self._extract_labels(train_dataset)
+        if self._is_regression():
+            skf = KFold(n_splits=folds, shuffle=True, random_state=92)
+        else:
+            skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=92)
         g = torch.Generator()
         g.manual_seed(42)
         # 1. Use fixed hyperparameters (no search)
@@ -840,14 +908,15 @@ class TrainerDownstream:
             optimizer = self.build_optimizer(model, {"lr": learning_rate, "weight_decay": weight_decay})
 
             # Fine-tuning: per-iteration cosine LR + Mixup + SoftTargetCrossEntropy
-            class_weights = self._compute_class_weights(train_subs).to(self.device)
+            class_weights = self._compute_class_weights(train_subs)
+            class_weights = class_weights.to(self.device) if class_weights is not None else None
             use_iter_lr = self.training_mode in ("full", "loo_finetune")
             if use_iter_lr:
                 # Store base_lr in param groups for per-iteration adjustment
                 for pg in optimizer.param_groups:
                     pg["base_lr"] = pg["lr"]
-                loss_fn = WeightedSoftTargetCrossEntropy(class_weights) if HAS_TIMM else self._build_loss_fn(label_smoothing, class_weights)
-                mixup_fn = self._build_mixup_fn(self.config["num_classes"]) if HAS_TIMM else None
+                loss_fn = self._build_loss_fn(label_smoothing, class_weights) if self._is_regression() else (WeightedSoftTargetCrossEntropy(class_weights) if HAS_TIMM else self._build_loss_fn(label_smoothing, class_weights))
+                mixup_fn = None if self._is_regression() else (self._build_mixup_fn(self.config["num_classes"]) if HAS_TIMM else None)
                 scheduler, step_per_batch = None, False
             else:
                 loss_fn = self._build_loss_fn(label_smoothing, class_weights)
@@ -900,20 +969,28 @@ class TrainerDownstream:
 
         mean_score = float(np.mean(fold_scores))
         print(f"mean fold score is {mean_score}")
-        wandb.log({
-            "mean_fold_score": mean_score,
-            # Original metrics
-            "cv_accuracy":  [met["accuracy"]  for met in fold_metrics],
-            "cv_recall":    [met["recall"]    for met in fold_metrics],
-            "cv_precision": [met["precision"] for met in fold_metrics],
-            "cv_f1":        [met["f1_score"]  for met in fold_metrics],
-            "cv_roc_auc":   [met["roc_auc"]   for met in fold_metrics],
-            "cv_kappa":     [met["kappa"]     for met in fold_metrics],
-            # Paper metrics
-            "cv_acc1":  [met["acc1"]  for met in fold_metrics],
-            "cv_acc2":  [met["acc2"]  for met in fold_metrics],
-            "cv_bacc":  [met["bacc"]  for met in fold_metrics],
-        })
+        log_dict = {"mean_fold_score": mean_score}
+        if self._is_regression():
+            log_dict.update({
+                "cv_mse":     [met["mse"]     for met in fold_metrics],
+                "cv_mae":     [met["mae"]     for met in fold_metrics],
+                "cv_pearson": [met["pearson"] for met in fold_metrics],
+            })
+        else:
+            log_dict.update({
+                # Original metrics
+                "cv_accuracy":  [met["accuracy"]  for met in fold_metrics],
+                "cv_recall":    [met["recall"]    for met in fold_metrics],
+                "cv_precision": [met["precision"] for met in fold_metrics],
+                "cv_f1":        [met["f1_score"]  for met in fold_metrics],
+                "cv_roc_auc":   [met["roc_auc"]   for met in fold_metrics],
+                "cv_kappa":     [met["kappa"]     for met in fold_metrics],
+                # Paper metrics
+                "cv_acc1":  [met["acc1"]  for met in fold_metrics],
+                "cv_acc2":  [met["acc2"]  for met in fold_metrics],
+                "cv_bacc":  [met["bacc"]  for met in fold_metrics],
+            })
+        wandb.log(log_dict)
         
         # 3. FINISH WANDB RUN
         wandb.finish()
@@ -959,13 +1036,14 @@ class TrainerDownstream:
         self.optimizer_name = opt_name
         optimizer = self.build_optimizer(model, {"lr": learning_rate, "weight_decay": weight_decay})
 
-        class_weights = self._compute_class_weights(train_dataset).to(self.device)
+        class_weights = self._compute_class_weights(train_dataset)
+        class_weights = class_weights.to(self.device) if class_weights is not None else None
         use_iter_lr = self.training_mode in ("full", "loo_finetune")
         if use_iter_lr:
             for pg in optimizer.param_groups:
                 pg["base_lr"] = pg["lr"]
-            loss_fn = WeightedSoftTargetCrossEntropy(class_weights) if HAS_TIMM else self._build_loss_fn(label_smoothing, class_weights)
-            mixup_fn = self._build_mixup_fn(self.config["num_classes"]) if HAS_TIMM else None
+            loss_fn = self._build_loss_fn(label_smoothing, class_weights) if self._is_regression() else (WeightedSoftTargetCrossEntropy(class_weights) if HAS_TIMM else self._build_loss_fn(label_smoothing, class_weights))
+            mixup_fn = None if self._is_regression() else (self._build_mixup_fn(self.config["num_classes"]) if HAS_TIMM else None)
             scheduler, step_per_batch = None, False
         else:
             loss_fn = self._build_loss_fn(label_smoothing, class_weights)
@@ -1054,13 +1132,14 @@ class TrainerDownstream:
         # (linear_probe and classic_nn use standard cosine scheduler, no mixup)
         # Class weighting: computed from train labels — for balanced datasets
         # weights ≈ [1,1,...] so numerically identical to unweighted CE.
-        class_weights = self._compute_class_weights(train_dataset).to(self.device)
+        class_weights = self._compute_class_weights(train_dataset)
+        class_weights = class_weights.to(self.device) if class_weights is not None else None
         use_iter_lr = self.training_mode in ("full", "loo_finetune")
         if use_iter_lr:
             for pg in optimizer.param_groups:
                 pg["base_lr"] = pg["lr"]
-            loss_fn = WeightedSoftTargetCrossEntropy(class_weights) if HAS_TIMM else self._build_loss_fn(label_smoothing, class_weights)
-            mixup_fn = self._build_mixup_fn(self.config["num_classes"]) if HAS_TIMM else None
+            loss_fn = self._build_loss_fn(label_smoothing, class_weights) if self._is_regression() else (WeightedSoftTargetCrossEntropy(class_weights) if HAS_TIMM else self._build_loss_fn(label_smoothing, class_weights))
+            mixup_fn = None if self._is_regression() else (self._build_mixup_fn(self.config["num_classes"]) if HAS_TIMM else None)
             scheduler, step_per_batch = None, False
         else:
             loss_fn = self._build_loss_fn(label_smoothing, class_weights)
@@ -1195,18 +1274,21 @@ class TrainerDownstream:
 
         merged_all = ConcatDataset([train_data_pop, val_data_pop])
 
-        # Extract labels for stratified split
+        # Extract labels for stratified split (float for regression, int for classification)
         all_labels = []
         for i in range(len(merged_all)):
             y = merged_all[i][1]
-            all_labels.append(y.item() if hasattr(y, 'item') else int(y))
+            if self._is_regression():
+                all_labels.append(y.item() if hasattr(y, 'item') else float(y))
+            else:
+                all_labels.append(y.item() if hasattr(y, 'item') else int(y))
         all_labels = np.array(all_labels)
 
         all_idx = np.arange(len(merged_all))
         train_idx, val_idx = train_test_split(
             all_idx, test_size=0.1, random_state=92,
             shuffle=True,
-            stratify=all_labels if len(np.unique(all_labels)) > 1 else None,
+            stratify=None if self._is_regression() else (all_labels if len(np.unique(all_labels)) > 1 else None),
         )
 
         merged_train = Subset(merged_all, train_idx)
@@ -1260,13 +1342,14 @@ class TrainerDownstream:
         self.optimizer_name = opt_name
         optimizer = self.build_optimizer(model, {"lr": learning_rate, "weight_decay": hp["weight_decay"]})
 
-        class_weights = self._compute_class_weights(merged_train).to(self.device)
+        class_weights = self._compute_class_weights(merged_train)
+        class_weights = class_weights.to(self.device) if class_weights is not None else None
         use_iter_lr = self.training_mode in ("full", "loo_finetune")
         if use_iter_lr:
             for pg in optimizer.param_groups:
                 pg["base_lr"] = pg["lr"]
-            loss_fn = WeightedSoftTargetCrossEntropy(class_weights) if HAS_TIMM else self._build_loss_fn(label_smoothing, class_weights)
-            mixup_fn = self._build_mixup_fn(self.config["num_classes"]) if HAS_TIMM else None
+            loss_fn = self._build_loss_fn(label_smoothing, class_weights) if self._is_regression() else (WeightedSoftTargetCrossEntropy(class_weights) if HAS_TIMM else self._build_loss_fn(label_smoothing, class_weights))
+            mixup_fn = None if self._is_regression() else (self._build_mixup_fn(self.config["num_classes"]) if HAS_TIMM else None)
             scheduler, step_per_batch = None, False
         else:
             loss_fn = self._build_loss_fn(label_smoothing, class_weights)

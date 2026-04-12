@@ -57,7 +57,8 @@ def pade_matrix_log(M, num_squarings=4, sqrt_iters=6, pade_order=6):
             # Denman-Beavers: Y→A^{1/2} with sqrt_iters iterations
             Y = A
             for _ in range(sqrt_iters):
-                Y_inv = torch.linalg.solve(Y, I)
+                Y_chol = torch.linalg.cholesky(Y)
+                Y_inv = torch.cholesky_solve(I, Y_chol)
                 Y = 0.5 * (Y + Y_inv)
             A = Y  # A ← A^{1/2}
 
@@ -1118,11 +1119,17 @@ class AdaptiveLogMap(nn.Module):
         else:
             # Padé [1,1] approximant of matrix logarithm:
             # log(S) ≈ 2(S - I)(I + S)^{-1}
-            # Must disable autocast — linalg.solve has no fp16 CUDA kernel
+            # Must disable autocast — Cholesky has no fp16 CUDA kernel
             with torch.amp.autocast('cuda', enabled=False), \
                  torch.amp.autocast('cpu', enabled=False):
-                X = S.float() - I.float()
-                T = torch.linalg.solve(I.float() + S.float(), 2 * X)
+                S_f32 = S.float().contiguous()
+                I_f32 = I.float()
+                X = S_f32 - I_f32
+                # Use Cholesky solve instead of linalg.solve —
+                # I+S is SPD (eigenvalues > 1), and Cholesky uses a
+                # different CUDA kernel that avoids misaligned-address bugs
+                L_chol = torch.linalg.cholesky(I_f32 + S_f32)
+                T = torch.cholesky_solve(2 * X, L_chol)
 
             # ── NaN/Inf guard after Padé ──
             if torch.isnan(T).any() or torch.isinf(T).any():
@@ -1271,8 +1278,11 @@ class TemporalCovarianceAttentionBias(nn.Module):
             # Pade [1,1] log map: log(S) ~ 2(S - I)(I + S)^{-1}
             # Same tangent-space projection as spatial Riemannian bias
             X = cov - eye  # (B, N, C, C)
-            # Solve (I + S) L = 2X  =>  L = (I + S)^{-1} 2X
-            tangent = torch.linalg.solve(eye + cov, 2.0 * X)  # (B, N, C, C)
+            # Cholesky solve: I+S is SPD → Cholesky is stable and avoids
+            # CUDA misaligned-address bugs in linalg.solve
+            cov_cont = cov.contiguous()
+            L_chol = torch.linalg.cholesky(eye + cov_cont)
+            tangent = torch.cholesky_solve(2.0 * X, L_chol)  # (B, N, C, C)
 
             # Pairwise Frobenius distance in tangent space (= Log-Euclidean distance)
             # ||L_t - L_s||_F^2 = ||L_t||_F^2 + ||L_s||_F^2 - 2*tr(L_t^T L_s)

@@ -131,6 +131,18 @@ DATASET_CONFIGS = {
         "data_length": 250,  # 1s * 250Hz (sliding window segments)
         "sampling_rate": 250,
     },
+    "seed_vig": {
+        "num_classes": 1,  # regression: single continuous output
+        "metric": "pearson",
+        "task_type": "regression",
+        "model_path": "downstream/saved_models",
+        "result_output": "downstream/results",
+        "data_path": "downstream/data/seed_vig",
+        "config_yaml": "downstream/info_dataset/seed_vig.yaml",
+        "num_channels": 17,
+        "data_length": 1000,  # 5s * 200Hz
+        "sampling_rate": 200,
+    },
 }
 
 
@@ -273,32 +285,109 @@ def build_labram(num_classes, checkpoint_path, num_channels, data_length, **kwar
         depth=12,
         num_heads=10,
         mlp_ratio=4.,
-        qkv_bias=True,
+        qkv_bias=False,
         qk_norm=partial(nn.LayerNorm, eps=1e-6),
         drop_rate=0.,
         attn_drop_rate=0.,
         drop_path_rate=0.1,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        init_values=1e-4,
+        init_values=0.1,
         use_abs_pos_emb=True,
         use_mean_pooling=True,
         init_scale=0.001,
     )
 
     if checkpoint_path is not None:
+        from collections import OrderedDict
         from downstream.models.foundation_models.labram import load_state_dict
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        if "model" in ckpt:
-            state_dict = ckpt["model"]
-        elif "state_dict" in ckpt:
-            state_dict = ckpt["state_dict"]
-        else:
-            state_dict = ckpt
-        load_state_dict(model, state_dict)
+
+        # Extract model state dict (same key search as STEEGFormer)
+        checkpoint_model = None
+        for model_key in ["model", "module", "state_dict"]:
+            if model_key in ckpt:
+                checkpoint_model = ckpt[model_key]
+                print(f"  [LaBraM] Found state_dict under key '{model_key}'")
+                break
+        if checkpoint_model is None:
+            checkpoint_model = ckpt
+
+        # Strip 'student.' prefix (LaBraM pretraining uses student-teacher)
+        if any(k.startswith("student.") for k in checkpoint_model.keys()):
+            new_dict = OrderedDict()
+            for key in list(checkpoint_model.keys()):
+                if key.startswith("student."):
+                    new_dict[key[8:]] = checkpoint_model[key]
+            checkpoint_model = new_dict
+            print(f"  [LaBraM] Stripped 'student.' prefix from {len(new_dict)} keys")
+
+        # Remove head keys if shape doesn't match (will be reset anyway)
+        model_state = model.state_dict()
+        for k in ["head.weight", "head.bias"]:
+            if k in checkpoint_model and checkpoint_model[k].shape != model_state[k].shape:
+                print(f"  [LaBraM] Removing key {k} from checkpoint (shape mismatch)")
+                del checkpoint_model[k]
+
+        # Remove relative_position_index keys (not needed, causes size mismatch)
+        for key in list(checkpoint_model.keys()):
+            if "relative_position_index" in key:
+                checkpoint_model.pop(key)
+
+        load_state_dict(model, checkpoint_model, prefix='')
         print(f"  [LaBraM] Loaded pretrained weights from {checkpoint_path}")
 
     # Reset classification head for the target task
     model.reset_classifier(num_classes)
+
+    # ── Compute and store default input_chans (positional embedding indices) ──
+    # LaBraM's forward() needs channel indices to select the correct positional
+    # embeddings from its 10-20 montage. We precompute them here so the model
+    # can be called as model(x) without explicitly passing input_chans.
+    config_yaml_path = kwargs.get("config_yaml")
+    if config_yaml_path is not None:
+        import yaml
+        with open(config_yaml_path, "r") as f:
+            ds_yaml = yaml.safe_load(f)
+        downstream_channels = ds_yaml.get("channel_list", [])
+    else:
+        downstream_channels = []
+
+    if downstream_channels:
+        # LaBraM's full 10-20 montage (same as STEEGFormer utils.py)
+        labram_channels = [
+            'FP1', 'FPZ', 'FP2', 'AF9', 'AF7', 'AF5', 'AF3', 'AF1', 'AFZ', 'AF2', 'AF4', 'AF6', 'AF8', 'AF10',
+            'F9', 'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6', 'F8', 'F10',
+            'FT9', 'FT7', 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 'FT8', 'FT10',
+            'T9', 'T7', 'C5', 'C3', 'C1', 'CZ', 'C2', 'C4', 'C6', 'T8', 'T10',
+            'TP9', 'TP7', 'CP5', 'CP3', 'CP1', 'CPZ', 'CP2', 'CP4', 'CP6', 'TP8', 'TP10',
+            'P9', 'P7', 'P5', 'P3', 'P1', 'PZ', 'P2', 'P4', 'P6', 'P8', 'P10',
+            'PO9', 'PO7', 'PO5', 'PO3', 'PO1', 'POZ', 'PO2', 'PO4', 'PO6', 'PO8', 'PO10',
+            'O1', 'OZ', 'O2', 'O9', 'CB1', 'CB2', 'IZ', 'O10',
+            'T3', 'T5', 'T4', 'T6', 'M1', 'M2', 'A1', 'A2',
+            'CFC1', 'CFC2', 'CFC3', 'CFC4', 'CFC5', 'CFC6', 'CFC7', 'CFC8',
+            'CCP1', 'CCP2', 'CCP3', 'CCP4', 'CCP5', 'CCP6', 'CCP7', 'CCP8',
+            'T1', 'T2', 'FTT9h', 'TTP7h', 'TPP9h', 'FTT10h', 'TPP8h', 'TPP10h',
+            'FP1-F7', 'F7-T7', 'T7-P7', 'P7-O1', 'FP2-F8', 'F8-T8', 'T8-P8', 'P8-O2',
+            'FP1-F3', 'F3-C3', 'C3-P3', 'P3-O1', 'FP2-F4', 'F4-C4', 'C4-P4', 'P4-O2',
+        ]
+        labram_lower = [ch.lower() for ch in labram_channels]
+
+        labram_channel_idx = [0]  # CLS token position
+        for ch in downstream_channels:
+            ch_low = ch.lower()
+            if ch_low in labram_lower:
+                labram_channel_idx.append(labram_lower.index(ch_low) + 1)
+            else:
+                print(f"  [LaBraM] WARNING: channel '{ch}' not found in LaBraM montage, skipping")
+
+        input_chans_tensor = torch.tensor(labram_channel_idx, dtype=torch.long)
+        # Register as buffer so it moves to GPU with model.to(device)
+        model.register_buffer("_default_input_chans", input_chans_tensor, persistent=False)
+        print(f"  [LaBraM] Registered default input_chans: {len(labram_channel_idx)} indices "
+              f"(CLS + {len(labram_channel_idx)-1} channels)")
+    else:
+        model._default_input_chans = None
+        print("  [LaBraM] WARNING: no channel list found, input_chans will be None")
 
     if training_mode == "linear_probe":
         # Freeze encoder, only train head (already Linear(200, num_classes))
@@ -1065,6 +1154,7 @@ def main():
         "result_output": ds_cfg["result_output"],
         "training_mode": args.training_mode,
         "dataset_name": args.dataset,
+        "task_type": ds_cfg.get("task_type", "classification"),
     }
 
     # ── Data loader (with per-model normalization) ──

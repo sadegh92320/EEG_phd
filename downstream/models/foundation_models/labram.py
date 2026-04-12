@@ -444,7 +444,10 @@ class NeuralTransformer(nn.Module):
         For example, for an EEG sample of 4 seconds with 64 electrodes, x will be [batch size, 64, 4, 200]
         '''
         x = rearrange(x, 'B N (A T) -> B N A T', T=200)
-        input_chans = input_chans[0]
+        if input_chans is not None:
+            input_chans = input_chans[0]
+        elif hasattr(self, '_default_input_chans') and self._default_input_chans is not None:
+            input_chans = self._default_input_chans
         x = self.forward_features(x, input_chans=input_chans, return_patch_tokens=return_patch_tokens, return_all_tokens=return_all_tokens, **kwargs)
         x = self.head(x)
         return x

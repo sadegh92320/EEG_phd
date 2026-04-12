@@ -186,8 +186,15 @@ class Downstream_Dataset(Dataset):
         if self.normalize:
             trial_data = self._normalize(trial_data)
 
+        # Regression labels (e.g. PERCLOS float) must stay float;
+        # classification labels are cast to long.
+        if isinstance(label, (float, np.floating)):
+            label_tensor = torch.tensor(label, dtype=torch.float)
+        else:
+            label_tensor = torch.tensor(label, dtype=torch.long)
+
         return (
             torch.from_numpy(trial_data).float(),
-            torch.tensor(label, dtype=torch.long),
+            label_tensor,
             torch.tensor(self.channel_id, dtype=torch.long),
         )
