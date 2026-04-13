@@ -1223,16 +1223,17 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
             scales = self.head_scales.view(1, self.num_heads, 1, 1)
             bias = L_combined * scales
 
-            # Return L_combined (before head_scales) for value mixing —
-            # consistent multi-scale geometry for both score and value paths
-            return bias, L_combined, True
+            # Return raw single-timestep L for value mixing —
+            # multi-scale only affects score bias (additive, cheap).
+            # Value bias uses L directly (avoids per-head C×C matmul overhead).
+            return bias, L
 
         else:
             # Single-scale fallback (original behavior)
             scales = self.head_scales.view(1, self.num_heads, 1, 1)
             bias = L.unsqueeze(1) * scales
 
-            return bias, L, False
+            return bias, L
 
 
 
