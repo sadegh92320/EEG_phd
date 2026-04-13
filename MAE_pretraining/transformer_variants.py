@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+import mne
+import yaml
+import os
 
 
 # ─── fp32-safe eigendecomposition ────────────────────────────────────────────
@@ -1090,7 +1093,206 @@ class AdaptiveLogMap(nn.Module):
                 T = X
 
             return T.to(orig_dtype)
-        
+
+
+# ─── Graph-Referenced Riemannian Bias (Contribution 2) ──────────────────────
+# Precompute the global 144×144 electrode topology reference matrix R.
+# R_{ij} = exp(-geodesic_dist(i,j)² / σ²) with σ=0.35 radians.
+# This is an RBF kernel on the unit-sphere electrode positions — guaranteed SPD
+# by Schoenberg's theorem (positive definite kernel on a metric space).
+
+def _build_global_R(sigma=0.35, eps=1e-4):
+    """
+    Build the 144×144 electrode topology reference matrix R.
+
+    Uses MNE standard_1005 montage positions, maps channel names via
+    channel_info.yaml, computes geodesic distance on the unit sphere,
+    and applies an RBF kernel.
+
+    Returns:
+        R: (144, 144) float32 tensor — SPD matrix
+        idx_to_name: dict mapping global index → channel name
+    """
+    # Load channel mapping: name → global index
+    yaml_path = os.path.join(os.path.dirname(__file__), "info_dataset", "channel_info.yaml")
+    with open(yaml_path) as f:
+        config = yaml.safe_load(f)
+    ch_mapping = config["channels_mapping"]  # name → index
+    idx_to_name = {v: k for k, v in ch_mapping.items()}
+    total = len(ch_mapping)
+
+    # Get 3D electrode positions from MNE
+    montage = mne.channels.make_standard_montage("standard_1005")
+    pos_dict_raw = montage.get_positions()["ch_pos"]
+    pos_dict = {k.lower(): torch.tensor(v, dtype=torch.float32) for k, v in pos_dict_raw.items()}
+
+    # Aliases (same as graph_embedding.py)
+    aliases = {
+        'cb1': 'poo7', 'cb2': 'poo8', 'cbz': 'pooz',
+        't3': 't7', 't4': 't8', 't5': 'p7', 't6': 'p8',
+        'm1': 'tp9', 'm2': 'tp10',
+    }
+    for alias, standard_name in aliases.items():
+        if standard_name in pos_dict:
+            pos_dict[alias] = pos_dict[standard_name]
+
+    # Build position matrix (144, 3) ordered by global index
+    positions = torch.zeros(total, 3)
+    for idx in range(total):
+        name = idx_to_name[idx]
+        name_lower = name.lower()
+        if name_lower in pos_dict:
+            positions[idx] = pos_dict[name_lower]
+        else:
+            # Fallback: origin (shouldn't happen for standard channels)
+            print(f"[_build_global_R] Warning: channel '{name}' not in montage, using origin.")
+            positions[idx] = torch.tensor([0.0, 0.0, 0.0])
+
+    # Normalize to unit sphere
+    norms = positions.norm(dim=1, keepdim=True)
+    norms[norms == 0] = 1.0
+    positions_norm = positions / norms
+
+    # Geodesic distance matrix
+    cos_sim = positions_norm @ positions_norm.T
+    cos_sim = torch.clamp(cos_sim, -1.0, 1.0)
+    D = torch.acos(cos_sim)  # (144, 144) in radians
+
+    # RBF kernel → R
+    R = torch.exp(-D.pow(2) / (sigma ** 2))
+
+    # Small regularization for numerical safety
+    R = R + eps * torch.eye(total)
+
+    return R, idx_to_name
+
+
+# Module-level cache: computed once, reused across all layers
+_GLOBAL_R_CACHE = {}
+
+
+def get_global_R(sigma=0.35, eps=1e-4):
+    """Cached access to the global R matrix."""
+    key = (sigma, eps)
+    if key not in _GLOBAL_R_CACHE:
+        R, idx_to_name = _build_global_R(sigma=sigma, eps=eps)
+        _GLOBAL_R_CACHE[key] = (R, idx_to_name)
+    return _GLOBAL_R_CACHE[key]
+
+
+class GraphReferencedRiemannianBias(nn.Module):
+    """
+    Contribution 2: Graph-Referenced Riemannian Attention Bias.
+
+    Computes a second spatial attention bias that captures how the observed
+    covariance deviates from what electrode topology predicts.
+
+    Math:
+        R_sub = R[ch_idx, ch_idx]           — topology reference for this dataset's channels
+        M = R_sub^{-1/2} · S · R_sub^{-1/2} — covariance in graph-referenced frame
+        L_graph = Padé_log(M)               — tangent vector at IDENTITY (same space as C1)
+
+    Both L (C1) and L_graph (C2) live in T_I — they add cleanly to spatial logits.
+
+    Args:
+        num_heads: Number of spatial attention heads
+        total_channels: Global channel space size (144)
+        sigma: RBF kernel bandwidth in radians (0.35 = adjacent electrodes ≈ 0.68 weight)
+        eps: Regularization for R and SPD matrices
+    """
+    def __init__(self, num_heads, total_channels=TOTAL_GLOBAL_CHANNELS,
+                 sigma=0.35, eps=1e-5):
+        super().__init__()
+        self.num_heads = num_heads
+        self.eps = eps
+        self.sigma = sigma
+
+        # Per-head learnable scaling — initialized to 0 (starts as no contribution,
+        # learns to use graph-referenced geometry)
+        self.graph_head_scales = nn.Parameter(torch.zeros(num_heads))
+
+        # Use first-order log approximation for C2: log(M) ≈ M - I
+        # This is MORE accurate for C2 than C1 because M = R^{-1/2}SR^{-1/2}
+        # is already close to I when R is a good prior (which is the whole point).
+        # Saves one full Cholesky + solve per layer compared to Padé.
+        # If needed, can upgrade to Padé later — but first-order should suffice.
+
+        # Precompute global R and register as buffer (moves with model to GPU)
+        R_global, _ = get_global_R(sigma=sigma, eps=1e-4)
+        self.register_buffer('R_global', R_global)  # (144, 144)
+
+        # Cache for R_sub^{-1/2} per channel configuration (avoids recomputation)
+        self._R_inv_sqrt_cache = {}
+
+    def _get_R_inv_sqrt(self, channel_idx):
+        """
+        Extract R_sub for the current channel set and compute R_sub^{-1/2}.
+        Cached per unique channel configuration.
+
+        Args:
+            channel_idx: (C,) long tensor — global channel indices
+        Returns:
+            R_inv_sqrt: (C, C) float32 tensor
+        """
+        cache_key = tuple(channel_idx.cpu().tolist())
+        if cache_key not in self._R_inv_sqrt_cache:
+            # Extract submatrix
+            R_sub = self.R_global[channel_idx][:, channel_idx]  # (C, C)
+
+            # Compute R_sub^{-1/2} via eigendecomposition
+            # R_sub is SPD (guaranteed by RBF kernel + eps regularization)
+            with torch.no_grad():
+                eigvals, eigvecs = torch.linalg.eigh(R_sub.float())
+                # Clamp eigenvalues for safety
+                eigvals = eigvals.clamp(min=1e-6)
+                R_inv_sqrt = eigvecs @ torch.diag(eigvals.pow(-0.5)) @ eigvecs.T
+
+            # Check condition number
+            cond = eigvals.max() / eigvals.min()
+            if cond > 1000:
+                print(f"[GraphReferencedRiemannianBias] Warning: κ(R_sub)={cond:.1f} "
+                      f"for C={len(channel_idx)}. Graph bias may be unreliable.")
+
+            self._R_inv_sqrt_cache[cache_key] = R_inv_sqrt.to(self.R_global.device)
+
+        return self._R_inv_sqrt_cache[cache_key]
+
+    def forward(self, S, channel_idx):
+        """
+        Args:
+            S: (B*N, C, C) batch of SPD covariance matrices (already regularized)
+            channel_idx: (C,) long tensor — global channel indices
+        Returns:
+            bias: (B*N, num_heads, C, C) graph-referenced attention bias
+            L_graph: (B*N, C, C) raw graph-referenced tangent vectors
+        """
+        BN, C, _ = S.shape
+
+        # Get R_sub^{-1/2} for this channel configuration
+        R_inv_sqrt = self._get_R_inv_sqrt(channel_idx)  # (C, C)
+
+        # Pre-transform: M = R^{-1/2} S R^{-1/2}
+        # This moves S into the graph-referenced frame
+        with torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False):
+            R_inv_sqrt_f32 = R_inv_sqrt.float().unsqueeze(0)  # (1, C, C)
+            S_f32 = S.float()
+            # M = R^{-1/2} @ S @ R^{-1/2}
+            M = torch.bmm(
+                torch.bmm(R_inv_sqrt_f32.expand(BN, -1, -1), S_f32),
+                R_inv_sqrt_f32.expand(BN, -1, -1)
+            )
+        # First-order log: log(M) ≈ M - I
+        # Accurate because M is near I when R is a good topology prior.
+        # No Cholesky needed — just a subtraction.
+        I = torch.eye(C, device=M.device, dtype=M.dtype).unsqueeze(0)
+        L_graph = (M - I).to(S.dtype)  # (BN, C, C)
+
+        # Per-head scaling
+        scales = self.graph_head_scales.view(1, self.num_heads, 1, 1)
+        bias = L_graph.unsqueeze(1) * scales  # (BN, num_heads, C, C)
+
+        return bias, L_graph
 
 
 class AdaptiveRiemannianAttentionBias(nn.Module):
@@ -1129,7 +1331,8 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
             channel_idx: (C,) long tensor — global channel indices for this batch
         Returns:
             bias: (B*N, num_heads, C, C) attention bias per head
-            L: (B*N, C, C) raw tangent vectors (reused for cross-channel mixing)
+            L: (B*N, C, C) raw tangent vectors
+            S: (B*N, C, C) SPD covariance matrices (reused by graph-referenced bias)
         """
         BN, C, D = x.shape
 
@@ -1149,46 +1352,29 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         scales = self.head_scales.view(1, self.num_heads, 1, 1)
         bias = L.unsqueeze(1) * scales
 
-        return bias, L
+        return bias, L, S
 
 
 
 class AdaptiveRiemannianParallelAttention(nn.Module):
     """
-    Parallel spatial-temporal attention with:
-      - Contribution 1: Adaptive Riemannian bias on spatial heads
-      - Contribution 2: Geometric Temporal Value Injection on temporal heads
+    Parallel spatial-temporal attention with dual Riemannian spatial biases:
+      - Contribution 1: Adaptive Riemannian bias (data-driven functional connectivity)
+        L = Padé_log(S) where S is the residual-stream covariance
+      - Contribution 2: Graph-Referenced Riemannian bias (topology-referenced)
+        L_graph = Padé_log(R^{-1/2} S R^{-1/2}) where R encodes electrode topology
 
-    Contribution 2 — Geometric Temporal Dynamics:
-    The temporal head sees (B*C, N, D) — one channel at a time, blind to
-    cross-channel brain state. We inject temporal DYNAMICS of the brain-state
-    geometry into temporal VALUE vectors AFTER the QKV projection.
+    Structure vs Function framing:
+    - C1 captures pure functional connectivity — what the data says about channel relationships
+    - C2 captures DEVIATION from structural connectivity — how the observed covariance
+      differs from what electrode topology (spatial proximity) predicts
+    - Both live in T_I (tangent space at identity) — they add cleanly to spatial logits
 
-    Pipeline per timestep n:
-        L_n = log(S_n) via Padé [1,1]            (already computed for spatial bias)
-        L_smooth = avg_pool(L_n, window=W)        (Log-Euclidean Fréchet mean, smooths noise)
-        ΔL_n = L_smooth_n − L_smooth_{n−1}        (temporal derivative of geometry)
-        d_n = mean_c( ΔL_n · x_space )            (pool dynamics through residual → D)
-        brain_emb_n = Linear(d_n) → d             (project D → dim_head, ~33K params)
-        V_temporal += β · brain_emb_n              (add to temporal values, broadcast heads)
+    Combined spatial logits: score += α_h · L + γ_h · L_graph
+    where α_h (C1) and γ_h (C2) are per-head learnable scales, both init to 0.
 
-    Why dynamics instead of static brain state:
-    - Static brain state (mean_c(L_n · x_space)) proved redundant with spatial
-      attention mixing: beta grew then shrank, no MSE improvement over 8 epochs.
-    - Temporal DERIVATIVE is unique — no other pathway provides it.
-    - Spatial prior for spatial heads, temporal dynamics for temporal heads:
-      each attention type gets a prior matched to its domain.
-    - The sliding window average is the Log-Euclidean Fréchet mean on the
-      SPD manifold — principled, not a hack.
-
-    Why values (not attention logits):
-    - Enriching embeddings before QKV (attempt 2) is LINEAR → absorbed by QKV
-    - Adding distance bias on temporal logits (attempt 1) → redundant with PE
-    - Adding to VALUES after QKV is NONLINEAR: softmax(QK^T/√d) multiplies
-      the dynamics-enriched values, creating a weighted trajectory summary.
-
-    Extra parameters: Linear(512→64) per layer = ~33K × 8 = ~262K total (~1%).
-    Plus one β scalar and window_size=3 per layer.
+    Extra parameters per layer: num_heads scalar scales + one Padé log map call.
+    R_sub^{-1/2} is precomputed and cached per channel configuration.
     """
     def __init__(self, embed_dim, num_heads=8, total_channels=TOTAL_GLOBAL_CHANNELS,
                  dropout=0.1, att_dropout=0.1, spd_eps=1e-5,
@@ -1205,16 +1391,14 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.embed_dim = embed_dim
         self.half_dim = self.heads_per_branch * self.dim_head
 
-        # Shared QKV projection (back to shared — separate QKV was for the
-        # failed enrichment approach; no longer needed)
+        # Shared QKV projection
         self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
         # Output projection
         self.fc = nn.Linear(embed_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
         self.att_dropout = att_dropout
 
-        # Adaptive Riemannian bias for spatial heads (global channel space)
-        # Also provides L_n (tangent vectors) reused for temporal value injection
+        # ── Contribution 1: Adaptive Riemannian bias (functional connectivity) ──
         self.riemannian_bias = AdaptiveRiemannianAttentionBias(
             num_heads=self.heads_per_branch,
             total_channels=total_channels,
@@ -1225,31 +1409,13 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             frechet_R_inv_sqrt=frechet_R_inv_sqrt,
         )
 
-        # ── Contribution 2: Geometric Temporal Dynamics for temporal values ──
-        # Instead of injecting the static brain state (which proved redundant
-        # with what spatial attention already mixes into the residual stream),
-        # we inject the DYNAMICS — how the brain-state geometry changes over time.
-        #
-        # Pipeline:
-        #   L_n: (B*N, C, C) tangent vectors — already computed for spatial bias
-        #   Reshape to (B, N, C, C), smooth with sliding window avg (size W),
-        #   then compute ΔL_n = L_smooth_n − L_smooth_{n−1}.
-        #   Pool through residual: brain_dynamic = mean_c(ΔL_n · x_space_n) → (B*N, D)
-        #   Project D → d: Linear(512, 64) — same 33K params per layer.
-        #
-        # Why dynamics not static:
-        #   - Static brain state is partially redundant with spatial attention
-        #     (empirically verified: beta grew then shrank at layers 0-2, no MSE gain)
-        #   - Temporal DERIVATIVE of geometry is unique — no other pathway provides it
-        #   - Matches temporal attention's domain: spatial prior for spatial heads,
-        #     temporal dynamics for temporal heads
-        #
-        # The sliding window average is the Log-Euclidean Fréchet mean on the
-        # SPD manifold — averaging tangent vectors IS the principled manifold mean.
-        self.window_size = 3  # sliding window for smoothing L_n
-        self.brain_state_proj = nn.Linear(embed_dim, self.dim_head, bias=False)
-        self.beta = nn.Parameter(torch.tensor(0.01))
-        nn.init.normal_(self.brain_state_proj.weight, std=0.1)
+        # ── Contribution 2: Graph-Referenced Riemannian bias (structural deviation) ──
+        self.graph_bias = GraphReferencedRiemannianBias(
+            num_heads=self.heads_per_branch,
+            total_channels=total_channels,
+            sigma=0.35,
+            eps=spd_eps,
+        )
 
     def forward(self, x_norm, num_chan, residual=None, channel_idx=None,
                 mask=None):
@@ -1272,7 +1438,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         H2 = self.heads_per_branch
         d = self.dim_head
 
-        # ── Compute Riemannian tangent vectors L_n from residual stream ──
+        # ── Compute Riemannian covariance from residual stream ──
         bias_source = residual if residual is not None else x_norm
         x_space = rearrange(bias_source, 'b (n c) d -> (b n) c d', c=C)
 
@@ -1281,10 +1447,20 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             mask_space = rearrange(mask, 'b (n c) -> (b n) c', c=C)
             x_space = x_space * (~mask_space).unsqueeze(-1).float()
 
-        # Compute spatial bias + raw tangent vectors (computed once, reused)
-        # riem_bias: (B*N, H2, C, C) — spatial attention bias
-        # L_n: (B*N, C, C) — tangent vectors reused for value injection
-        riem_bias, L_n = self.riemannian_bias(x_space, channel_idx)
+        # ── Contribution 1: Functional connectivity bias ──
+        # riem_bias: (B*N, H2, C, C) — spatial attention bias from log(S)
+        # L: (B*N, C, C) — tangent vectors at identity
+        # S: (B*N, C, C) — SPD covariance matrices (reused by C2)
+        riem_bias, L, S = self.riemannian_bias(x_space, channel_idx)
+
+        # ── Contribution 2: Graph-Referenced structural deviation bias ──
+        # graph_bias: (B*N, H2, C, C) — bias from log(R^{-1/2} S R^{-1/2})
+        # L_graph: (B*N, C, C) — graph-referenced tangent vectors at identity
+        graph_riem_bias, L_graph = self.graph_bias(S, channel_idx)
+
+        # Store diagnostic norms for logging
+        self._L_norm = L.detach().abs().mean()
+        self._L_graph_norm = L_graph.detach().abs().mean()
 
         # ── Shared QKV ──
         qkv = self.qkv(x_norm).reshape(B, L, 3, H, d).permute(2, 0, 3, 1, 4)
@@ -1295,67 +1471,18 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         k_t, k_s = k[:, :H2], k[:, H2:]
         v_t, v_s = v[:, :H2], v[:, H2:]
 
-        # ── Contribution 2: Geometric temporal dynamics for temporal values ──
-        # Smooth L_n over a sliding window (Log-Euclidean Fréchet mean),
-        # then compute the temporal derivative ΔL_n = L_smooth_n − L_smooth_{n−1}.
-        # Pool ΔL_n through x_space to get a fixed D-dim dynamics summary.
-        L_seq = L_n.detach().view(B, N, C, C)             # (B, N, C, C)
-
-        # Sliding window average along time (dim=1)
-        # Use avg_pool1d on flattened C*C, then reshape back
-        CC = C * C
-        L_flat = L_seq.reshape(B, N, CC).permute(0, 2, 1)  # (B, CC, N)
-        W = min(self.window_size, N)
-        pad_left = (W - 1) // 2
-        pad_right = W - 1 - pad_left
-        L_padded = F.pad(L_flat, (pad_left, pad_right), mode='replicate')
-        L_smooth = F.avg_pool1d(L_padded, kernel_size=W, stride=1)  # (B, CC, N)
-        L_smooth = L_smooth.permute(0, 2, 1).reshape(B, N, C, C)   # (B, N, C, C)
-
-        # Temporal derivative: ΔL_n = L_smooth_n − L_smooth_{n−1}
-        # At t=0, use L_smooth_0 itself (the absolute geometry IS the dynamics
-        # at the boundary — avoids wasting 1/N of the signal as zeros)
-        delta_L = torch.zeros_like(L_smooth)
-        delta_L[:, 1:] = L_smooth[:, 1:] - L_smooth[:, :-1]       # (B, N, C, C)
-        delta_L[:, 0] = L_smooth[:, 0]                              # boundary: absolute geometry
-        delta_L = delta_L.reshape(B * N, C, C)                      # (B*N, C, C)
-
-        # Pool dynamics through residual stream: mean_c(ΔL · x_space) → (B*N, D)
-        brain_dynamic = torch.bmm(
-            delta_L, x_space.detach()
-        ).mean(dim=1)                                               # (B*N, D)
-
-        # Store magnitude for diagnostics (logged in training loop)
-        self._brain_dynamic_norm = brain_dynamic.detach().abs().mean()
-
-        brain_emb = self.brain_state_proj(brain_dynamic)             # (B*N, d)
-
-        # ── Temporal attention with brain-state value injection ──
+        # ── Temporal attention (standard, no bias) ──
         q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=C)
         k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=C)
         v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=C)
 
-        # brain_emb is (B*N, d) — need (B*C, H2, N, d) for temporal view
-        # Step 1: (B*N, d) → (B, N, d) → (B, 1, N, d) — add head dim (broadcast)
-        # Step 2: expand across C channels: (B, 1, C, N, d)
-        # Step 3: merge B,C → (B*C, 1, N, d) — head dim broadcasts on addition
-        brain_emb_temporal = brain_emb.view(B, N, d)     # (B, N, d)
-        brain_emb_temporal = brain_emb_temporal.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, N, d)
-        brain_emb_temporal = brain_emb_temporal.expand(-1, -1, C, -1, -1)  # (B, 1, C, N, d)
-        brain_emb_temporal = rearrange(brain_emb_temporal, 'b 1 c n d -> (b c) 1 n d')
-
-        # Inject brain state into temporal values
-        v_t_enriched = v_t + self.beta * brain_emb_temporal
-
-        # Manual temporal attention (can't use Flash with modified V separately,
-        # but the score computation is still efficient)
         out_t = F.scaled_dot_product_attention(
-            q_t, k_t, v_t_enriched,
+            q_t, k_t, v_t,
             dropout_p=self.att_dropout if self.training else 0.0,
         )
         out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=C)
 
-        # ── Spatial attention (Riemannian-biased) ──
+        # ── Spatial attention (dual Riemannian-biased) ──
         q_s = rearrange(q_s, 'b h (n c) d -> (b n) h c d', c=C)
         k_s = rearrange(k_s, 'b h (n c) d -> (b n) h c d', c=C)
         v_s = rearrange(v_s, 'b h (n c) d -> (b n) h c d', c=C)
@@ -1363,7 +1490,8 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         with torch.amp.autocast('cuda', enabled=False), \
              torch.amp.autocast('cpu', enabled=False):
             score = (q_s.float() @ k_s.float().transpose(-2, -1)) / (d ** 0.5)
-            score = score + riem_bias.float()
+            # Dual bias: α_h · L (functional) + γ_h · L_graph (structural deviation)
+            score = score + riem_bias.float() + graph_riem_bias.float()
             score = score.softmax(dim=-1)
         score = F.dropout(score, p=self.att_dropout, training=self.training)
         out_s = score.to(v_s.dtype) @ v_s

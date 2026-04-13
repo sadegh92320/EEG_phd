@@ -426,24 +426,19 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             self.log(f"head_scale_mean/layer_{i}", scales.mean(), on_step=False, on_epoch=True)
             self.log(f"head_scale_std/layer_{i}", scales.std(), on_step=False, on_epoch=True)
 
-            # Geometric Temporal Value Injection beta (Contribution 2)
-            beta = layer.attn.beta.detach()
-            self.log(f"beta/layer_{i}", beta.item(), on_step=False, on_epoch=True)
+            # Graph-Referenced Riemannian bias head scales (Contribution 2)
+            graph_scales = layer.attn.graph_bias.graph_head_scales.detach()
+            self.log(f"graph_scale_mean/layer_{i}", graph_scales.mean(), on_step=False, on_epoch=True)
+            self.log(f"graph_scale_std/layer_{i}", graph_scales.std(), on_step=False, on_epoch=True)
 
-            # Gradient diagnostics: track whether brain_state_proj is learning
-            if layer.attn.beta.grad is not None:
-                self.log(f"grad_beta/layer_{i}",
-                         layer.attn.beta.grad.abs().item(),
+            # Diagnostic: tangent vector magnitudes for C1 vs C2
+            if hasattr(layer.attn, '_L_norm'):
+                self.log(f"L_norm/layer_{i}",
+                         layer.attn._L_norm.item(),
                          on_step=False, on_epoch=True)
-            if layer.attn.brain_state_proj.weight.grad is not None:
-                self.log(f"grad_proj_norm/layer_{i}",
-                         layer.attn.brain_state_proj.weight.grad.norm().item(),
-                         on_step=False, on_epoch=True)
-
-            # Brain dynamic signal magnitude (Contribution 2 health check)
-            if hasattr(layer.attn, '_brain_dynamic_norm'):
-                self.log(f"brain_dynamic_norm/layer_{i}",
-                         layer.attn._brain_dynamic_norm.item(),
+            if hasattr(layer.attn, '_L_graph_norm'):
+                self.log(f"L_graph_norm/layer_{i}",
+                         layer.attn._L_graph_norm.item(),
                          on_step=False, on_epoch=True)
 
         return loss

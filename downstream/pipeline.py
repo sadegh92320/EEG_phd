@@ -189,17 +189,17 @@ class Pipeline:
 
             # ── Select model variant ──
             # All variants use the same parallel attention architecture.
-            # The baseline freezes head_scales=0 and beta=0 so both
-            # Riemannian bias and temporal value injection branches have
-            # zero contribution — same architecture, same param count.
+            # The baseline freezes head_scales=0 and graph_head_scales=0
+            # so both Riemannian biases (C1 functional + C2 structural)
+            # have zero contribution — same architecture, same param count.
             if log_mode == 'baseline':
-                print("[Ablation] Parallel attention with Riemannian + cross-channel mixing disabled")
+                print("[Ablation] Parallel attention with dual Riemannian bias disabled")
                 model = ApproxAdaptiveRiemannBert(use_corr_masking=use_corr_masking)
                 for layer in model.encoder:
                     layer.attn.riemannian_bias.head_scales.requires_grad = False
                     layer.attn.riemannian_bias.head_scales.zero_()
-                    layer.attn.beta.requires_grad = False
-                    layer.attn.beta.zero_()
+                    layer.attn.graph_bias.graph_head_scales.requires_grad = False
+                    layer.attn.graph_bias.graph_head_scales.zero_()
             else:
                 masking_str = "corr-masking" if use_corr_masking else "random-masking"
                 print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}")

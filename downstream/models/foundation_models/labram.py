@@ -412,7 +412,15 @@ class NeuralTransformer(nn.Module):
             x = x + pos_embed
         if self.time_embed is not None:
             nc = n if t == self.patch_size else a
-            time_embed = self.time_embed[:, 0:input_time_window, :].unsqueeze(1).expand(batch_size, nc, -1, -1).flatten(1, 2)
+            max_time = self.time_embed.shape[1]  # pretrained supports 16
+            if input_time_window <= max_time:
+                te = self.time_embed[:, 0:input_time_window, :]
+            else:
+                # interpolate time embedding for longer sequences (e.g. 30s sleep epochs)
+                te = self.time_embed.permute(0, 2, 1)  # (1, D, 16)
+                te = F.interpolate(te, size=input_time_window, mode='linear', align_corners=False)
+                te = te.permute(0, 2, 1)  # (1, input_time_window, D)
+            time_embed = te.unsqueeze(1).expand(batch_size, nc, -1, -1).flatten(1, 2)
             x[:, 1:, :] += time_embed
 
         x = self.pos_drop(x)
