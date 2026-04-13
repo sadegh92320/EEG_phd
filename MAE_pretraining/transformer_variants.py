@@ -1100,30 +1100,16 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
     Supports variable channel counts: the reference is stored globally (144×144)
     and the batch's channel indices select the relevant submatrix at runtime.
 
-    Multi-scale mode (when multiscale_windows is not None):
-        Computes per-timestep log-covariance L, then averages L over temporal
-        windows of different sizes (Fréchet mean in tangent space).  Each
-        spatial head learns a softmax-weighted combination of scales via
-        `scale_weights` (H, S).  The model starts with uniform weights (1/S)
-        and learns which temporal scales matter per head.
-
     Args:
         num_heads: Number of attention heads (each gets its own learned scale)
         total_channels: Size of the global channel space (default 144)
         eps: Regularization for SPD matrix
         log_mode: 'approx', 'pade', or 'eigh' (see AdaptiveLogMap)
         use_approx: DEPRECATED — kept for backward compat.
-        multiscale_windows: tuple of ints — temporal window sizes for
-            multi-scale covariance (e.g. (1, 5, 15)).  None = single-scale
-            (backward compatible).  Window size 1 = current single-timestep.
-        multiscale_min_channels: skip multi-scale when C < this (default 8).
-            For very few channels the C×C covariance is already low-rank;
-            averaging over windows adds noise, not signal.
     """
     def __init__(self, num_heads, total_channels=TOTAL_GLOBAL_CHANNELS,
                  eps=1e-5, log_mode='eigh', use_approx=False,
-                 use_frechet=False, frechet_R_inv_sqrt=None,
-                 multiscale_windows=None, multiscale_min_channels=8):
+                 use_frechet=False, frechet_R_inv_sqrt=None):
         super().__init__()
         self.num_heads = num_heads
         self.eps = eps
@@ -1136,27 +1122,14 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         # as standard Euclidean attention and learns to use the bias
         self.head_scales = nn.Parameter(torch.zeros(num_heads))
 
-        # ── Multi-scale temporal covariance ──
-        self.multiscale_windows = multiscale_windows
-        self.multiscale_min_channels = multiscale_min_channels
-        if multiscale_windows is not None:
-            num_scales = len(multiscale_windows)
-            # Per-head, per-scale weights — uniform init so all scales
-            # contribute equally at start; softmax applied at runtime
-            self.scale_weights = nn.Parameter(
-                torch.zeros(num_heads, num_scales)  # zeros → uniform after softmax
-            )
-
-    def forward(self, x, channel_idx, batch_size=None, num_timesteps=None):
+    def forward(self, x, channel_idx):
         """
         Args:
             x: (B*N, C, D) channel embeddings (from residual stream)
             channel_idx: (C,) long tensor — global channel indices for this batch
-            batch_size: int (B) — needed for multi-scale temporal pooling
-            num_timesteps: int (N) — needed for multi-scale temporal pooling
         Returns:
             bias: (B*N, num_heads, C, C) attention bias per head
-            L: (B*N, C, C) raw single-timestep tangent vectors for value mixing
+            L: (B*N, C, C) raw tangent vectors (for value mixing + logging)
         """
         BN, C, D = x.shape
 
@@ -1172,65 +1145,11 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         # Step 2: Project to tangent space at identity via Padé [1,1]
         L = self.adaptive_log(S, channel_idx)  # (B*N, C, C)
 
-        # Step 3: Multi-scale temporal averaging in tangent space
-        use_multiscale = (
-            self.multiscale_windows is not None
-            and batch_size is not None
-            and num_timesteps is not None
-            and C >= self.multiscale_min_channels
-        )
+        # Step 3: Per-head scaling
+        scales = self.head_scales.view(1, self.num_heads, 1, 1)
+        bias = L.unsqueeze(1) * scales
 
-        if use_multiscale:
-            B = batch_size
-            N = num_timesteps
-            # Reshape to (B, N, C*C) for 1D temporal pooling
-            L_4d = L.view(B, N, C, C)
-            L_flat = L_4d.reshape(B, N, C * C).permute(0, 2, 1)  # (B, C*C, N)
-
-            # Compute Fréchet mean in tangent space for each window size
-            L_scales = []
-            for win in self.multiscale_windows:
-                if win <= 1:
-                    # Single-timestep: use L as-is
-                    L_scales.append(L_flat)  # (B, C*C, N)
-                else:
-                    # Symmetric (non-causal) window via avg_pool1d with padding
-                    pad = win // 2
-                    L_padded = F.pad(L_flat, (pad, pad), mode='replicate')
-                    L_pooled = F.avg_pool1d(L_padded, kernel_size=win, stride=1)
-                    # avg_pool1d may produce N+1 outputs if win is even; trim
-                    L_pooled = L_pooled[:, :, :N]
-                    L_scales.append(L_pooled)  # (B, C*C, N)
-
-            # Stack scales: (num_scales, B, C*C, N)
-            L_stack = torch.stack(L_scales, dim=0)
-
-            # Per-head softmax weights over scales: (H, num_scales)
-            sw = F.softmax(self.scale_weights, dim=-1)  # (H, S)
-
-            # Weighted combination per head via einsum:
-            # sw: (H, S), L_stack: (S, B, C*C, N) → L_combined: (H, B, C*C, N)
-            L_combined = torch.einsum('hs,sbcn->hbcn', sw, L_stack)
-
-            # Reshape to (B*N, H, C, C) — matching expected bias shape
-            L_combined = L_combined.permute(1, 3, 0, 2)  # (B, N, H, C*C)
-            L_combined = L_combined.reshape(B * N, self.num_heads, C, C)
-
-            # Apply per-head scales for attention bias
-            scales = self.head_scales.view(1, self.num_heads, 1, 1)
-            bias = L_combined * scales
-
-            # Return raw single-timestep L for value mixing —
-            # multi-scale only affects score bias (additive, cheap).
-            # Value bias uses L directly (avoids per-head C×C matmul overhead).
-            return bias, L
-
-        else:
-            # Single-scale fallback (original behavior)
-            scales = self.head_scales.view(1, self.num_heads, 1, 1)
-            bias = L.unsqueeze(1) * scales
-
-            return bias, L
+        return bias, L
 
 
 
@@ -1247,7 +1166,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
                  log_mode='eigh', use_approx=False,
                  use_frechet=False, frechet_R_inv_sqrt=None,
                  use_temporal_cov=False,
-                 multiscale_windows=None, multiscale_min_channels=8):
+                 use_value_bias=True):
         super().__init__()
         assert num_heads % 2 == 0, "num_heads must be even for parallel split"
         assert embed_dim % num_heads == 0
@@ -1257,6 +1176,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.dim_head = embed_dim // num_heads
         self.embed_dim = embed_dim
         self.half_dim = self.heads_per_branch * self.dim_head
+        self.use_value_bias = use_value_bias
 
         # Shared QKV projection
         self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
@@ -1274,15 +1194,14 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             use_approx=use_approx,
             use_frechet=use_frechet,
             frechet_R_inv_sqrt=frechet_R_inv_sqrt,
-            multiscale_windows=multiscale_windows,
-            multiscale_min_channels=multiscale_min_channels,
         )
 
         # Geometric value mixing: V' = V + β_h · (L @ V)
         # Injects covariance structure into attention values — complementary
         # to the score bias (which controls routing, not feature mixing).
         # Initialized to 0 so model starts as standard attention.
-        self.value_beta = nn.Parameter(torch.zeros(self.heads_per_branch))
+        if use_value_bias:
+            self.value_beta = nn.Parameter(torch.zeros(self.heads_per_branch))
 
     def forward(self, x_norm, num_chan, residual=None, channel_idx=None,
                 mask=None):
@@ -1310,9 +1229,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             mask_space = rearrange(mask, 'b (n c) -> (b n) c', c=C)
             x_space = x_space * (~mask_space).unsqueeze(-1).float()
 
-        riem_bias, L_n = self.riemannian_bias(
-            x_space, channel_idx, batch_size=B, num_timesteps=N
-        )
+        riem_bias, L_n = self.riemannian_bias(x_space, channel_idx)
 
         # ── Shared QKV ──
         qkv = self.qkv(x_norm).reshape(B, L, 3, H, d).permute(2, 0, 3, 1, 4)
@@ -1339,18 +1256,14 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         v_s = rearrange(v_s, 'b h (n c) d -> (b n) h c d', c=C)
 
         # ── Geometric value mixing: V' = V + β_h · (L @ V) ──
-        # L_n is always (B*N, C, C) — single-timestep, shared across heads.
-        # Multi-scale only affects the score bias (additive, cheap).
-        # Value bias uses raw L to avoid expensive per-head C×C @ V matmul.
-        # Runs in native dtype (fp16 under mixed precision) to save VRAM —
-        # no softmax here, so float32 is not needed for numerical stability.
-        beta_h = self.value_beta.view(1, H2, 1, 1)
-        # L_n: (B*N, C, C), v_s: (B*N, H2, C, d) → v_geo: (B*N, H2, C, d)
-        # Use bmm via reshape to avoid einsum memory overhead:
-        # Expand L to match heads by broadcasting through reshape
-        L_exp = L_n.unsqueeze(1).to(v_s.dtype)       # (B*N, 1, C, C)
-        v_geo = (L_exp @ v_s)                          # (B*N, H2, C, d) via broadcast
-        v_s = v_s + beta_h * v_geo
+        # Score bias (α·L on attention logits) controls WHERE to attend.
+        # Value bias (β·L@V) controls WHAT information flows — complementary.
+        # Runs in native dtype (fp16) to save VRAM; no softmax, fp32 not needed.
+        if self.use_value_bias:
+            beta_h = self.value_beta.view(1, H2, 1, 1)
+            L_exp = L_n.unsqueeze(1).to(v_s.dtype)   # (B*N, 1, C, C)
+            v_geo = L_exp @ v_s                        # (B*N, H2, C, d) broadcast
+            v_s = v_s + beta_h * v_geo
 
         with torch.amp.autocast('cuda', enabled=False), \
              torch.amp.autocast('cpu', enabled=False):
@@ -1398,7 +1311,7 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
                  norm=nn.LayerNorm, spd_eps=1e-5, log_mode='eigh', use_approx=False,
                  use_frechet=False, frechet_R_inv_sqrt=None,
                  use_temporal_cov=False,
-                 multiscale_windows=None, multiscale_min_channels=8):
+                 use_value_bias=True):
         super().__init__()
 
         self.attn = AdaptiveRiemannianParallelAttention(
@@ -1413,8 +1326,7 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
             use_frechet=use_frechet,
             frechet_R_inv_sqrt=frechet_R_inv_sqrt,
             use_temporal_cov=use_temporal_cov,
-            multiscale_windows=multiscale_windows,
-            multiscale_min_channels=multiscale_min_channels,
+            use_value_bias=use_value_bias,
         )
 
         self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()

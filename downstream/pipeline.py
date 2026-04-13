@@ -152,22 +152,20 @@ class Pipeline:
 
     def load_encoder(self, pretrain=True, log_mode='pade',
                      use_corr_masking=True, resume_ckpt=None, use_global_norm=False,
-                     clamp_channels=False,
-                     multiscale_windows=None, multiscale_min_channels=8):
+                     clamp_channels=False, value_bias_layers=4):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
         Contributions:
             1. Riemannian spatial attention bias (Padé [1,1] log map)
-               - Multi-scale temporal covariance (when multiscale_windows is set)
-               - Geometric value mixing (V' = V + β·L@V, always active, init 0)
+               - Score bias: α_h · log(Σ) on attention logits (all layers)
+               - Value bias: β_h · (L @ V) geometric value mixing (early layers)
 
         Ablation table:
             1. baseline (parallel attn, no Riemannian) → log_mode='baseline'
             2. approx (S-I)                            → log_mode='approx', use_corr_masking=False
             3. pade                                    → log_mode='pade',   use_corr_masking=False
             4. pade + correlation masking               → log_mode='pade',   use_corr_masking=True
-            5. pade + corr mask + multiscale            → multiscale_windows=(1,5,15)
 
         Args:
             pretrain:         if True, train from scratch; else load existing ckpt
@@ -180,9 +178,9 @@ class Pipeline:
             clamp_channels:   if True, clamp channels with variance > 10× median
                               (only applies when use_global_norm=True). Use if
                               training is unstable due to noisy electrodes.
-            multiscale_windows: tuple of ints — temporal window sizes for
-                              multi-scale covariance (e.g. (1,5,15)). None = off.
-            multiscale_min_channels: skip multi-scale for C < this (default 8).
+            value_bias_layers: number of early layers that use geometric value
+                              mixing V' = V + β·(L@V). Default 4 (layers 0–3).
+                              Set to 0 to disable value bias entirely.
         """
         assert log_mode in ('pade', 'approx', 'baseline'), \
             f"log_mode must be 'pade', 'approx', or 'baseline', got '{log_mode}'"
@@ -200,23 +198,18 @@ class Pipeline:
                 print("[Ablation] Parallel attention with Riemannian bias disabled")
                 model = ApproxAdaptiveRiemannBert(
                     use_corr_masking=use_corr_masking,
-                    multiscale_windows=multiscale_windows,
-                    multiscale_min_channels=multiscale_min_channels,
+                    value_bias_layers=0,  # no value bias for clean baseline
                 )
                 for layer in model.encoder:
                     layer.attn.riemannian_bias.head_scales.requires_grad = False
                     layer.attn.riemannian_bias.head_scales.zero_()
-                    # Also freeze value beta for clean baseline
-                    layer.attn.value_beta.requires_grad = False
-                    layer.attn.value_beta.zero_()
             else:
                 masking_str = "corr-masking" if use_corr_masking else "random-masking"
-                ms_str = f", multiscale={multiscale_windows}" if multiscale_windows else ""
-                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}{ms_str}")
+                vb_str = f", value_bias_layers={value_bias_layers}"
+                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}{vb_str}")
                 model = ApproxAdaptiveRiemannBert(
                     use_corr_masking=use_corr_masking,
-                    multiscale_windows=multiscale_windows,
-                    multiscale_min_channels=multiscale_min_channels,
+                    value_bias_layers=value_bias_layers,
                 )
                 # Override log_mode in every encoder layer if needed
                 if log_mode == 'approx':
@@ -231,8 +224,8 @@ class Pipeline:
                 run_name = f"riemann-{log_mode}-{norm_tag}"
                 if use_corr_masking:
                     run_name += "-corrmask"
-                if multiscale_windows:
-                    run_name += f"-ms{'_'.join(str(w) for w in multiscale_windows)}"
+                if value_bias_layers > 0:
+                    run_name += f"-vbias{value_bias_layers}"
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
@@ -260,9 +253,7 @@ class Pipeline:
                 "use_corr_masking": use_corr_masking,
                 "use_global_norm": use_global_norm,
                 "clamp_channels": clamp_channels,
-                "multiscale_windows": multiscale_windows,
-                "multiscale_min_channels": multiscale_min_channels,
-                "value_bias": True,  # always active (init 0)
+                "value_bias_layers": value_bias_layers,
             })
 
             callbacks = [TQDMProgressBar(refresh_rate=20), ckpt_callback]
