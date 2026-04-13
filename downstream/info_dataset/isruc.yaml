@@ -1,0 +1,18 @@
+name_dataset: isruc
+
+channel_list:
+  - F3
+  - C3
+  - O1
+  - F4
+  - C4
+  - O2
+
+frequency: 200
+data_unit: V
+
+num_participant: 10
+num_classes: 5  # W, N1, N2, N3, REM
+task: classification
+
+data_file: downstream/data/isruc

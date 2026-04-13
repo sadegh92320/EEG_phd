@@ -136,6 +136,28 @@ DATASET_CONFIGS = {
         "data_length": 1000,  # 5s * 200Hz
         "sampling_rate": 200,
     },
+    "sleep_edfx": {
+        "num_classes": 5,
+        "metric": "accuracy",
+        "model_path": "downstream/saved_models",
+        "result_output": "downstream/results",
+        "data_path": "downstream/data/sleep_edfx",
+        "config_yaml": "downstream/info_dataset/sleep_edfx.yaml",
+        "num_channels": 2,
+        "data_length": 3000,  # 30s * 100Hz
+        "sampling_rate": 100,
+    },
+    "isruc": {
+        "num_classes": 5,
+        "metric": "accuracy",
+        "model_path": "downstream/saved_models",
+        "result_output": "downstream/results",
+        "data_path": "downstream/data/isruc",
+        "config_yaml": "downstream/info_dataset/isruc.yaml",
+        "num_channels": 6,
+        "data_length": 6000,  # 30s * 200Hz
+        "sampling_rate": 200,
+    },
 }
 
 

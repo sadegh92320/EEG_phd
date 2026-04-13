@@ -1159,37 +1159,36 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
       - Contribution 1: Adaptive Riemannian bias on spatial heads
       - Contribution 2: Geometric Temporal Value Injection on temporal heads
 
-    Contribution 2 — Geometric Temporal Value Injection:
+    Contribution 2 — Geometric Temporal Dynamics:
     The temporal head sees (B*C, N, D) — one channel at a time, blind to
-    cross-channel brain state. We inject brain-state awareness by adding a
-    learned projection of the brain state to temporal VALUE vectors AFTER
-    the QKV projection.
+    cross-channel brain state. We inject temporal DYNAMICS of the brain-state
+    geometry into temporal VALUE vectors AFTER the QKV projection.
 
     Pipeline per timestep n:
-        L_n = log(S_n) via Padé [1,1]           (already computed for spatial bias)
-        b_n = mean_c( L_n · x_space )            (geometry-weighted channel pool → D)
-        brain_emb_n = Linear(b_n) → d            (project D → dim_head, ~33K params)
-        V_temporal += β · brain_emb_n             (add to temporal values, broadcast heads)
+        L_n = log(S_n) via Padé [1,1]            (already computed for spatial bias)
+        L_smooth = avg_pool(L_n, window=W)        (Log-Euclidean Fréchet mean, smooths noise)
+        ΔL_n = L_smooth_n − L_smooth_{n−1}        (temporal derivative of geometry)
+        d_n = mean_c( ΔL_n · x_space )            (pool dynamics through residual → D)
+        brain_emb_n = Linear(d_n) → d             (project D → dim_head, ~33K params)
+        V_temporal += β · brain_emb_n              (add to temporal values, broadcast heads)
 
-    The brain state b_n = mean_c(L_n · x_space) is the geometry-weighted average
-    of the residual stream: L_n rotates channel representations by tangent-space
-    structure, then we pool over channels. This gives a fixed D-dimensional
-    summary regardless of channel count — no zero-padding needed.
+    Why dynamics instead of static brain state:
+    - Static brain state (mean_c(L_n · x_space)) proved redundant with spatial
+      attention mixing: beta grew then shrank, no MSE improvement over 8 epochs.
+    - Temporal DERIVATIVE is unique — no other pathway provides it.
+    - Spatial prior for spatial heads, temporal dynamics for temporal heads:
+      each attention type gets a prior matched to its domain.
+    - The sliding window average is the Log-Euclidean Fréchet mean on the
+      SPD manifold — principled, not a hack.
 
-    Why this works (vs. failed approaches):
+    Why values (not attention logits):
     - Enriching embeddings before QKV (attempt 2) is LINEAR → absorbed by QKV
-    - Adding distance bias on temporal logits (attempt 1) → wrong objective
-    - Adding to VALUES after QKV is NONLINEAR: the attention weights
-      softmax(QK^T/√d) multiply the brain-state-enriched values, creating
-      a weighted average of brain states across time. This interaction
-      between attention weights and values cannot be replicated by QKV alone.
+    - Adding distance bias on temporal logits (attempt 1) → redundant with PE
+    - Adding to VALUES after QKV is NONLINEAR: softmax(QK^T/√d) multiplies
+      the dynamics-enriched values, creating a weighted trajectory summary.
 
-    Extra parameters: Linear(512→64) per layer = ~33K × 8 layers = ~262K total
-    (~1% of base model). Plus one β scalar per layer.
-
-    Supports variable channel counts across batches. The Riemannian reference
-    lives in the global 144-channel space; each batch's channel indices select
-    the relevant submatrix.
+    Extra parameters: Linear(512→64) per layer = ~33K × 8 = ~262K total (~1%).
+    Plus one β scalar and window_size=3 per layer.
     """
     def __init__(self, embed_dim, num_heads=8, total_channels=TOTAL_GLOBAL_CHANNELS,
                  dropout=0.1, att_dropout=0.1, spd_eps=1e-5,
@@ -1226,25 +1225,31 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             frechet_R_inv_sqrt=frechet_R_inv_sqrt,
         )
 
-        # ── Contribution 2: Brain-state projection for temporal values ──
-        # Instead of vectorizing the C×C triangle (variable size, huge),
-        # we pool L_n through the residual stream:
-        #     brain_state = mean_c( L_n @ x_space )   →  (B*N, D)
-        # This is the "geometry-weighted channel average" — a fixed D-dim
-        # summary of the cross-channel tangent-space structure at each timestep,
-        # regardless of channel count.  Then project D → d:
-        #     Linear(512, 64) = 32K params per layer — ~1% total overhead.
+        # ── Contribution 2: Geometric Temporal Dynamics for temporal values ──
+        # Instead of injecting the static brain state (which proved redundant
+        # with what spatial attention already mixes into the residual stream),
+        # we inject the DYNAMICS — how the brain-state geometry changes over time.
+        #
+        # Pipeline:
+        #   L_n: (B*N, C, C) tangent vectors — already computed for spatial bias
+        #   Reshape to (B, N, C, C), smooth with sliding window avg (size W),
+        #   then compute ΔL_n = L_smooth_n − L_smooth_{n−1}.
+        #   Pool through residual: brain_dynamic = mean_c(ΔL_n · x_space_n) → (B*N, D)
+        #   Project D → d: Linear(512, 64) — same 33K params per layer.
+        #
+        # Why dynamics not static:
+        #   - Static brain state is partially redundant with spatial attention
+        #     (empirically verified: beta grew then shrank at layers 0-2, no MSE gain)
+        #   - Temporal DERIVATIVE of geometry is unique — no other pathway provides it
+        #   - Matches temporal attention's domain: spatial prior for spatial heads,
+        #     temporal dynamics for temporal heads
+        #
+        # The sliding window average is the Log-Euclidean Fréchet mean on the
+        # SPD manifold — averaging tangent vectors IS the principled manifold mean.
+        self.window_size = 3  # sliding window for smoothing L_n
         self.brain_state_proj = nn.Linear(embed_dim, self.dim_head, bias=False)
-        # Scale parameter — init to small positive value (not zero).
-        # If beta=0, brain_state_proj receives exactly zero gradient
-        # (dL/dW = beta * dL/d_brain_emb * brain_state^T = 0 * ... = 0),
-        # creating a chicken-and-egg deadlock.  beta=0.01 with small-init
-        # proj means the initial perturbation to V is ~0.01 * N(0,0.01) ≈ 1e-4,
-        # negligible vs V ~ O(1), but enough to bootstrap gradients.
         self.beta = nn.Parameter(torch.tensor(0.01))
-
-        # Small init so brain-state path doesn't perturb early training
-        nn.init.normal_(self.brain_state_proj.weight, std=0.01)
+        nn.init.normal_(self.brain_state_proj.weight, std=0.1)
 
     def forward(self, x_norm, num_chan, residual=None, channel_idx=None,
                 mask=None):
@@ -1290,17 +1295,40 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         k_t, k_s = k[:, :H2], k[:, H2:]
         v_t, v_s = v[:, :H2], v[:, H2:]
 
-        # ── Contribution 2: Brain-state embedding for temporal values ──
-        # Pool L_n through the residual stream to get a fixed D-dim summary:
-        #   L_n @ x_space: (B*N, C, C) @ (B*N, C, D) → (B*N, C, D)
-        #   mean over C  → (B*N, D)
-        # This is the geometry-weighted channel average — captures cross-channel
-        # structure in embedding space, fixed size regardless of channel count.
-        # Detach both to prevent gradient competition with spatial bias path.
-        brain_state = torch.bmm(
-            L_n.detach(), x_space.detach()
-        ).mean(dim=1)                                     # (B*N, D)
-        brain_emb = self.brain_state_proj(brain_state)     # (B*N, d)
+        # ── Contribution 2: Geometric temporal dynamics for temporal values ──
+        # Smooth L_n over a sliding window (Log-Euclidean Fréchet mean),
+        # then compute the temporal derivative ΔL_n = L_smooth_n − L_smooth_{n−1}.
+        # Pool ΔL_n through x_space to get a fixed D-dim dynamics summary.
+        L_seq = L_n.detach().view(B, N, C, C)             # (B, N, C, C)
+
+        # Sliding window average along time (dim=1)
+        # Use avg_pool1d on flattened C*C, then reshape back
+        CC = C * C
+        L_flat = L_seq.reshape(B, N, CC).permute(0, 2, 1)  # (B, CC, N)
+        W = min(self.window_size, N)
+        pad_left = (W - 1) // 2
+        pad_right = W - 1 - pad_left
+        L_padded = F.pad(L_flat, (pad_left, pad_right), mode='replicate')
+        L_smooth = F.avg_pool1d(L_padded, kernel_size=W, stride=1)  # (B, CC, N)
+        L_smooth = L_smooth.permute(0, 2, 1).reshape(B, N, C, C)   # (B, N, C, C)
+
+        # Temporal derivative: ΔL_n = L_smooth_n − L_smooth_{n−1}
+        # At t=0, use L_smooth_0 itself (the absolute geometry IS the dynamics
+        # at the boundary — avoids wasting 1/N of the signal as zeros)
+        delta_L = torch.zeros_like(L_smooth)
+        delta_L[:, 1:] = L_smooth[:, 1:] - L_smooth[:, :-1]       # (B, N, C, C)
+        delta_L[:, 0] = L_smooth[:, 0]                              # boundary: absolute geometry
+        delta_L = delta_L.reshape(B * N, C, C)                      # (B*N, C, C)
+
+        # Pool dynamics through residual stream: mean_c(ΔL · x_space) → (B*N, D)
+        brain_dynamic = torch.bmm(
+            delta_L, x_space.detach()
+        ).mean(dim=1)                                               # (B*N, D)
+
+        # Store magnitude for diagnostics (logged in training loop)
+        self._brain_dynamic_norm = brain_dynamic.detach().abs().mean()
+
+        brain_emb = self.brain_state_proj(brain_dynamic)             # (B*N, d)
 
         # ── Temporal attention with brain-state value injection ──
         q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=C)

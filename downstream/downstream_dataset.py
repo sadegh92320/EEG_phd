@@ -93,12 +93,16 @@ class Downstream_Dataset(Dataset):
             for key, val in self.channel_config["channels_mapping"].items()
         }
 
+        next_id = max(chan_map.values()) + 1 if chan_map else 0
         for ch in channel_list:
             idx = chan_map.get(ch)
             if idx is None:
-                raise ValueError(
-                    f"Channel '{ch}' not found in general channel_info.yaml mapping."
-                )
+                # Bipolar derivations (e.g. Fpz-Cz) or unknown channels:
+                # assign sequential IDs beyond the known mapping.
+                # These won't match any pretrained positional embedding,
+                # which is correct — models will use default/no pos embed.
+                idx = next_id
+                next_id += 1
             channel_id.append(idx)
         return channel_id
 

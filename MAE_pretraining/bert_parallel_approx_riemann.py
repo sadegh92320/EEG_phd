@@ -440,6 +440,12 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                          layer.attn.brain_state_proj.weight.grad.norm().item(),
                          on_step=False, on_epoch=True)
 
+            # Brain dynamic signal magnitude (Contribution 2 health check)
+            if hasattr(layer.attn, '_brain_dynamic_norm'):
+                self.log(f"brain_dynamic_norm/layer_{i}",
+                         layer.attn._brain_dynamic_norm.item(),
+                         on_step=False, on_epoch=True)
+
         return loss
 
     def validation_step(self, batch, batch_idx):

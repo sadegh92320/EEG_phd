@@ -1,0 +1,14 @@
+name_dataset: sleep_edfx
+
+channel_list:
+  - Fpz-Cz
+  - Pz-Oz
+
+frequency: 100
+data_unit: V
+
+num_participant: 78
+num_classes: 5  # W, N1, N2, N3, REM
+task: classification
+
+data_file: downstream/data/sleep_edfx
