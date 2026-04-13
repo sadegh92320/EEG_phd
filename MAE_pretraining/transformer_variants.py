@@ -1156,10 +1156,7 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
             num_timesteps: int (N) — needed for multi-scale temporal pooling
         Returns:
             bias: (B*N, num_heads, C, C) attention bias per head
-            L_for_values: (B*N, C, C) or (B*N, H, C, C) — tangent vectors for
-                value mixing.  Single-scale: shared across heads (B*N, C, C).
-                Multi-scale: per-head weighted (B*N, H, C, C).
-            is_per_head: bool — whether L_for_values has a head dimension
+            L: (B*N, C, C) raw single-timestep tangent vectors for value mixing
         """
         BN, C, D = x.shape
 
@@ -1313,7 +1310,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             mask_space = rearrange(mask, 'b (n c) -> (b n) c', c=C)
             x_space = x_space * (~mask_space).unsqueeze(-1).float()
 
-        riem_bias, L_n, L_is_per_head = self.riemannian_bias(
+        riem_bias, L_n = self.riemannian_bias(
             x_space, channel_idx, batch_size=B, num_timesteps=N
         )
 
@@ -1342,19 +1339,18 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         v_s = rearrange(v_s, 'b h (n c) d -> (b n) h c d', c=C)
 
         # ── Geometric value mixing: V' = V + β_h · (L @ V) ──
-        # Injects manifold structure into values before attention matmul.
-        # Score bias (α·L) controls WHERE to attend; value bias (β·L@V)
-        # controls WHAT information flows — complementary, not redundant.
-        with torch.amp.autocast('cuda', enabled=False), \
-             torch.amp.autocast('cpu', enabled=False):
-            beta_h = self.value_beta.view(1, H2, 1, 1)
-            if L_is_per_head:
-                # Multi-scale: L_n is (B*N, H, C, C) — per-head weighted
-                v_geo = torch.einsum('bhij,bhjd->bhid', L_n.float(), v_s.float())
-            else:
-                # Single-scale: L_n is (B*N, C, C) — shared across heads
-                v_geo = torch.einsum('bij,bhjd->bhid', L_n.float(), v_s.float())
-            v_s = v_s + (beta_h * v_geo).to(v_s.dtype)
+        # L_n is always (B*N, C, C) — single-timestep, shared across heads.
+        # Multi-scale only affects the score bias (additive, cheap).
+        # Value bias uses raw L to avoid expensive per-head C×C @ V matmul.
+        # Runs in native dtype (fp16 under mixed precision) to save VRAM —
+        # no softmax here, so float32 is not needed for numerical stability.
+        beta_h = self.value_beta.view(1, H2, 1, 1)
+        # L_n: (B*N, C, C), v_s: (B*N, H2, C, d) → v_geo: (B*N, H2, C, d)
+        # Use bmm via reshape to avoid einsum memory overhead:
+        # Expand L to match heads by broadcasting through reshape
+        L_exp = L_n.unsqueeze(1).to(v_s.dtype)       # (B*N, 1, C, C)
+        v_geo = (L_exp @ v_s)                          # (B*N, H2, C, d) via broadcast
+        v_s = v_s + beta_h * v_geo
 
         with torch.amp.autocast('cuda', enabled=False), \
              torch.amp.autocast('cpu', enabled=False):
