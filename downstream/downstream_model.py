@@ -153,6 +153,89 @@ class CombinedRiemannDownstreamHead(nn.Module):
         return self.final(combined)
 
 
+class GeodesicPrototypeHead(nn.Module):
+    """
+    Contribution 2: Geodesic Prototype Classifier.
+
+    Classifies by Log-Euclidean distance between the trial's spatial
+    geometry (from the encoder's last-layer covariance) and learnable
+    class-specific prototypes on the tangent space of the SPD manifold.
+
+    Pipeline:
+        (B, N*C, D) → reshape (B, N, C, D) → mean over N → (B, C, D)
+        → covariance → Padé [1,1] log map → upper triangle → (B, tri)
+        → distance to K prototypes → logits = −d_k
+
+    Why this links to C1:
+        C1 biases spatial attention to preserve meaningful geometry through
+        8 encoder layers. This head reads that geometry directly — classifying
+        by *how channels co-activate*, not by raw feature magnitude. Each
+        prototype captures a class-specific spatial pattern (e.g., left-motor
+        vs. right-motor channel coupling).
+
+    Uses the SAME Padé [1,1] log map as C1's encoder, ensuring consistency
+    between the Riemannian geometry used during pretraining and downstream.
+    """
+    def __init__(self, embed_dim, num_channels, num_classes, dropout=0.1, eps=1e-5):
+        super().__init__()
+        self.num_channels = num_channels
+        self.eps = eps
+
+        tri_size = num_channels * (num_channels + 1) // 2
+
+        # Normalize tangent vectors before distance computation
+        self.norm = nn.LayerNorm(tri_size)
+
+        # Learnable class prototypes — small random init to break symmetry
+        self.prototypes = nn.Parameter(torch.randn(num_classes, tri_size) * 0.02)
+
+        # Learnable temperature for softmax over distances
+        self.temperature = nn.Parameter(torch.tensor(10.0))
+
+        self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
+
+    @staticmethod
+    def _pade_log(S, eye):
+        """Padé [1,1] log map: log(S) ≈ 2(S - I)(S + I)^{-1}.
+        Same formula used in C1's AdaptiveRiemannianAttentionBias."""
+        A = S - eye                          # numerator
+        B = S + eye                          # denominator
+        L = 2.0 * torch.linalg.solve(B, A)  # (S+I)^{-1} (S-I) * 2
+        # Symmetrize to kill numerical asymmetry
+        return (L + L.transpose(-2, -1)) * 0.5
+
+    def forward(self, x, num_channels):
+        """
+        Args:
+            x: (B, L, D) where L = C * N (all patch tokens from encoder)
+            num_channels: int, number of EEG channels C
+        Returns:
+            logits: (B, num_classes) — negative scaled distances
+        """
+        B, L, D = x.shape
+        C = num_channels
+
+        # Time-averaged spatial embeddings: (B, C, D)
+        x_spatial = rearrange(x, "b (n c) d -> b n c d", c=C)
+        x_spatial = x_spatial.mean(dim=1)  # (B, C, D)
+
+        # Covariance → SPD → Padé log map → upper triangle
+        eye = torch.eye(C, device=x.device, dtype=x.dtype).unsqueeze(0)
+        cov = x_spatial.float() @ x_spatial.float().transpose(-1, -2) / D + self.eps * eye
+        log_cov = self._pade_log(cov, eye).to(x.dtype)
+
+        idx = torch.triu_indices(C, C, device=log_cov.device)
+        tangent = log_cov[:, idx[0], idx[1]]  # (B, tri)
+        tangent = self.norm(tangent)
+        tangent = self.dropout(tangent)
+
+        # Log-Euclidean distance to each prototype: (B, K)
+        dists = torch.cdist(tangent, self.prototypes, p=2)  # (B, K)
+
+        # Negative distance as logits, scaled by learnable temperature
+        return -dists * self.temperature.abs()
+
+
 class DownstreamHead(nn.Module):
     """
     Classification head for the downstream model.
@@ -252,6 +335,12 @@ class Downstream(nn.Module):
         elif head_choice == "riemann_combined":
             num_ch = len(config["channel_list"]) if config is not None else 22
             self.head = CombinedRiemannDownstreamHead(
+                embed_dim=enc_dim, num_channels=num_ch,
+                num_classes=num_classes, dropout=head_dropout,
+            )
+        elif head_choice == "geodesic_prototype":
+            num_ch = len(config["channel_list"]) if config is not None else 22
+            self.head = GeodesicPrototypeHead(
                 embed_dim=enc_dim, num_channels=num_ch,
                 num_classes=num_classes, dropout=head_dropout,
             )
@@ -543,7 +632,7 @@ class DownstreamRiemannTransformerPara(Downstream):
         # Head: dispatch based on head_choice
         cls_out = x[:, :1, :]   # first patch token as dummy CLS
         patch_out = x            # all tokens are patch tokens
-        if self.head_choice in ("riemann", "riemann_combined"):
+        if self.head_choice in ("riemann", "riemann_combined", "geodesic_prototype"):
             return self.head(patch_out, C)
         else:
             return self.head(cls_out, patch_out)

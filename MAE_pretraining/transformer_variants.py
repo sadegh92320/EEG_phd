@@ -1259,10 +1259,19 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         # Score bias (α·L on attention logits) controls WHERE to attend.
         # Value bias (β·L@V) controls WHAT information flows — complementary.
         # Runs in native dtype (fp16) to save VRAM; no softmax, fp32 not needed.
+        #
+        # LEAK PREVENTION: L @ V mixes all channels' values. If masked channels
+        # keep their mask-token V vectors, L routes mask-token info into
+        # unmasked channels — a subtle leak (model sees "which channels are
+        # masked" through the value path). Zero out masked V before mixing.
         if self.use_value_bias:
             beta_h = self.value_beta.view(1, H2, 1, 1)
             L_exp = L_n.unsqueeze(1).to(v_s.dtype)   # (B*N, 1, C, C)
-            v_geo = L_exp @ v_s                        # (B*N, H2, C, d) broadcast
+            v_for_geo = v_s
+            if mask is not None:
+                mask_v = rearrange(mask, 'b (n c) -> (b n) c', c=C)
+                v_for_geo = v_s * (~mask_v).unsqueeze(1).unsqueeze(-1).float()
+            v_geo = L_exp @ v_for_geo                  # (B*N, H2, C, d)
             v_s = v_s + beta_h * v_geo
 
         with torch.amp.autocast('cuda', enabled=False), \

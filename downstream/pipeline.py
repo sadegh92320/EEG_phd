@@ -151,7 +151,7 @@ class Pipeline:
 
 
     def load_encoder(self, pretrain=True, log_mode='pade',
-                     use_corr_masking=True, resume_ckpt=None, use_global_norm=False,
+                     use_corr_masking=False, resume_ckpt=None, use_global_norm=False,
                      clamp_channels=False, value_bias_layers=4):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.

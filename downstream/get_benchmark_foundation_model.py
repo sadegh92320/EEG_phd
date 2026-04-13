@@ -209,6 +209,21 @@ def build_riemann_combined_head(num_classes, checkpoint_path, num_channels, data
     return model
 
 
+def build_geodesic_prototype(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
+    """Riemannian parallel transformer + geodesic prototype classifier (C2)."""
+    config_yaml = kwargs.get("config_yaml", None)
+    if config_yaml:
+        with open(config_yaml) as f:
+            cfg = yaml.safe_load(f)
+    else:
+        cfg = {"channel_list": list(range(num_channels))}
+    model = DownstreamRiemannTransformerPara(
+        num_classes=num_classes, checkpoint_path=checkpoint_path,
+        head_choice="geodesic_prototype", config=cfg,
+    )
+    return model
+
+
 def _partial_unfreeze(model, block_container, num_total_blocks, finetune_layers, head_modules):
     """
     STEEGformer-style partial unfreezing: freeze everything, then unfreeze
@@ -658,6 +673,7 @@ MODEL_BUILDERS = {
     "riemann_adaptive": build_riemann_transformer_para,  # alias — same model
     "riemann_seq": build_riemann_transformer_seq,
     "riemann_combined": build_riemann_combined_head,
+    "geodesic_prototype": build_geodesic_prototype,
 }
 
 
