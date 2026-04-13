@@ -194,6 +194,20 @@ def build_riemann_transformer_seq(num_classes, checkpoint_path, num_channels, da
     model = DownstreamRiemannTransformerSeq(num_classes=num_classes, checkpoint_path=checkpoint_path)
     return model
 
+def build_riemann_combined_head(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
+    """Riemannian parallel transformer + combined classification head (C2: pooled + tangent features)."""
+    config_yaml = kwargs.get("config_yaml", None)
+    if config_yaml:
+        with open(config_yaml) as f:
+            cfg = yaml.safe_load(f)
+    else:
+        cfg = {"channel_list": list(range(num_channels))}
+    model = DownstreamRiemannTransformerPara(
+        num_classes=num_classes, checkpoint_path=checkpoint_path,
+        head_choice="riemann_combined", config=cfg,
+    )
+    return model
+
 
 def _partial_unfreeze(model, block_container, num_total_blocks, finetune_layers, head_modules):
     """
@@ -643,6 +657,7 @@ MODEL_BUILDERS = {
     "riemann_para": build_riemann_transformer_para,
     "riemann_adaptive": build_riemann_transformer_para,  # alias — same model
     "riemann_seq": build_riemann_transformer_seq,
+    "riemann_combined": build_riemann_combined_head,
 }
 
 

@@ -67,7 +67,90 @@ class RiemannDownstreamHead(nn.Module):
         features = self.norm(features)
         features = self.dropout(features)
         return self.final(features)
-        
+
+
+class CombinedRiemannDownstreamHead(nn.Module):
+    """
+    Contribution 2: Combined Riemannian Classification Head.
+
+    Concatenates standard pooled encoder output with tangent-space features
+    extracted from the encoder's last-layer spatial covariance.
+
+    Pipeline:
+        (B, N*C, D) → split into:
+          Branch A: mean-pool → LayerNorm → (B, D)          [standard path]
+          Branch B: reshape (B,N,C,D) → mean over N → cov → log(Σ)
+                    → upper triangle → LayerNorm → (B, tri)  [tangent path]
+        Concatenate → Dropout → Linear → (B, num_classes)
+
+    Why this works:
+    - Branch A captures content (what the brain is doing)
+    - Branch B captures spatial geometry (how channels co-activate)
+    - Tangent-space classification is the gold standard in BCI
+      (Barachant et al. 2012) — but here applied to pretrained
+      representations instead of raw EEG, which should be strictly
+      better because C1 biases spatial attention to maintain
+      meaningful geometry through 8 layers.
+
+    The synergy with C1:
+    - C1 biases spatial attention to follow manifold structure during
+      pretraining → encoder covariance is geometrically meaningful
+    - C2 harvests that geometry for classification
+    - Without C1, Branch B is just raw-signal tangent features (modest)
+    - With C1, Branch B uses pretrained manifold-aware features (better)
+    """
+    def __init__(self, embed_dim, num_channels, num_classes, dropout=0.1, eps=1e-5):
+        super().__init__()
+        self.num_channels = num_channels
+        self.eps = eps
+
+        # Upper triangle (including diagonal) of C×C symmetric matrix
+        tri_size = num_channels * (num_channels + 1) // 2
+
+        # Branch A: pooled encoder output
+        self.norm_pool = nn.LayerNorm(embed_dim)
+
+        # Branch B: tangent-space features
+        self.norm_tangent = nn.LayerNorm(tri_size)
+
+        # Combined classifier
+        combined_dim = embed_dim + tri_size
+        self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
+        self.final = nn.Linear(combined_dim, num_classes)
+
+    def forward(self, x, num_channels):
+        """
+        Args:
+            x: (B, L, D) where L = C * N (all patch tokens from encoder)
+            num_channels: int, number of EEG channels C
+        Returns:
+            logits: (B, num_classes)
+        """
+        B, L, D = x.shape
+        C = num_channels
+
+        # ── Branch A: Standard pooled output ──
+        pooled = self.norm_pool(x).mean(dim=1)  # (B, D)
+
+        # ── Branch B: Tangent-space features from spatial covariance ──
+        x_spatial = rearrange(x, "b (n c) d -> b n c d", c=C)
+        x_spatial = x_spatial.mean(dim=1)  # (B, C, D) — time-averaged
+
+        eye = torch.eye(C, device=x.device, dtype=x.dtype).unsqueeze(0)
+        cov = x_spatial @ x_spatial.transpose(-1, -2) / D + self.eps * eye  # (B, C, C)
+
+        # Log map: log(Σ) ≈ Σ - I (first-order, stable)
+        log_cov = cov - eye
+
+        # Vectorize upper triangle
+        idx = torch.triu_indices(C, C, device=log_cov.device)
+        tangent_features = log_cov[:, idx[0], idx[1]]  # (B, C*(C+1)/2)
+        tangent_features = self.norm_tangent(tangent_features)
+
+        # ── Concatenate and classify ──
+        combined = torch.cat([pooled, tangent_features], dim=-1)  # (B, D + tri)
+        combined = self.dropout(combined)
+        return self.final(combined)
 
 
 class DownstreamHead(nn.Module):
@@ -163,6 +246,12 @@ class Downstream(nn.Module):
         elif head_choice == "riemann":
             num_ch = len(config["channel_list"]) if config is not None else 22
             self.head = RiemannDownstreamHead(
+                embed_dim=enc_dim, num_channels=num_ch,
+                num_classes=num_classes, dropout=head_dropout,
+            )
+        elif head_choice == "riemann_combined":
+            num_ch = len(config["channel_list"]) if config is not None else 22
+            self.head = CombinedRiemannDownstreamHead(
                 embed_dim=enc_dim, num_channels=num_ch,
                 num_classes=num_classes, dropout=head_dropout,
             )
@@ -446,12 +535,11 @@ class DownstreamRiemannTransformerPara(Downstream):
         x = self._run_encoder(x, C, channel_idx=channel_idx)
         x = self.norm_enc(x)
 
-        # Head: cls_out unused for avg pooling, pass None-like placeholder
+        # Head: dispatch based on head_choice
         cls_out = x[:, :1, :]   # first patch token as dummy CLS
         patch_out = x            # all tokens are patch tokens
-        if self.head_choice == "riemann":
+        if self.head_choice in ("riemann", "riemann_combined"):
             return self.head(patch_out, C)
-
         else:
             return self.head(cls_out, patch_out)
 
