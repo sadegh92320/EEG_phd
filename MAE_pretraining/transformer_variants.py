@@ -1208,14 +1208,12 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
             # Stack scales: (num_scales, B, C*C, N)
             L_stack = torch.stack(L_scales, dim=0)
 
-            # Per-head softmax weights: (H, num_scales) → (num_scales, H, 1, 1)
-            sw = F.softmax(self.scale_weights, dim=-1).T  # (num_scales, H)
-            sw = sw[:, :, None, None]  # (num_scales, H, 1, 1)
+            # Per-head softmax weights over scales: (H, num_scales)
+            sw = F.softmax(self.scale_weights, dim=-1)  # (H, S)
 
-            # Weighted combination per head: (H, B, C*C, N)
-            L_stack_exp = L_stack.unsqueeze(1)  # (S, 1, B, C*C, N)
-            sw_exp = sw.unsqueeze(2).unsqueeze(4)  # (S, H, 1, 1, 1)
-            L_combined = (sw_exp * L_stack_exp).sum(dim=0)  # (H, B, C*C, N)
+            # Weighted combination per head via einsum:
+            # sw: (H, S), L_stack: (S, B, C*C, N) → L_combined: (H, B, C*C, N)
+            L_combined = torch.einsum('hs,sbcn->hbcn', sw, L_stack)
 
             # Reshape to (B*N, H, C, C) — matching expected bias shape
             L_combined = L_combined.permute(1, 3, 0, 2)  # (B, N, H, C*C)
