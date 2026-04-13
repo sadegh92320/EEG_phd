@@ -119,7 +119,8 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
     """
     def __init__(self, config=None, num_channels=64,
                  max_embedding=2000, enc_dim=512, depth_e=8,
-                 mask_prob=0.5, patch_size=16, norm_pix_loss=False):
+                 mask_prob=0.5, patch_size=16, norm_pix_loss=False,
+                 multiscale_windows=None, multiscale_min_channels=8):
         super().__init__()
 
         self.config = config
@@ -131,7 +132,9 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         # No num_channels needed — reference lives in global 144-channel space
         self.encoder = nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
-                enc_dim, nhead=8, mlp_ratio=4, log_mode='pade'
+                enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
+                multiscale_windows=multiscale_windows,
+                multiscale_min_channels=multiscale_min_channels,
             ) for _ in range(depth_e)
         ])
 

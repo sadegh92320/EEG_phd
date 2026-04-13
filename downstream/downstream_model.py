@@ -482,6 +482,10 @@ class DownstreamRiemannTransformerPara(Downstream):
         kwargs.pop("merge_k", None)
         kwargs.pop("use_frechet", None)
         kwargs.pop("use_temporal_cov", None)
+        # Multi-scale covariance config — store before super().__init__
+        # so _build_encoder can use them
+        self._multiscale_windows = kwargs.pop("multiscale_windows", None)
+        self._multiscale_min_channels = kwargs.pop("multiscale_min_channels", 8)
         if aggregation == "class":
             raise ValueError(
                 "DownstreamRiemannTransformerPara does not use a [CLS] token. "
@@ -490,9 +494,13 @@ class DownstreamRiemannTransformerPara(Downstream):
         super().__init__(*args, aggregation=aggregation, **kwargs)
 
     def _build_encoder(self, enc_dim, depth_e):
+        multiscale_windows = getattr(self, '_multiscale_windows', None)
+        multiscale_min_channels = getattr(self, '_multiscale_min_channels', 8)
         return nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
+                multiscale_windows=multiscale_windows,
+                multiscale_min_channels=multiscale_min_channels,
             ) for _ in range(depth_e)
         ])
 

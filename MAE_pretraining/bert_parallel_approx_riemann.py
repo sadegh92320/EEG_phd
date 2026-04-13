@@ -127,7 +127,8 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
     def __init__(self, config=None, num_channels=64,
                  max_embedding=2000, enc_dim=512, depth_e=8,
                  mask_prob=0.5, patch_size=16, norm_pix_loss=False,
-                 use_corr_masking=True):
+                 use_corr_masking=True,
+                 multiscale_windows=None, multiscale_min_channels=8):
         super().__init__()
 
         self.config = config
@@ -137,11 +138,12 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
 
         # Adaptive Riemannian parallel transformer layers
         # log_mode='pade' → Padé [1,1] approximant: log(S) ≈ 2(S-I)(I+S)^{-1}
-        # Contribution 1: Riemannian spatial attention bias
-        # Contribution 2: Geometric Temporal Value Injection for temporal heads
+        # Contribution 1: Riemannian spatial attention bias (multi-scale)
         self.encoder = nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
+                multiscale_windows=multiscale_windows,
+                multiscale_min_channels=multiscale_min_channels,
             ) for _ in range(depth_e)
         ])
 
@@ -421,10 +423,23 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
 
         # Log the learned head scales across layers for analysis
         for i, layer in enumerate(self.encoder):
-            # Spatial Riemannian bias head scales (Contribution 1)
+            # Spatial Riemannian bias head scales (Contribution 1: score bias α_h)
             scales = layer.attn.riemannian_bias.head_scales.detach()
             self.log(f"head_scale_mean/layer_{i}", scales.mean(), on_step=False, on_epoch=True)
             self.log(f"head_scale_std/layer_{i}", scales.std(), on_step=False, on_epoch=True)
+
+            # Value bias β_h (Contribution 1: geometric value mixing)
+            vbeta = layer.attn.value_beta.detach()
+            self.log(f"value_beta_mean/layer_{i}", vbeta.mean(), on_step=False, on_epoch=True)
+            self.log(f"value_beta_max/layer_{i}", vbeta.abs().max(), on_step=False, on_epoch=True)
+
+            # Multi-scale weights (if enabled)
+            if hasattr(layer.attn.riemannian_bias, 'scale_weights'):
+                sw = F.softmax(layer.attn.riemannian_bias.scale_weights.detach(), dim=-1)
+                for h in range(sw.shape[0]):
+                    for s in range(sw.shape[1]):
+                        self.log(f"scale_w_h{h}_s{s}/layer_{i}", sw[h, s],
+                                 on_step=False, on_epoch=True)
 
 
         return loss
