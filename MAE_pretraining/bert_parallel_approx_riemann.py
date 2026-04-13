@@ -138,7 +138,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         # Adaptive Riemannian parallel transformer layers
         # log_mode='pade' → Padé [1,1] approximant: log(S) ≈ 2(S-I)(I+S)^{-1}
         # Contribution 1: Riemannian spatial attention bias
-        # Contribution 2: Geometric cross-channel mixing for temporal heads
+        # Contribution 2: Geometric Temporal Value Injection for temporal heads
         self.encoder = nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
@@ -426,9 +426,19 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             self.log(f"head_scale_mean/layer_{i}", scales.mean(), on_step=False, on_epoch=True)
             self.log(f"head_scale_std/layer_{i}", scales.std(), on_step=False, on_epoch=True)
 
-            # Geometric cross-channel mixing alpha (Contribution 2)
-            alpha = layer.attn.alpha.detach()
-            self.log(f"alpha/layer_{i}", alpha.item(), on_step=False, on_epoch=True)
+            # Geometric Temporal Value Injection beta (Contribution 2)
+            beta = layer.attn.beta.detach()
+            self.log(f"beta/layer_{i}", beta.item(), on_step=False, on_epoch=True)
+
+            # Gradient diagnostics: track whether brain_state_proj is learning
+            if layer.attn.beta.grad is not None:
+                self.log(f"grad_beta/layer_{i}",
+                         layer.attn.beta.grad.abs().item(),
+                         on_step=False, on_epoch=True)
+            if layer.attn.brain_state_proj.weight.grad is not None:
+                self.log(f"grad_proj_norm/layer_{i}",
+                         layer.attn.brain_state_proj.weight.grad.norm().item(),
+                         on_step=False, on_epoch=True)
 
         return loss
 

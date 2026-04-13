@@ -106,7 +106,7 @@ class DownstreamDataLoader:
             test_size=0.2,
             random_state=92,
             shuffle=True,
-            stratify=y_train if len(np.unique(y_train)) > 1 else None,
+            stratify=y_train if (not np.issubdtype(np.array(y_train).dtype, np.floating) and len(np.unique(y_train)) > 1) else None,
         )
 
         train_dataset = Subset(full_train_dataset, train_idx)
@@ -185,7 +185,7 @@ class DownstreamDataLoader:
             test_size=0.2,
             random_state=92,
             shuffle=True,
-            stratify=y_train if len(np.unique(y_train)) > 1 else None,
+            stratify=y_train if (not np.issubdtype(np.array(y_train).dtype, np.floating) and len(np.unique(y_train)) > 1) else None,
         )
 
         train_dataset = Subset(full_train_dataset, train_idx)

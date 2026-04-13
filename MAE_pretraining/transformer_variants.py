@@ -1157,34 +1157,39 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
     """
     Parallel spatial-temporal attention with:
       - Contribution 1: Adaptive Riemannian bias on spatial heads
-      - Contribution 2: Geometric Cross-Channel Mixing on temporal heads
+      - Contribution 2: Geometric Temporal Value Injection on temporal heads
 
-    Geometric Cross-Channel Mixing injects brain-state awareness into temporal
-    attention. Each temporal head normally sees only one channel at a time
-    (B*C, N, D). The mixing enriches each token with cross-channel covariance
-    structure before temporal QKV projection:
+    Contribution 2 — Geometric Temporal Value Injection:
+    The temporal head sees (B*C, N, D) — one channel at a time, blind to
+    cross-channel brain state. We inject brain-state awareness by adding a
+    learned projection of the brain state to temporal VALUE vectors AFTER
+    the QKV projection.
 
-        L_n = log(S_n)  via Padé [1,1]  (already computed for spatial bias)
-        G = L_n @ x_norm                (geometric cross-channel mixing)
-        x_enriched = x_norm + α * normalize(G)
+    Pipeline per timestep n:
+        L_n = log(S_n) via Padé [1,1]           (already computed for spatial bias)
+        b_n = mean_c( L_n · x_space )            (geometry-weighted channel pool → D)
+        brain_emb_n = Linear(b_n) → d            (project D → dim_head, ~33K params)
+        V_temporal += β · brain_emb_n             (add to temporal values, broadcast heads)
 
-    Temporal QKV is computed from x_enriched; spatial QKV from x_norm.
-    This gives temporal heads awareness of the full brain state geometry
-    at each time step without changing the spatial attention pathway.
+    The brain state b_n = mean_c(L_n · x_space) is the geometry-weighted average
+    of the residual stream: L_n rotates channel representations by tangent-space
+    structure, then we pool over channels. This gives a fixed D-dimensional
+    summary regardless of channel count — no zero-padding needed.
+
+    Why this works (vs. failed approaches):
+    - Enriching embeddings before QKV (attempt 2) is LINEAR → absorbed by QKV
+    - Adding distance bias on temporal logits (attempt 1) → wrong objective
+    - Adding to VALUES after QKV is NONLINEAR: the attention weights
+      softmax(QK^T/√d) multiply the brain-state-enriched values, creating
+      a weighted average of brain states across time. This interaction
+      between attention weights and values cannot be replicated by QKV alone.
+
+    Extra parameters: Linear(512→64) per layer = ~33K × 8 layers = ~262K total
+    (~1% of base model). Plus one β scalar per layer.
 
     Supports variable channel counts across batches. The Riemannian reference
     lives in the global 144-channel space; each batch's channel indices select
     the relevant submatrix.
-
-    Args:
-        embed_dim: Total embedding dimension
-        num_heads: Number of attention heads (must be even — split 50/50)
-        total_channels: Size of global channel space (default 144)
-        dropout: Output dropout probability
-        att_dropout: Attention weight dropout probability
-        spd_eps: SPD regularization constant
-        log_mode: 'approx', 'pade', or 'eigh' (see AdaptiveLogMap)
-        use_approx: DEPRECATED — kept for backward compat.
     """
     def __init__(self, embed_dim, num_heads=8, total_channels=TOTAL_GLOBAL_CHANNELS,
                  dropout=0.1, att_dropout=0.1, spd_eps=1e-5,
@@ -1201,20 +1206,16 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.embed_dim = embed_dim
         self.half_dim = self.heads_per_branch * self.dim_head
 
-        # Separate QKV projections for temporal (enriched) and spatial (original)
-        self.qkv_temporal = nn.Linear(embed_dim, 3 * self.half_dim)
-        self.qkv_spatial = nn.Linear(embed_dim, 3 * self.half_dim)
-        # Output projection (full dimension — concatenation of both branches)
+        # Shared QKV projection (back to shared — separate QKV was for the
+        # failed enrichment approach; no longer needed)
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
+        # Output projection
         self.fc = nn.Linear(embed_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
         self.att_dropout = att_dropout
 
-        # Contribution 2: Geometric cross-channel mixing scale
-        # Initialized small so the model starts close to standard attention
-        self.alpha = nn.Parameter(torch.full((1,), 0.01))
-
         # Adaptive Riemannian bias for spatial heads (global channel space)
-        # Also provides L_n (tangent vectors) reused for cross-channel mixing
+        # Also provides L_n (tangent vectors) reused for temporal value injection
         self.riemannian_bias = AdaptiveRiemannianAttentionBias(
             num_heads=self.heads_per_branch,
             total_channels=total_channels,
@@ -1224,6 +1225,26 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             use_frechet=use_frechet,
             frechet_R_inv_sqrt=frechet_R_inv_sqrt,
         )
+
+        # ── Contribution 2: Brain-state projection for temporal values ──
+        # Instead of vectorizing the C×C triangle (variable size, huge),
+        # we pool L_n through the residual stream:
+        #     brain_state = mean_c( L_n @ x_space )   →  (B*N, D)
+        # This is the "geometry-weighted channel average" — a fixed D-dim
+        # summary of the cross-channel tangent-space structure at each timestep,
+        # regardless of channel count.  Then project D → d:
+        #     Linear(512, 64) = 32K params per layer — ~1% total overhead.
+        self.brain_state_proj = nn.Linear(embed_dim, self.dim_head, bias=False)
+        # Scale parameter — init to small positive value (not zero).
+        # If beta=0, brain_state_proj receives exactly zero gradient
+        # (dL/dW = beta * dL/d_brain_emb * brain_state^T = 0 * ... = 0),
+        # creating a chicken-and-egg deadlock.  beta=0.01 with small-init
+        # proj means the initial perturbation to V is ~0.01 * N(0,0.01) ≈ 1e-4,
+        # negligible vs V ~ O(1), but enough to bootstrap gradients.
+        self.beta = nn.Parameter(torch.tensor(0.01))
+
+        # Small init so brain-state path doesn't perturb early training
+        nn.init.normal_(self.brain_state_proj.weight, std=0.01)
 
     def forward(self, x_norm, num_chan, residual=None, channel_idx=None,
                 mask=None):
@@ -1241,71 +1262,76 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         B, L, D = x_norm.shape
         assert L % num_chan == 0
         N = L // num_chan
+        C = num_chan
         H = self.num_heads
         H2 = self.heads_per_branch
         d = self.dim_head
 
         # ── Compute Riemannian tangent vectors L_n from residual stream ──
-        # These serve double duty:
-        #   1. Spatial attention bias (Contribution 1)
-        #   2. Cross-channel mixing for temporal enrichment (Contribution 2)
         bias_source = residual if residual is not None else x_norm
-        x_space = rearrange(bias_source, 'b (n c) d -> (b n) c d', c=num_chan)
+        x_space = rearrange(bias_source, 'b (n c) d -> (b n) c d', c=C)
 
         # Zero out masked channels before covariance (pretraining only)
-        # This prevents the mask token embedding from contaminating the
-        # covariance geometry — masked channels should not contribute
         if mask is not None:
-            mask_space = rearrange(mask, 'b (n c) -> (b n) c', c=num_chan)
+            mask_space = rearrange(mask, 'b (n c) -> (b n) c', c=C)
             x_space = x_space * (~mask_space).unsqueeze(-1).float()
 
-        # Compute Riemannian bias + raw tangent vectors L_n (computed once, reused)
+        # Compute spatial bias + raw tangent vectors (computed once, reused)
         # riem_bias: (B*N, H2, C, C) — spatial attention bias
-        # L_n: (B*N, C, C) — tangent vectors reused for cross-channel mixing
+        # L_n: (B*N, C, C) — tangent vectors reused for value injection
         riem_bias, L_n = self.riemannian_bias(x_space, channel_idx)
 
-        # ── Contribution 2: Geometric Cross-Channel Mixing ──
-        # Reuse L_n from the spatial bias computation (no redundant Padé)
-        BN = L_n.shape[0]
-        x_norm_space = rearrange(x_norm, 'b (n c) d -> (b n) c d', c=num_chan)
-        G = torch.bmm(L_n.detach().to(x_norm_space.dtype), x_norm_space)  # (B*N, C, D)
+        # ── Shared QKV ──
+        qkv = self.qkv(x_norm).reshape(B, L, 3, H, d).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, H, L, d)
 
-        # Frobenius normalization to prevent scale explosion
-        G_flat = G.reshape(BN, -1)  # (B*N, C*D)
-        G_norm = torch.norm(G_flat, p=2, dim=1, keepdim=True).unsqueeze(-1) + 1e-6  # (B*N, 1, 1)
-        G = G / G_norm
+        # Split heads: first H2 for temporal, last H2 for spatial
+        q_t, q_s = q[:, :H2], q[:, H2:]
+        k_t, k_s = k[:, :H2], k[:, H2:]
+        v_t, v_s = v[:, :H2], v[:, H2:]
 
-        # Enriched input for temporal QKV
-        G_seq = rearrange(G, '(b n) c d -> b (n c) d', b=B)
-        x_enriched = x_norm + self.alpha * G_seq
+        # ── Contribution 2: Brain-state embedding for temporal values ──
+        # Pool L_n through the residual stream to get a fixed D-dim summary:
+        #   L_n @ x_space: (B*N, C, C) @ (B*N, C, D) → (B*N, C, D)
+        #   mean over C  → (B*N, D)
+        # This is the geometry-weighted channel average — captures cross-channel
+        # structure in embedding space, fixed size regardless of channel count.
+        # Detach both to prevent gradient competition with spatial bias path.
+        brain_state = torch.bmm(
+            L_n.detach(), x_space.detach()
+        ).mean(dim=1)                                     # (B*N, D)
+        brain_emb = self.brain_state_proj(brain_state)     # (B*N, d)
 
-        # ── Temporal QKV from enriched input ──
-        qkv_t = self.qkv_temporal(x_enriched)  # (B, L, 3 * half_dim)
-        qkv_t = qkv_t.reshape(B, L, 3, H2, d).permute(2, 0, 3, 1, 4)
-        q_t, k_t, v_t = qkv_t[0], qkv_t[1], qkv_t[2]
+        # ── Temporal attention with brain-state value injection ──
+        q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=C)
+        k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=C)
+        v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=C)
 
-        # ── Spatial QKV from original normalized input ──
-        qkv_s = self.qkv_spatial(x_norm)  # (B, L, 3 * half_dim)
-        qkv_s = qkv_s.reshape(B, L, 3, H2, d).permute(2, 0, 3, 1, 4)
-        q_s, k_s, v_s = qkv_s[0], qkv_s[1], qkv_s[2]
+        # brain_emb is (B*N, d) — need (B*C, H2, N, d) for temporal view
+        # Step 1: (B*N, d) → (B, N, d) → (B, 1, N, d) — add head dim (broadcast)
+        # Step 2: expand across C channels: (B, 1, C, N, d)
+        # Step 3: merge B,C → (B*C, 1, N, d) — head dim broadcasts on addition
+        brain_emb_temporal = brain_emb.view(B, N, d)     # (B, N, d)
+        brain_emb_temporal = brain_emb_temporal.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, N, d)
+        brain_emb_temporal = brain_emb_temporal.expand(-1, -1, C, -1, -1)  # (B, 1, C, N, d)
+        brain_emb_temporal = rearrange(brain_emb_temporal, 'b 1 c n d -> (b c) 1 n d')
 
-        # ── Temporal attention (Euclidean, but from geometry-enriched tokens) ──
-        q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
-        k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
-        v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
+        # Inject brain state into temporal values
+        v_t_enriched = v_t + self.beta * brain_emb_temporal
 
+        # Manual temporal attention (can't use Flash with modified V separately,
+        # but the score computation is still efficient)
         out_t = F.scaled_dot_product_attention(
-            q_t, k_t, v_t,
+            q_t, k_t, v_t_enriched,
             dropout_p=self.att_dropout if self.training else 0.0,
         )
-        out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=num_chan)
+        out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=C)
 
         # ── Spatial attention (Riemannian-biased) ──
-        q_s = rearrange(q_s, 'b h (n c) d -> (b n) h c d', c=num_chan)
-        k_s = rearrange(k_s, 'b h (n c) d -> (b n) h c d', c=num_chan)
-        v_s = rearrange(v_s, 'b h (n c) d -> (b n) h c d', c=num_chan)
+        q_s = rearrange(q_s, 'b h (n c) d -> (b n) h c d', c=C)
+        k_s = rearrange(k_s, 'b h (n c) d -> (b n) h c d', c=C)
+        v_s = rearrange(v_s, 'b h (n c) d -> (b n) h c d', c=C)
 
-        # Manual spatial attention with Riemannian bias
         with torch.amp.autocast('cuda', enabled=False), \
              torch.amp.autocast('cpu', enabled=False):
             score = (q_s.float() @ k_s.float().transpose(-2, -1)) / (d ** 0.5)

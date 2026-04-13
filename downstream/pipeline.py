@@ -158,7 +158,7 @@ class Pipeline:
 
         Contributions:
             1. Riemannian spatial attention bias (Padé [1,1] log map)
-            2. Geometric cross-channel mixing for temporal heads
+            2. Geometric Temporal Value Injection for temporal heads
 
         Ablation table:
             1. baseline (parallel attn, no Riemannian) → log_mode='baseline'
@@ -189,17 +189,17 @@ class Pipeline:
 
             # ── Select model variant ──
             # All variants use the same parallel attention architecture.
-            # The baseline freezes head_scales=0 and alpha=0 so both
-            # Riemannian and cross-channel mixing branches have zero
-            # contribution — same architecture, same param count.
+            # The baseline freezes head_scales=0 and beta=0 so both
+            # Riemannian bias and temporal value injection branches have
+            # zero contribution — same architecture, same param count.
             if log_mode == 'baseline':
                 print("[Ablation] Parallel attention with Riemannian + cross-channel mixing disabled")
                 model = ApproxAdaptiveRiemannBert(use_corr_masking=use_corr_masking)
                 for layer in model.encoder:
                     layer.attn.riemannian_bias.head_scales.requires_grad = False
                     layer.attn.riemannian_bias.head_scales.zero_()
-                    layer.attn.alpha.requires_grad = False
-                    layer.attn.alpha.zero_()
+                    layer.attn.beta.requires_grad = False
+                    layer.attn.beta.zero_()
             else:
                 masking_str = "corr-masking" if use_corr_masking else "random-masking"
                 print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}")
