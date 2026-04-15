@@ -57,8 +57,7 @@ def pade_matrix_log(M, num_squarings=4, sqrt_iters=6, pade_order=6):
             # Denman-Beavers: Y→A^{1/2} with sqrt_iters iterations
             Y = A
             for _ in range(sqrt_iters):
-                Y_chol = torch.linalg.cholesky(Y)
-                Y_inv = torch.cholesky_solve(I, Y_chol)
+                Y_inv = torch.linalg.solve(Y, I)
                 Y = 0.5 * (Y + Y_inv)
             A = Y  # A ← A^{1/2}
 
@@ -1075,11 +1074,8 @@ class AdaptiveLogMap(nn.Module):
                 S_f32 = S.float().contiguous()
                 I_f32 = I.float()
                 X = S_f32 - I_f32
-                # Use Cholesky solve instead of linalg.solve —
-                # I+S is SPD (eigenvalues > 1), and Cholesky uses a
-                # different CUDA kernel that avoids misaligned-address bugs
-                L_chol = torch.linalg.cholesky(I_f32 + S_f32)
-                T = torch.cholesky_solve(2 * X, L_chol)
+                # (I + S)^{-1} · 2X — device-agnostic linalg.solve.
+                T = torch.linalg.solve(I_f32 + S_f32, 2 * X)
 
             # ── NaN/Inf guard after Padé ──
             if torch.isnan(T).any() or torch.isinf(T).any():
@@ -1091,6 +1087,40 @@ class AdaptiveLogMap(nn.Module):
 
             return T.to(orig_dtype)
 
+
+
+class TangentLayerNorm(nn.Module):
+    """
+    Per-sample LayerNorm for the tangent-space residual stream (C3 stabilizer).
+
+    Operates on matrices in T_I — the tangent space at identity of the SPD
+    manifold. Because all logs are taken at identity via Padé [1,1], every
+    L tensor is already in the same (flat) tangent space, so standard
+    LayerNorm is geometrically valid under the log-Euclidean metric
+    (Arsigny et al. 2007). No Fréchet mean, no parallel transport, no
+    matrix sqrt — all of which caused instability in the Fréchet-reference
+    ablation for C1.
+
+    Normalizes each sample's C*C entries to zero mean and unit std, then
+    applies learnable scalar affine (γ, δ) shared across entries. Symmetry
+    of the input matrix is preserved because scalar γ, δ act element-wise
+    on a symmetric tensor.
+    """
+    def __init__(self, eps=1e-5):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(1))
+        self.delta = nn.Parameter(torch.zeros(1))
+        self.eps = eps
+
+    def forward(self, L):
+        # L: (B*N, C, C) — tangent-space state
+        BN = L.shape[0]
+        flat = L.reshape(BN, -1)                       # (B*N, C*C)
+        mean = flat.mean(dim=-1, keepdim=True)
+        std = flat.std(dim=-1, keepdim=True)
+        norm = (flat - mean) / (std + self.eps)
+        norm = self.gamma * norm + self.delta
+        return norm.reshape_as(L)
 
 
 class AdaptiveRiemannianAttentionBias(nn.Module):
@@ -1109,7 +1139,8 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
     """
     def __init__(self, num_heads, total_channels=TOTAL_GLOBAL_CHANNELS,
                  eps=1e-5, log_mode='eigh', use_approx=False,
-                 use_frechet=False, frechet_R_inv_sqrt=None):
+                 use_frechet=False, frechet_R_inv_sqrt=None,
+                 use_tangent_norm=False):
         super().__init__()
         self.num_heads = num_heads
         self.eps = eps
@@ -1122,14 +1153,32 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         # as standard Euclidean attention and learns to use the bias
         self.head_scales = nn.Parameter(torch.zeros(num_heads))
 
-    def forward(self, x, channel_idx):
+        # C3 stabilizer: tangent-space LayerNorm on accumulated residual state.
+        # Prevents magnitude drift in L across layers when use_residual_stream=True.
+        # Only instantiated when needed — no extra params when residual stream is off.
+        self.tangent_norm = TangentLayerNorm(eps=eps) if use_tangent_norm else None
+
+    def forward(self, x, channel_idx, mask_space=None, L_prev=None, beta=None):
         """
         Args:
-            x: (B*N, C, D) channel embeddings (from residual stream)
+            x: (B*N, C, D) channel embeddings (from residual stream).
+               Masked-channel rows should already be zeroed by caller.
             channel_idx: (C,) long tensor — global channel indices for this batch
+            mask_space: (B*N, C) boolean — True = masked channel at this timestep.
+                        When provided, masked rows/cols of S are overwritten with
+                        identity structure so log(S) is zero on masked positions
+                        (clean zero bias instead of Padé artifacts on fake zeros).
+            L_prev: (B*N, C, C) accumulated tangent state from the previous layer,
+                    or None if this is the first layer / residual stream is disabled.
+                    All tangent vectors are at identity, so pointwise addition is
+                    geometrically valid (they live in the same tangent space T_I).
+            beta: scalar learnable weight for this layer's fresh geometric update.
+                  Only used when L_prev is provided. Accumulation:
+                      L_current = L_prev + beta * log(S_n)
         Returns:
             bias: (B*N, num_heads, C, C) attention bias per head
-            L: (B*N, C, C) raw tangent vectors (for value mixing + logging)
+            L: (B*N, C, C) current tangent state (either fresh or accumulated).
+                  Caller should pass this as L_prev at the next layer.
         """
         BN, C, D = x.shape
 
@@ -1140,16 +1189,40 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
              torch.amp.autocast('cpu', enabled=False):
             x_f32 = x.float()
             S = torch.bmm(x_f32, x_f32.transpose(-2, -1)) / D
-            S = S + self.eps * torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
+            eye = torch.eye(C, device=S.device, dtype=S.dtype).unsqueeze(0)
+            S = S + self.eps * eye
+
+            # Structural masking: overwrite masked rows/cols with identity.
+            # Without this, masked entries in S are fake zeros → Padé log
+            # produces garbage (-1 on diagonal, noise off-diagonal) at masked
+            # positions. After this fix, S = [[S_vis, 0], [0, I]] block-wise,
+            # so log(S) has clean zeros on masked rows/cols.
+            if mask_space is not None:
+                mf = mask_space.float()
+                m_any = (mf.unsqueeze(-1) + mf.unsqueeze(-2)).clamp_(max=1.0)
+                S = S * (1.0 - m_any) + eye * m_any
 
         # Step 2: Project to tangent space at identity via Padé [1,1]
-        L = self.adaptive_log(S, channel_idx)  # (B*N, C, C)
+        L_fresh = self.adaptive_log(S, channel_idx)  # (B*N, C, C)
 
-        # Step 3: Per-head scaling
+        # Step 2b: Residual stream accumulation. Since all logs are taken at
+        # identity, L_prev and L_fresh both live in T_I — their sum is still
+        # in T_I and corresponds to a valid tangent vector.
+        if L_prev is not None and beta is not None:
+            L_current = L_prev + beta * L_fresh
+            # Step 2c: Tangent-space LayerNorm to prevent magnitude drift across
+            # the accumulated residual stream. Applied only when a residual is
+            # actually being accumulated (layer 0 keeps its fresh Padé output).
+            if self.tangent_norm is not None:
+                L_current = self.tangent_norm(L_current)
+        else:
+            L_current = L_fresh
+
+        # Step 3: Per-head scaling on the current (possibly accumulated) tangent
         scales = self.head_scales.view(1, self.num_heads, 1, 1)
-        bias = L.unsqueeze(1) * scales
+        bias = L_current.unsqueeze(1) * scales
 
-        return bias, L
+        return bias, L_current
 
 
 
@@ -1166,7 +1239,8 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
                  log_mode='eigh', use_approx=False,
                  use_frechet=False, frechet_R_inv_sqrt=None,
                  use_temporal_cov=False,
-                 use_value_bias=True):
+                 use_value_bias=True,
+                 use_tangent_norm=False):
         super().__init__()
         assert num_heads % 2 == 0, "num_heads must be even for parallel split"
         assert embed_dim % num_heads == 0
@@ -1194,6 +1268,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             use_approx=use_approx,
             use_frechet=use_frechet,
             frechet_R_inv_sqrt=frechet_R_inv_sqrt,
+            use_tangent_norm=use_tangent_norm,
         )
 
         # Geometric value mixing: V' = V + β_h · (L @ V)
@@ -1204,7 +1279,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             self.value_beta = nn.Parameter(torch.zeros(self.heads_per_branch))
 
     def forward(self, x_norm, num_chan, residual=None, channel_idx=None,
-                mask=None):
+                mask=None, L_prev=None, residual_beta=None):
         """
         Args:
             x_norm: (B, L, D) normalized input (post-LayerNorm)
@@ -1212,6 +1287,15 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             residual: (B, L, D) raw residual stream (pre-LayerNorm)
             channel_idx: (C,) long tensor — global channel indices
             mask: (B, L) boolean — True = masked token (pretraining only)
+            L_prev: (B*N, C, C) accumulated tangent state from the previous layer,
+                    or None if residual stream is disabled / this is layer 0.
+            residual_beta: scalar learnable weight for this layer's geometric
+                    contribution to the accumulated stream. Provided by the
+                    enclosing transformer layer (one per layer).
+        Returns:
+            out: (B, L, D) attention output
+            L_current: (B*N, C, C) current tangent state — pass to next layer
+                    as L_prev if residual stream is enabled.
         """
         B, L, D = x_norm.shape
         assert L % num_chan == 0
@@ -1225,11 +1309,16 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         bias_source = residual if residual is not None else x_norm
         x_space = rearrange(bias_source, 'b (n c) d -> (b n) c d', c=C)
 
+        mask_space = None
         if mask is not None:
             mask_space = rearrange(mask, 'b (n c) -> (b n) c', c=C)
             x_space = x_space * (~mask_space).unsqueeze(-1).float()
 
-        riem_bias, L_n = self.riemannian_bias(x_space, channel_idx)
+        # Riemannian bias with optional residual-stream accumulation
+        riem_bias, L_n = self.riemannian_bias(
+            x_space, channel_idx, mask_space=mask_space,
+            L_prev=L_prev, beta=residual_beta,
+        )
 
         # ── Shared QKV ──
         qkv = self.qkv(x_norm).reshape(B, L, 3, H, d).permute(2, 0, 3, 1, 4)
@@ -1288,7 +1377,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         out = torch.cat([out_t, out_s], dim=1)
         out = rearrange(out, 'b h l d -> b l (h d)')
         out = self.fc(out)
-        return self.dropout(out)
+        return self.dropout(out), L_n
 
 
 class AdaptiveRiemannianParallelTransformer(nn.Module):
@@ -1320,8 +1409,25 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
                  norm=nn.LayerNorm, spd_eps=1e-5, log_mode='eigh', use_approx=False,
                  use_frechet=False, frechet_R_inv_sqrt=None,
                  use_temporal_cov=False,
-                 use_value_bias=True):
+                 use_value_bias=True,
+                 use_residual_stream=False,
+                 use_tangent_norm=None):
         super().__init__()
+
+        self.use_residual_stream = use_residual_stream
+        # Per-layer learnable scalar controlling this layer's contribution
+        # to the accumulated tangent-space stream. Initialized to 1.0 so that
+        # enabling residual_stream initially behaves similarly to
+        # the independent per-layer baseline; can decay toward 0 if later
+        # layers do not need fresh geometric updates.
+        if use_residual_stream:
+            self.residual_beta = nn.Parameter(torch.tensor(1.0))
+
+        # TangentLayerNorm auto-enables with residual stream unless explicitly
+        # overridden. When use_residual_stream=False, tangent norm has nothing
+        # to normalize (no accumulation), so defaulting to False is correct.
+        if use_tangent_norm is None:
+            use_tangent_norm = use_residual_stream
 
         self.attn = AdaptiveRiemannianParallelAttention(
             embed_dim=embed_dim,
@@ -1336,6 +1442,7 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
             frechet_R_inv_sqrt=frechet_R_inv_sqrt,
             use_temporal_cov=use_temporal_cov,
             use_value_bias=use_value_bias,
+            use_tangent_norm=use_tangent_norm,
         )
 
         self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
@@ -1347,20 +1454,31 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
         hidden_size = int(embed_dim * mlp_ratio)
         self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
 
-    def forward(self, x, num_chan, channel_idx=None, mask=None):
+    def forward(self, x, num_chan, channel_idx=None, mask=None, L_prev=None):
         """
         Args:
             x: (B, L, D) input tensor where L = N * num_chan
             num_chan: number of channels C in this batch
             channel_idx: (C,) long tensor — global channel indices
             mask: (B, L) boolean — True = masked token (pretraining only).
-                  Passed to attention for mask-aware covariance. None during
-                  downstream inference.
+            L_prev: (B*N, C, C) accumulated tangent state from the previous layer.
+                    None if residual stream is disabled or this is the first layer.
+        Returns:
+            x: (B, L, D) updated features
+            L_current: (B*N, C, C) current tangent state — thread into next layer
+                    as L_prev if residual stream is enabled.
         """
-        # Pass normalized input for QKV, raw residual for Riemannian bias
-        x = x + self.drop_path1(
-            self.attn(self.norm1(x), num_chan, residual=x,
-                      channel_idx=channel_idx, mask=mask)
+        # Pass normalized input for QKV, raw residual for Riemannian bias.
+        # Attention returns (output, L_current); we forward L_current to caller.
+        beta = self.residual_beta if self.use_residual_stream else None
+        # Only pass L_prev through if this layer participates in the stream
+        stream_prev = L_prev if self.use_residual_stream else None
+
+        attn_out, L_current = self.attn(
+            self.norm1(x), num_chan, residual=x,
+            channel_idx=channel_idx, mask=mask,
+            L_prev=stream_prev, residual_beta=beta,
         )
+        x = x + self.drop_path1(attn_out)
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
-        return x
+        return x, L_current

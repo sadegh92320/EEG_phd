@@ -71,15 +71,15 @@ class RiemannDownstreamHead(nn.Module):
 
 class CombinedRiemannDownstreamHead(nn.Module):
     """
-    Contribution 2: Combined Riemannian Classification Head.
+    Contribution 2: Tangent-Augmented Classification Head.
 
     Concatenates standard pooled encoder output with tangent-space features
-    extracted from the encoder's last-layer spatial covariance.
+    extracted from the encoder's last-layer spatial covariance via Padé log map.
 
     Pipeline:
         (B, N*C, D) → split into:
           Branch A: mean-pool → LayerNorm → (B, D)          [standard path]
-          Branch B: reshape (B,N,C,D) → mean over N → cov → log(Σ)
+          Branch B: reshape (B,N,C,D) → mean over N → cov → Padé log(Σ)
                     → upper triangle → LayerNorm → (B, tri)  [tangent path]
         Concatenate → Dropout → Linear → (B, num_classes)
 
@@ -92,6 +92,9 @@ class CombinedRiemannDownstreamHead(nn.Module):
       better because C1 biases spatial attention to maintain
       meaningful geometry through 8 layers.
 
+    Uses the SAME Padé [1,1] log map as C1's encoder, ensuring geometric
+    consistency between pretraining and downstream classification.
+
     The synergy with C1:
     - C1 biases spatial attention to follow manifold structure during
       pretraining → encoder covariance is geometrically meaningful
@@ -99,10 +102,26 @@ class CombinedRiemannDownstreamHead(nn.Module):
     - Without C1, Branch B is just raw-signal tangent features (modest)
     - With C1, Branch B uses pretrained manifold-aware features (better)
     """
-    def __init__(self, embed_dim, num_channels, num_classes, dropout=0.1, eps=1e-5):
+    def __init__(self, embed_dim, num_channels, num_classes, dropout=0.1, eps=1e-5,
+                 aggregation="cov_averaged", log_mode="linear"):
+        """
+        Args:
+            aggregation:
+                "time_averaged" — time-average features, then one covariance.
+                "cov_averaged" — per-timestep covariance, averaged in SPD, 1 log map.
+                "per_timestep" — per-timestep covariance, log-Euclidean mean (N logs).
+            log_mode:
+                "pade"   — Padé [1,1] approximant (accurate, requires linalg.solve).
+                "linear" — first-order Taylor log(S) ≈ S − I (no solve, fast).
+                           Recommended on MPS where linalg.solve has high overhead.
+        """
         super().__init__()
+        assert aggregation in {"time_averaged", "cov_averaged", "per_timestep"}
+        assert log_mode in {"pade", "linear"}
+        self.log_mode = log_mode
         self.num_channels = num_channels
         self.eps = eps
+        self.aggregation = aggregation
 
         # Upper triangle (including diagonal) of C×C symmetric matrix
         tri_size = num_channels * (num_channels + 1) // 2
@@ -117,6 +136,26 @@ class CombinedRiemannDownstreamHead(nn.Module):
         combined_dim = embed_dim + tri_size
         self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
         self.final = nn.Linear(combined_dim, num_classes)
+
+    @staticmethod
+    def _pade_log(S, eye):
+        """Padé [1,1] log map: log(S) ≈ 2(S - I)(S + I)^{-1}.
+        Same formula used in C1's AdaptiveRiemannianAttentionBias."""
+        A = S - eye
+        B = S + eye
+        L = 2.0 * torch.linalg.solve(B, A)
+        return (L + L.transpose(-2, -1)) * 0.5
+
+    @staticmethod
+    def _linear_log(S, eye):
+        """First-order Taylor: log(S) ≈ S − I. No solve, trivially cheap.
+        Good when S is close to I (ensured by LayerNorm-normalized encoder output
+        and the eps ridge). Recommended on devices where batched linalg.solve
+        has high per-call overhead (e.g., MPS)."""
+        return S - eye
+
+    def _log_map(self, S, eye):
+        return self._pade_log(S, eye) if self.log_mode == "pade" else self._linear_log(S, eye)
 
     def forward(self, x, num_channels):
         """
@@ -133,14 +172,37 @@ class CombinedRiemannDownstreamHead(nn.Module):
         pooled = self.norm_pool(x).mean(dim=1)  # (B, D)
 
         # ── Branch B: Tangent-space features from spatial covariance ──
-        x_spatial = rearrange(x, "b (n c) d -> b n c d", c=C)
-        x_spatial = x_spatial.mean(dim=1)  # (B, C, D) — time-averaged
-
+        x_spatial = rearrange(x, "b (n c) d -> b n c d", c=C)  # (B, N, C, D)
         eye = torch.eye(C, device=x.device, dtype=x.dtype).unsqueeze(0)
-        cov = x_spatial @ x_spatial.transpose(-1, -2) / D + self.eps * eye  # (B, C, C)
 
-        # Log map: log(Σ) ≈ Σ - I (first-order, stable)
-        log_cov = cov - eye
+        if self.aggregation == "time_averaged":
+            # Original: average features over time, then covariance
+            x_avg = x_spatial.mean(dim=1)  # (B, C, D)
+            cov = x_avg.float() @ x_avg.float().transpose(-1, -2) / D + self.eps * eye
+            log_cov = self._log_map(cov, eye).to(x.dtype)
+        elif self.aggregation == "cov_averaged":
+            # Per-timestep covariance averaged in SPD space, single log map.
+            # Key identity: mean_t(x_t @ x_t^T / D) = (1/(N*D)) * X_stack @ X_stack^T
+            # where X_stack is x reshaped to (B, C, N*D). Computable as a single
+            # GEMM with no (B, N, C, C) intermediate — same cost structure as
+            # time_averaged, just with N*D inner dimension instead of D.
+            N = x_spatial.size(1)
+            x_stack = x_spatial.transpose(1, 2).reshape(B, C, N * D).contiguous()
+            cov_mean = torch.bmm(x_stack, x_stack.transpose(-1, -2)) / (N * D)
+            cov_mean = cov_mean.float() + self.eps * eye
+            log_cov = self._pade_log(cov_mean, eye).to(x.dtype)
+        else:
+            # per_timestep: log-Euclidean mean (N log maps). Most principled,
+            # most expensive. Kept for ablation comparisons.
+            eye_n = eye.unsqueeze(0)
+            x_f = x_spatial.float()
+            cov_t = torch.einsum('bncd,bned->bnce', x_f, x_f) / D + self.eps * eye_n
+            BN = B * x_spatial.size(1)
+            cov_flat = cov_t.reshape(BN, C, C)
+            eye_flat = torch.eye(C, device=x.device, dtype=cov_flat.dtype).unsqueeze(0)
+            log_flat = self._log_map(cov_flat, eye_flat)
+            log_t = log_flat.reshape(B, x_spatial.size(1), C, C)
+            log_cov = log_t.mean(dim=1).to(x.dtype)
 
         # Vectorize upper triangle
         idx = torch.triu_indices(C, C, device=log_cov.device)
@@ -574,6 +636,10 @@ class DownstreamRiemannTransformerPara(Downstream):
         # Value bias config — store before super().__init__
         # so _build_encoder can use it
         self._value_bias_layers = kwargs.pop("value_bias_layers", 4)
+        # Riemannian residual stream config (C3)
+        self._use_residual_stream = kwargs.pop("use_residual_stream", True)
+        self._residual_stream_start = kwargs.pop("residual_stream_start", 1)
+        self._use_tangent_norm = kwargs.pop("use_tangent_norm", True)
         if aggregation == "class":
             raise ValueError(
                 "DownstreamRiemannTransformerPara does not use a [CLS] token. "
@@ -583,18 +649,32 @@ class DownstreamRiemannTransformerPara(Downstream):
 
     def _build_encoder(self, enc_dim, depth_e):
         value_bias_layers = getattr(self, '_value_bias_layers', 4)
+        use_residual_stream = getattr(self, '_use_residual_stream', True)
+        residual_stream_start = getattr(self, '_residual_stream_start', 1)
+        use_tangent_norm = getattr(self, '_use_tangent_norm', True)
         return nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
                 use_value_bias=(i < value_bias_layers),
+                use_residual_stream=(use_residual_stream and i >= residual_stream_start),
+                use_tangent_norm=(use_residual_stream and use_tangent_norm
+                                  and i >= residual_stream_start),
             ) for i in range(depth_e)
         ])
 
     def _run_encoder(self, x, C, channel_idx=None):
         """Adaptive Riemannian parallel transformer needs num_chan + channel_idx.
-        No mask during downstream (inference only)."""
+        No mask during downstream (inference only).
+
+        Threads the Riemannian residual stream L across layers. For layers
+        with use_residual_stream=True, L accumulates via tangent-space addition.
+        For layers with use_residual_stream=False, L is recomputed fresh
+        (standard C1 behavior) but still returned for interface consistency.
+        """
+        L_state = None
         for transformer in self.encoder:
-            x = transformer(x, num_chan=C, channel_idx=channel_idx)
+            x, L_state = transformer(x, num_chan=C, channel_idx=channel_idx,
+                                     L_prev=L_state)
         return x
 
     def forward(self, x, channel_list):

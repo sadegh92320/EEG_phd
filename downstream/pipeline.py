@@ -152,7 +152,8 @@ class Pipeline:
 
     def load_encoder(self, pretrain=True, log_mode='pade',
                      use_corr_masking=False, resume_ckpt=None, use_global_norm=False,
-                     clamp_channels=False, value_bias_layers=4):
+                     clamp_channels=False, value_bias_layers=4,
+                     use_residual_stream=True, residual_stream_start=1):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
@@ -160,12 +161,17 @@ class Pipeline:
             1. Riemannian spatial attention bias (Padé [1,1] log map)
                - Score bias: α_h · log(Σ) on attention logits (all layers)
                - Value bias: β_h · (L @ V) geometric value mixing (early layers)
+            3. Riemannian residual stream (cross-layer tangent-space state)
+               - L^(l+1) = L^(l) + β^(l) · log(Σ^(l)) accumulated across layers
+               - Each layer's attention bias uses accumulated L instead of
+                 recomputing independently, giving geometry depth-wise memory.
 
         Ablation table:
-            1. baseline (parallel attn, no Riemannian) → log_mode='baseline'
-            2. approx (S-I)                            → log_mode='approx', use_corr_masking=False
-            3. pade                                    → log_mode='pade',   use_corr_masking=False
-            4. pade + correlation masking               → log_mode='pade',   use_corr_masking=True
+            1. baseline (parallel attn, no Riemannian)    → log_mode='baseline'
+            2. approx (S-I)                               → log_mode='approx', use_corr_masking=False
+            3. pade                                       → log_mode='pade',   use_corr_masking=False
+            4. pade + correlation masking                 → log_mode='pade',   use_corr_masking=True
+            5. pade + residual stream                     → log_mode='pade',   use_residual_stream=True
 
         Args:
             pretrain:         if True, train from scratch; else load existing ckpt
@@ -181,6 +187,14 @@ class Pipeline:
             value_bias_layers: number of early layers that use geometric value
                               mixing V' = V + β·(L@V). Default 4 (layers 0–3).
                               Set to 0 to disable value bias entirely.
+            use_residual_stream: if True, enable the C3 Riemannian residual stream
+                              — per-layer learnable β^(l) accumulates tangent-space
+                              state across the encoder depth. Default True.
+            residual_stream_start: layer index at which the residual stream begins.
+                              Layer 0 has no prior state to accumulate from, so the
+                              default (1) starts accumulation at layer 1. Set to 0
+                              if you want layer 0 to also participate (it will just
+                              use its own fresh L_0 — no upstream state).
         """
         assert log_mode in ('pade', 'approx', 'baseline'), \
             f"log_mode must be 'pade', 'approx', or 'baseline', got '{log_mode}'"
@@ -199,6 +213,7 @@ class Pipeline:
                 model = ApproxAdaptiveRiemannBert(
                     use_corr_masking=use_corr_masking,
                     value_bias_layers=0,  # no value bias for clean baseline
+                    use_residual_stream=False,  # residual stream requires Riemannian bias
                 )
                 for layer in model.encoder:
                     layer.attn.riemannian_bias.head_scales.requires_grad = False
@@ -206,10 +221,13 @@ class Pipeline:
             else:
                 masking_str = "corr-masking" if use_corr_masking else "random-masking"
                 vb_str = f", value_bias_layers={value_bias_layers}"
-                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}{vb_str}")
+                rs_str = f", residual_stream={'on' if use_residual_stream else 'off'}"
+                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}{vb_str}{rs_str}")
                 model = ApproxAdaptiveRiemannBert(
                     use_corr_masking=use_corr_masking,
                     value_bias_layers=value_bias_layers,
+                    use_residual_stream=use_residual_stream,
+                    residual_stream_start=residual_stream_start,
                 )
                 # Override log_mode in every encoder layer if needed
                 if log_mode == 'approx':
@@ -226,6 +244,8 @@ class Pipeline:
                     run_name += "-corrmask"
                 if value_bias_layers > 0:
                     run_name += f"-vbias{value_bias_layers}"
+                if use_residual_stream:
+                    run_name += f"-rstream{residual_stream_start}"
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
@@ -254,6 +274,8 @@ class Pipeline:
                 "use_global_norm": use_global_norm,
                 "clamp_channels": clamp_channels,
                 "value_bias_layers": value_bias_layers,
+                "use_residual_stream": use_residual_stream,
+                "residual_stream_start": residual_stream_start,
             })
 
             callbacks = [TQDMProgressBar(refresh_rate=20), ckpt_callback]
