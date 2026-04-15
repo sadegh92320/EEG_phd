@@ -121,9 +121,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                  max_embedding=2000, enc_dim=512, depth_e=8,
                  mask_prob=0.5, patch_size=16, norm_pix_loss=False,
                  value_bias_layers=4,
-                 use_residual_stream=True,
-                 residual_stream_start=1,
-                 use_tangent_norm=True):
+                 learn_mu_reference=True):
         super().__init__()
 
         self.config = config
@@ -132,15 +130,12 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
 
         # Adaptive Riemannian parallel transformer layers
         # log_mode='pade' → Padé [1,1] approximant: log(S) ≈ 2(S-I)(I+S)^{-1}
-        # No num_channels needed — reference lives in global 144-channel space
-        # C3: Riemannian residual stream — accumulates tangent state across layers.
+        # C3: learnable tangent-space centering via per-layer μ^(l)
         self.encoder = nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
                 use_value_bias=(i < value_bias_layers),
-                use_residual_stream=(use_residual_stream and i >= residual_stream_start),
-                use_tangent_norm=(use_residual_stream and use_tangent_norm
-                                  and i >= residual_stream_start),
+                learn_mu_reference=learn_mu_reference,
             ) for i in range(depth_e)
         ])
 
@@ -312,10 +307,8 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         channel_idx = channel_list[0]  # (C,) global channel indices
 
         # Pass through adaptive Riemannian transformer layers (approximation mode)
-        # Thread the Riemannian residual stream (C3) across layers.
-        L_state = None
         for transformer in self.encoder:
-            x, L_state = transformer(x, C, channel_idx=channel_idx, L_prev=L_state)
+            x = transformer(x, C, channel_idx=channel_idx)
 
         x = self.norm_enc(x)
         x = self.fc(x)
@@ -382,10 +375,14 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             self.log(f"head_scale_mean/layer_{i}", scales.mean(), on_step=False, on_epoch=True)
             self.log(f"head_scale_std/layer_{i}", scales.std(), on_step=False, on_epoch=True)
 
-            # C3: Riemannian residual stream weight per layer
-            if hasattr(layer, 'residual_beta'):
-                rbeta = layer.residual_beta.detach()
-                self.log(f"residual_beta/layer_{i}", rbeta, on_step=False, on_epoch=True)
+            # C3: Learnable tangent-space reference μ^(l) — should grow toward
+            # the log-Euclidean Fréchet mean of layer-l's covariance distribution
+            mu = layer.attn.riemannian_bias.mu_log
+            if mu is not None:
+                self.log(f"mu_frobenius/layer_{i}", mu.detach().norm(),
+                         on_step=False, on_epoch=True)
+                self.log(f"mu_max_abs/layer_{i}", mu.detach().abs().max(),
+                         on_step=False, on_epoch=True)
 
         return loss
 

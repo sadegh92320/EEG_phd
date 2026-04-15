@@ -636,10 +636,8 @@ class DownstreamRiemannTransformerPara(Downstream):
         # Value bias config — store before super().__init__
         # so _build_encoder can use it
         self._value_bias_layers = kwargs.pop("value_bias_layers", 4)
-        # Riemannian residual stream config (C3)
-        self._use_residual_stream = kwargs.pop("use_residual_stream", True)
-        self._residual_stream_start = kwargs.pop("residual_stream_start", 1)
-        self._use_tangent_norm = kwargs.pop("use_tangent_norm", True)
+        # C3: learnable tangent-space centering (replaces prior residual-stream experiments)
+        self._learn_mu_reference = kwargs.pop("learn_mu_reference", True)
         if aggregation == "class":
             raise ValueError(
                 "DownstreamRiemannTransformerPara does not use a [CLS] token. "
@@ -649,32 +647,19 @@ class DownstreamRiemannTransformerPara(Downstream):
 
     def _build_encoder(self, enc_dim, depth_e):
         value_bias_layers = getattr(self, '_value_bias_layers', 4)
-        use_residual_stream = getattr(self, '_use_residual_stream', True)
-        residual_stream_start = getattr(self, '_residual_stream_start', 1)
-        use_tangent_norm = getattr(self, '_use_tangent_norm', True)
+        learn_mu_reference = getattr(self, '_learn_mu_reference', True)
         return nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
                 use_value_bias=(i < value_bias_layers),
-                use_residual_stream=(use_residual_stream and i >= residual_stream_start),
-                use_tangent_norm=(use_residual_stream and use_tangent_norm
-                                  and i >= residual_stream_start),
+                learn_mu_reference=learn_mu_reference,
             ) for i in range(depth_e)
         ])
 
     def _run_encoder(self, x, C, channel_idx=None):
-        """Adaptive Riemannian parallel transformer needs num_chan + channel_idx.
-        No mask during downstream (inference only).
-
-        Threads the Riemannian residual stream L across layers. For layers
-        with use_residual_stream=True, L accumulates via tangent-space addition.
-        For layers with use_residual_stream=False, L is recomputed fresh
-        (standard C1 behavior) but still returned for interface consistency.
-        """
-        L_state = None
+        """Adaptive Riemannian parallel transformer. No mask during downstream."""
         for transformer in self.encoder:
-            x, L_state = transformer(x, num_chan=C, channel_idx=channel_idx,
-                                     L_prev=L_state)
+            x = transformer(x, num_chan=C, channel_idx=channel_idx)
         return x
 
     def forward(self, x, channel_list):

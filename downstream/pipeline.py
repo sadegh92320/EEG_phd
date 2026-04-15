@@ -152,49 +152,46 @@ class Pipeline:
 
     def load_encoder(self, pretrain=True, log_mode='pade',
                      use_corr_masking=False, resume_ckpt=None, use_global_norm=False,
-                     clamp_channels=False, value_bias_layers=4,
-                     use_residual_stream=True, residual_stream_start=1):
+                     clamp_channels=False, value_bias_layers=0,
+                     learn_mu_reference=True):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
         Contributions:
-            1. Riemannian spatial attention bias (Padé [1,1] log map)
-               - Score bias: α_h · log(Σ) on attention logits (all layers)
-               - Value bias: β_h · (L @ V) geometric value mixing (early layers)
-            3. Riemannian residual stream (cross-layer tangent-space state)
-               - L^(l+1) = L^(l) + β^(l) · log(Σ^(l)) accumulated across layers
-               - Each layer's attention bias uses accumulated L instead of
-                 recomputing independently, giving geometry depth-wise memory.
+            C1. Riemannian spatial attention bias (Padé [1,1] log map at identity)
+                Score bias: α_h · log(Σ) added to attention logits.
+            C2. Channel-invariant adaptive log map — global 144-channel reference
+                allows a single pretrained encoder to operate on any channel
+                layout via submatrix indexing.
+            C3. Learnable tangent-space centering — per-layer μ^(l) subtracted
+                from log(Σ) before the bias is applied. Shifts the effective
+                log-Euclidean reference from identity toward the learned
+                Fréchet-mean-like center of the covariance distribution, which
+                the diagnostic (Appendix X) shows is systematically far from I.
 
         Ablation table:
             1. baseline (parallel attn, no Riemannian)    → log_mode='baseline'
-            2. approx (S-I)                               → log_mode='approx', use_corr_masking=False
-            3. pade                                       → log_mode='pade',   use_corr_masking=False
-            4. pade + correlation masking                 → log_mode='pade',   use_corr_masking=True
-            5. pade + residual stream                     → log_mode='pade',   use_residual_stream=True
+            2. approx (S-I)                               → log_mode='approx'
+            3. pade                                       → log_mode='pade'
+            4. pade + MAD normalization                   → + use_global_norm=True, clamp_channels=True
+            5. pade + MAD + mu centering (full C3)        → + learn_mu_reference=True
+            6. (negative) pade + MAD + Fréchet reference  → documented failure
 
         Args:
-            pretrain:         if True, train from scratch; else load existing ckpt
-            log_mode:         'pade', 'approx', or 'baseline'
-            use_corr_masking: if True, use correlation-aware channel masking;
-                              if False, use standard random BERT masking
-            resume_ckpt:      path to checkpoint to resume from (None = from scratch)
-            use_global_norm:  if True, use global normalization (preserves channel
-                              variance ratios); if False, use z-standardization
-            clamp_channels:   if True, clamp channels with variance > 10× median
-                              (only applies when use_global_norm=True). Use if
-                              training is unstable due to noisy electrodes.
-            value_bias_layers: number of early layers that use geometric value
-                              mixing V' = V + β·(L@V). Default 4 (layers 0–3).
-                              Set to 0 to disable value bias entirely.
-            use_residual_stream: if True, enable the C3 Riemannian residual stream
-                              — per-layer learnable β^(l) accumulates tangent-space
-                              state across the encoder depth. Default True.
-            residual_stream_start: layer index at which the residual stream begins.
-                              Layer 0 has no prior state to accumulate from, so the
-                              default (1) starts accumulation at layer 1. Set to 0
-                              if you want layer 0 to also participate (it will just
-                              use its own fresh L_0 — no upstream state).
+            pretrain:           if True, train from scratch; else load existing ckpt
+            log_mode:           'pade', 'approx', or 'baseline'
+            use_corr_masking:   correlation-aware vs random BERT masking
+            resume_ckpt:        checkpoint to resume from (None = from scratch)
+            use_global_norm:    True → MAD-based global normalization
+            clamp_channels:     True → clamp channels with variance > 10× median
+            value_bias_layers:  number of early layers using β·(L@V) value mixing.
+                                Default 0 (disabled — earlier experiments showed
+                                no benefit, see Appendix X).
+            learn_mu_reference: if True, enable C3 learnable tangent-space centering.
+                                Adds one (144,144) symmetric matrix per layer,
+                                subtracted from log(Σ) in the attention bias.
+                                Default True (recommended; negligible compute cost,
+                                motivated by SPREAD-regime covariance diagnostic).
         """
         assert log_mode in ('pade', 'approx', 'baseline'), \
             f"log_mode must be 'pade', 'approx', or 'baseline', got '{log_mode}'"
@@ -212,8 +209,8 @@ class Pipeline:
                 print("[Ablation] Parallel attention with Riemannian bias disabled")
                 model = ApproxAdaptiveRiemannBert(
                     use_corr_masking=use_corr_masking,
-                    value_bias_layers=0,  # no value bias for clean baseline
-                    use_residual_stream=False,  # residual stream requires Riemannian bias
+                    value_bias_layers=0,         # no value bias for clean baseline
+                    learn_mu_reference=False,    # no centering either for clean baseline
                 )
                 for layer in model.encoder:
                     layer.attn.riemannian_bias.head_scales.requires_grad = False
@@ -221,13 +218,12 @@ class Pipeline:
             else:
                 masking_str = "corr-masking" if use_corr_masking else "random-masking"
                 vb_str = f", value_bias_layers={value_bias_layers}"
-                rs_str = f", residual_stream={'on' if use_residual_stream else 'off'}"
-                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}{vb_str}{rs_str}")
+                mu_str = f", mu={'on' if learn_mu_reference else 'off'}"
+                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}{vb_str}{mu_str}")
                 model = ApproxAdaptiveRiemannBert(
                     use_corr_masking=use_corr_masking,
                     value_bias_layers=value_bias_layers,
-                    use_residual_stream=use_residual_stream,
-                    residual_stream_start=residual_stream_start,
+                    learn_mu_reference=learn_mu_reference,
                 )
                 # Override log_mode in every encoder layer if needed
                 if log_mode == 'approx':
@@ -244,8 +240,8 @@ class Pipeline:
                     run_name += "-corrmask"
                 if value_bias_layers > 0:
                     run_name += f"-vbias{value_bias_layers}"
-                if use_residual_stream:
-                    run_name += f"-rstream{residual_stream_start}"
+                if learn_mu_reference:
+                    run_name += "-mu"
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
@@ -274,8 +270,7 @@ class Pipeline:
                 "use_global_norm": use_global_norm,
                 "clamp_channels": clamp_channels,
                 "value_bias_layers": value_bias_layers,
-                "use_residual_stream": use_residual_stream,
-                "residual_stream_start": residual_stream_start,
+                "learn_mu_reference": learn_mu_reference,
             })
 
             callbacks = [TQDMProgressBar(refresh_rate=20), ckpt_callback]

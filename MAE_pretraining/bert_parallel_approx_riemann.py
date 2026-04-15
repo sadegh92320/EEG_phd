@@ -129,9 +129,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                  mask_prob=0.5, patch_size=16, norm_pix_loss=False,
                  use_corr_masking=True,
                  value_bias_layers=4,
-                 use_residual_stream=True,
-                 residual_stream_start=1,
-                 use_tangent_norm=True):
+                 learn_mu_reference=True):
         super().__init__()
 
         self.config = config
@@ -141,21 +139,16 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
 
         # Adaptive Riemannian parallel transformer layers
         # log_mode='pade' → Padé [1,1] approximant: log(S) ≈ 2(S-I)(I+S)^{-1}
-        # Contribution 1: Riemannian spatial attention bias
-        #   - Score bias: α_h · log(Σ) added to attention logits (all layers)
-        #   - Value bias: β_h · (L @ V) geometric value mixing (early layers only)
-        # Contribution 3: Riemannian residual stream (cross-layer geometric state)
-        #   - L^{l+1} = L^l + β^l · log(Σ^l); accumulated tangent-space state
-        #     modulates spatial attention at every layer, giving the geometric
-        #     bias "memory" across depth rather than recomputing independently.
-        #   - Disabled at layer 0 (no prior state to accumulate) via residual_stream_start.
+        # C1: Riemannian spatial attention bias (score bias α_h · log(Σ))
+        # C3: Learnable tangent-space centering — per-layer μ subtracted from
+        #     log(Σ) before the bias is applied. Shifts the effective
+        #     log-Euclidean reference away from identity toward the learned
+        #     Fréchet-mean-like center of the covariance distribution.
         self.encoder = nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
                 use_value_bias=(i < value_bias_layers),
-                use_residual_stream=(use_residual_stream and i >= residual_stream_start),
-                use_tangent_norm=(use_residual_stream and use_tangent_norm
-                                  and i >= residual_stream_start),
+                learn_mu_reference=learn_mu_reference,
             ) for i in range(depth_e)
         ])
 
@@ -350,22 +343,10 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         channel_idx = channel_list[0]  # (C,) global channel indices
 
         # Pass through adaptive Riemannian transformer layers.
-        # mask is passed so that masked channels are zeroed before covariance
-        # computation (prevents mask token contaminating geometry).
-        # L_state carries the Riemannian residual stream across layers when
-        # use_residual_stream=True; otherwise each layer ignores it.
-        L_state = None
-        # Track per-layer |L| magnitude for drift diagnostics (C3 only)
-        self._last_L_frobenius = []
+        # mask is passed so masked channels are zeroed before covariance
+        # computation (prevents mask token from contaminating the geometry).
         for transformer in self.encoder:
-            x, L_state = transformer(x, C, channel_idx=channel_idx, mask=mask,
-                                     L_prev=L_state)
-            if transformer.use_residual_stream and L_state is not None:
-                # Store mean Frobenius norm of L per layer, for later logging
-                # in training_step. Detached — we don't want gradients through it.
-                self._last_L_frobenius.append(
-                    L_state.detach().pow(2).sum(dim=(-2, -1)).sqrt().mean().item()
-                )
+            x = transformer(x, C, channel_idx=channel_idx, mask=mask)
 
         x = self.norm_enc(x)
         x = self.fc(x)
@@ -458,30 +439,17 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 self.log(f"value_beta_mean/layer_{i}", vbeta.mean(), on_step=False, on_epoch=True)
                 self.log(f"value_beta_max/layer_{i}", vbeta.abs().max(), on_step=False, on_epoch=True)
 
-            # Residual-stream weight β^(l) (Contribution 3: cross-layer geometric state)
-            # Interpretable: small β → this layer inherits previous geometric state,
-            # large β → this layer contributes fresh geometry. Watch for magnitude drift:
-            # if β stays ≥ 1 across all layers, accumulated L can grow unboundedly and
-            # saturate the softmax. Model should learn to decay β in deep layers.
-            if hasattr(layer, 'residual_beta'):
-                rbeta = layer.residual_beta.detach()
-                self.log(f"residual_beta/layer_{i}", rbeta, on_step=False, on_epoch=True)
-
-            # TangentLayerNorm γ, δ — if tangent norm is active we can see the
-            # learned affine scale/shift applied to the accumulated state.
-            tn = layer.attn.riemannian_bias.tangent_norm
-            if tn is not None:
-                self.log(f"tangent_norm_gamma/layer_{i}", tn.gamma.detach(),
+            # C3: Learnable tangent-space reference μ^(l).
+            # Should converge toward the log-Euclidean Fréchet mean of the
+            # covariance distribution — the diagnostic showed ‖mean log S‖_F
+            # ranging ~9–28 across layers; μ should grow toward similar magnitudes
+            # during training, shifting the effective reference away from identity.
+            mu = layer.attn.riemannian_bias.mu_log
+            if mu is not None:
+                self.log(f"mu_frobenius/layer_{i}", mu.detach().norm(),
                          on_step=False, on_epoch=True)
-                self.log(f"tangent_norm_delta/layer_{i}", tn.delta.detach(),
+                self.log(f"mu_max_abs/layer_{i}", mu.detach().abs().max(),
                          on_step=False, on_epoch=True)
-
-        # |L|_F per layer — direct diagnostic of drift across depth.
-        # If TangentLayerNorm works, these should be roughly constant across layers;
-        # if it's off or failing, expect monotonic growth with depth.
-        for i, frob in enumerate(getattr(self, '_last_L_frobenius', [])):
-            self.log(f"L_frobenius/layer_{i+1}", frob,
-                     on_step=False, on_epoch=True)
 
         return loss
 
