@@ -461,9 +461,10 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 # SPD distance weight β — should grow from 0 if geometry helps
                 self.log(f"luna_spd_beta/layer_{i}", luna.spd_beta.detach(),
                          on_step=False, on_epoch=True)
-                # Prototype norms — track whether prototypes are specializing
-                mu_p = luna.mu_prototypes.detach()
-                proto_norms = mu_p.reshape(luna.num_slots, -1).norm(dim=-1)
+                # Prototype factor norms — track whether prototypes are specializing
+                # mu_proto_factors: (l, C_total, r) — compute ‖U_q‖_F per slot
+                U = luna.mu_proto_factors.detach()
+                proto_norms = U.reshape(luna.num_slots, -1).norm(dim=-1)
                 self.log(f"luna_proto_norm_mean/layer_{i}", proto_norms.mean(),
                          on_step=False, on_epoch=True)
                 self.log(f"luna_proto_norm_std/layer_{i}", proto_norms.std(),
