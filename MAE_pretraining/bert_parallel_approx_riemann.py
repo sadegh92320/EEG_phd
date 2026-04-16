@@ -126,7 +126,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
     """
     def __init__(self, config=None, num_channels=64,
                  max_embedding=2000, enc_dim=512, depth_e=8,
-                 mask_prob=0.5, patch_size=16, norm_pix_loss=False,
+                 mask_prob=0.5, patch_size=8, norm_pix_loss=False,
                  use_corr_masking=True,
                  value_bias_layers=4,
                  learn_mu_reference=True,
@@ -381,6 +381,14 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         x = x.view(B, C, N, patch_size)
         x = x.permute(0, 2, 1, 3).contiguous()
         return x, pad
+
+    def configure_gradient_clipping(self, optimizer, gradient_clip_val=None,
+                                      gradient_clip_algorithm=None):
+        """Clip gradients to prevent residual stream blow-up.
+        Without this, x @ x^T in the covariance computation can overflow
+        float32 → NaN in the Padé log-map → training crash."""
+        self.clip_gradients(optimizer, gradient_clip_val=1.0,
+                           gradient_clip_algorithm='norm')
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, weight_decay=0.05)

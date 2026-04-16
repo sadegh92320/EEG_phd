@@ -1426,19 +1426,20 @@ class RiemannianLunaTemporalCompression(nn.Module):
 
         # ── Process: self-attention among packed slots (projection-free) ──
         # packed is already (BC, H, l, d) — use directly as Q, K, V
-        # Uses FlashAttention kernel for speed (no custom bias needed here)
-        processed = F.scaled_dot_product_attention(
-            packed, packed, packed,
-            dropout_p=self.att_dropout if self.training else 0.0
-        )  # (BC, H, l, d)
+        # Manual attention is faster than F.scaled_dot_product_attention here
+        # because l=16 is too small for FlashAttention's kernel launch overhead.
+        self_score = (packed @ packed.transpose(-2, -1)) * self.scale
+        self_attn = self_score.softmax(dim=-1)
+        self_attn = F.dropout(self_attn, p=self.att_dropout, training=self.training)
+        processed = self_attn @ packed  # (BC, H, l, d)
 
         # ── Unpack: input tokens attend to processed slots ──
         # Q = original q_t, K/V = processed slots (no extra projections)
-        # Uses FlashAttention kernel for speed (no custom bias needed here)
-        out = F.scaled_dot_product_attention(
-            q_t, processed, processed,
-            dropout_p=self.att_dropout if self.training else 0.0
-        )  # (BC, H, N, d)
+        # Manual attention: N×l is small enough that kernel overhead dominates.
+        unpack_score = (q_t @ processed.transpose(-2, -1)) * self.scale  # (BC, H, N, l)
+        unpack_attn = unpack_score.softmax(dim=-1)
+        unpack_attn = F.dropout(unpack_attn, p=self.att_dropout, training=self.training)
+        out = unpack_attn @ processed  # (BC, H, N, d)
 
         return out
 

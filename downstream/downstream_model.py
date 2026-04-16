@@ -356,7 +356,7 @@ class Downstream(nn.Module):
     """
     def __init__(self, checkpoint_path, config=None,
                  max_embedding=2000, enc_dim=512, depth_e=8,
-                 patch_size=16, aggregation="avg", num_classes=9, head_dropout=0.1, head_choice = 'linear'):
+                 patch_size=8, aggregation="avg", num_classes=9, head_dropout=0.1, head_choice = 'linear'):
         super().__init__()
 
         self.config = config
@@ -546,7 +546,7 @@ class DownstreamGNN(Downstream):
     """
     def __init__(self, checkpoint_path, config=None,
                  max_embedding=2000, enc_dim=512, depth_e=8,
-                 patch_size=16, aggregation="avg", num_classes=9, head_dropout=0.1):
+                 patch_size=8, aggregation="avg", num_classes=9, head_dropout=0.1):
         # Build the base (delay checkpoint loading — we need to set up GNN first)
         super().__init__(
             checkpoint_path=None, config=config, max_embedding=max_embedding,

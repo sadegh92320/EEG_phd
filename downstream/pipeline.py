@@ -278,7 +278,7 @@ class Pipeline:
                 "depth_e": 8,
                 "depth_d": 4,
                 "mask_prob": 0.7,
-                "patch_size": 16,
+                "patch_size": 8,
                 "log_mode": log_mode,
                 "use_corr_masking": use_corr_masking,
                 "use_global_norm": use_global_norm,
@@ -341,7 +341,7 @@ class Pipeline:
             checkpoint_path=self.checkpoint_path,
             enc_dim=512,       # must match EncoderDecoder default
             depth_e=8,         # must match EncoderDecoder default
-            patch_size=16,     # must match EncoderDecoder default
+            patch_size=8,      # must match EncoderDecoder default
             num_classes=self.config["num_classes"],
         )
         
@@ -360,7 +360,7 @@ class Pipeline:
                 checkpoint_path=self.checkpoint_path,
                 enc_dim=512,       # must match EncoderDecoder default
                 depth_e=8,
-                patch_size=16,
+                patch_size=8,
                 num_classes=self.config["num_classes"],
             )
     
