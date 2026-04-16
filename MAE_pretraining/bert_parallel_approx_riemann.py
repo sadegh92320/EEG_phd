@@ -131,7 +131,8 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                  value_bias_layers=4,
                  learn_mu_reference=True,
                  use_luna_temporal=False, luna_num_slots=16,
-                 luna_start_layer=2, luna_spd_beta_init=0.0):
+                 luna_start_layer=2, luna_spd_beta_init=0.0,
+                 use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0):
         super().__init__()
 
         self.config = config
@@ -139,6 +140,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         self.num_channels = num_channels
         self.use_corr_masking = use_corr_masking
         self.use_luna_temporal = use_luna_temporal
+        self.use_rope = use_rope
 
         # Adaptive Riemannian parallel transformer layers
         # log_mode='pade' → Padé [1,1] approximant: log(S) ≈ 2(S-I)(I+S)^{-1}
@@ -153,6 +155,9 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 use_luna_temporal=(use_luna_temporal and i >= luna_start_layer),
                 luna_num_slots=luna_num_slots,
                 luna_spd_beta_init=luna_spd_beta_init,
+                use_rope=use_rope,
+                rope_freq_min=rope_freq_min,
+                rope_freq_max=rope_freq_max,
             ) for i in range(depth_e)
         ])
 
@@ -332,10 +337,13 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         x += chan_embedding
 
         # Temporal embeddings
-        seq_idx = torch.arange(0, N, device=device, dtype=torch.long)
-        eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
-        tp = self.temporal_embedding_e(eeg_seq_indices)
-        x += tp
+        # When RoPE is enabled, skip additive temporal PE — position is injected
+        # via rotation inside the temporal attention (no magnitude imbalance).
+        if not self.use_rope:
+            seq_idx = torch.arange(0, N, device=device, dtype=torch.long)
+            eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
+            tp = self.temporal_embedding_e(eeg_seq_indices)
+            x += tp
 
         # ── Masking ──
         if self.use_corr_masking:
@@ -476,6 +484,21 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 self.log(f"luna_proto_norm_mean/layer_{i}", proto_norms.mean(),
                          on_step=False, on_epoch=True)
                 self.log(f"luna_proto_norm_std/layer_{i}", proto_norms.std(),
+                         on_step=False, on_epoch=True)
+
+            # ── RoPE frequency logging ──
+            if hasattr(attn, 'temporal_rope'):
+                rope = attn.temporal_rope
+                # Convert to Hz for interpretability (dt ≈ patch_size/128)
+                dt = self.patch_size / 128.0
+                freqs_hz = rope.omega.detach() / (2.0 * 3.14159 * dt)
+                self.log(f"rope_freq_mean_hz/layer_{i}", freqs_hz.mean(),
+                         on_step=False, on_epoch=True)
+                self.log(f"rope_freq_min_hz/layer_{i}", freqs_hz.min(),
+                         on_step=False, on_epoch=True)
+                self.log(f"rope_freq_max_hz/layer_{i}", freqs_hz.max(),
+                         on_step=False, on_epoch=True)
+                self.log(f"rope_freq_std_hz/layer_{i}", freqs_hz.std(),
                          on_step=False, on_epoch=True)
 
         return loss
