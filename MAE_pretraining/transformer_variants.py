@@ -1267,8 +1267,12 @@ class RiemannianLunaTemporalCompression(nn.Module):
         # K and V come directly from the shared QKV's k_t and v_t
         self.pack_q = nn.Linear(half_dim, half_dim, bias=False)
 
-        # ── Self-attention among packed slots (single QKV projection) ──
-        self.self_qkv = nn.Linear(half_dim, 3 * half_dim, bias=False)
+        # ── Self-attention among packed slots: projection-free ──
+        # The packed tokens already carry rich representations from the pack
+        # cross-attention. Using them directly as Q/K/V for self-attention
+        # saves ~1.2M params across 6 layers with negligible expressivity loss
+        # (the 16 slots are low-dimensional enough that additional projections
+        # add more parameters than information).
 
         # ── Unpack: no extra projections needed ──
         # Q = original q_t, K/V = processed slots (already transformed by self-attn)
@@ -1293,22 +1297,23 @@ class RiemannianLunaTemporalCompression(nn.Module):
         # (l, C_total, r) @ (l, r, C_total) → (l, C_total, C_total)
         return self.mu_proto_factors @ self.mu_proto_factors.transpose(-2, -1)
 
-    def _compute_spd_distances(self, L_per_token, channel_idx):
+    def _compute_spd_distances(self, L_per_sample, channel_idx):
         """
         Compute Frobenius distance between each token's tangent vector L_t
         and each slot's low-rank prototype μ_q = U_q U_q^T.
 
-        Uses ‖L - UU^T‖²_F = ‖L‖²_F + ‖UU^T‖²_F - 2·tr(L·UU^T)
-        and computes all terms without ever forming the full μ_q matrix.
+        Operates at SAMPLE level (B, N), not (B*C, N) — all channels at the
+        same timestep share the same covariance, so distances are identical
+        across channels. The caller broadcasts to B*C after this.
 
         Args:
-            L_per_token: (B*C, N, C_ch, C_ch) log-map output per temporal token.
+            L_per_sample: (B, N, C_ch, C_ch) log-map output per temporal token.
             channel_idx: (C_ch,) global channel indices
 
         Returns:
-            distances: (B*C, num_slots, N) — ‖L_t − μ_q‖_F for each slot-token pair
+            distances: (B, num_slots, N) — ‖L_t − μ_q‖_F for each slot-token pair
         """
-        BC, N, C_ch, _ = L_per_token.shape
+        BC, N, C_ch, _ = L_per_sample.shape  # BC is actually B here (sample-level)
         l = self.num_slots
         r = self.proto_rank
 
@@ -1317,7 +1322,7 @@ class RiemannianLunaTemporalCompression(nn.Module):
         U_sub = self.mu_proto_factors[:, channel_idx]  # (l, C_ch, r)
 
         # ‖L_t‖²_F: (BC, N)
-        L_flat = L_per_token.reshape(BC, N, -1)  # (BC, N, C_ch²)
+        L_flat = L_per_sample.reshape(BC, N, -1)  # (B, N, C_ch²)
         L_sqnorm = (L_flat * L_flat).sum(dim=-1)  # (BC, N)
 
         # ‖μ_q‖²_F = ‖U U^T‖²_F = tr((UU^T)(UU^T)) = ‖U^T U‖²_F
@@ -1392,16 +1397,22 @@ class RiemannianLunaTemporalCompression(nn.Module):
         if L_n is not None and channel_idx is not None and C is not None:
             B = BC // C
             # L_n is (B*N, C_ch, C_ch) — one covariance per (batch, timestep).
-            # All C channels at timestep n share the same covariance.
-            # Reshape to (B, N, C_ch, C_ch) then expand to (B*C, N, C_ch, C_ch)
-            L_reshaped = L_n.reshape(B, N, *L_n.shape[1:])  # (B, N, C_ch, C_ch)
-            # expand + reshape is memory-free (view only)
-            L_per_token = L_reshaped.unsqueeze(1).expand(-1, C, -1, -1, -1)
-            L_per_token = L_per_token.reshape(BC, N, *L_n.shape[1:])
+            # All C channels at timestep n share the SAME covariance, so we
+            # compute distances at (B, N) level and broadcast to (B*C) — saves
+            # a factor of C in both compute and memory.
+            L_per_sample = L_n.reshape(B, N, *L_n.shape[1:])  # (B, N, C_ch, C_ch)
 
-            # SPD distances: (BC, l, N)
-            spd_dist = self._compute_spd_distances(L_per_token, channel_idx)
+            # SPD distances at sample level: (B, l, N)
+            spd_dist_b = self._compute_spd_distances(L_per_sample, channel_idx)
+
+            # Broadcast to all channels: (B, l, N) → (B*C, l, N)
+            # Use repeat_interleave so each sample's distances are repeated C
+            # times contiguously (matching the (b c) layout of BC dimension).
+            # This allocates only (B*C, l, N) — no intermediate 4D tensor.
+            spd_dist = spd_dist_b.repeat_interleave(C, dim=0)  # (B*C, l, N)
+
             # Subtract β · distance (higher distance → lower score)
+            # pack_score is (BC, H, l, N), spd_dist is (BC, l, N) → unsqueeze for heads
             pack_score = pack_score - self.spd_beta * spd_dist.unsqueeze(1)
 
         pack_attn = pack_score.softmax(dim=-1)
@@ -1410,16 +1421,12 @@ class RiemannianLunaTemporalCompression(nn.Module):
         # Packed representation: (BC, H, l, d)
         packed = pack_attn @ v_t
 
-        # ── Process: self-attention among packed slots ──
-        packed_flat = rearrange(packed, 'bc h l d -> bc l (h d)')
-        sqkv = self.self_qkv(packed_flat)  # (BC, l, 3*H*d)
-        sqkv = rearrange(sqkv, 'bc l (three h d) -> three bc h l d', three=3, h=H)
-        sq, sk, sv = sqkv[0], sqkv[1], sqkv[2]
-
-        self_score = (sq @ sk.transpose(-2, -1)) * self.scale
+        # ── Process: self-attention among packed slots (projection-free) ──
+        # packed is already (BC, H, l, d) — use directly as Q, K, V
+        self_score = (packed @ packed.transpose(-2, -1)) * self.scale
         self_attn = self_score.softmax(dim=-1)
         self_attn = F.dropout(self_attn, p=self.att_dropout, training=self.training)
-        processed = self_attn @ sv  # (BC, H, l, d)
+        processed = self_attn @ packed  # (BC, H, l, d)
 
         # ── Unpack: input tokens attend to processed slots ──
         # Q = original q_t, K/V = processed slots (no extra projections)
