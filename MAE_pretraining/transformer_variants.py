@@ -1,7 +1,136 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# EEG-adapted Rotary Position Embedding (RoPE)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Standard RoPE rotates Q/K dimension pairs by position-dependent angles,
+# encoding relative position without modifying token magnitude.
+#
+# EEG adaptation: learnable rotation frequencies initialized over the
+# physiologically relevant range [0.5, 50] Hz (delta → gamma).
+# Per-layer so each layer can learn its own temporal frequency preference.
+# ═════════════════════════════════════════════════════════════════════════════
+
+class EEGRoPE(nn.Module):
+    """
+    Learnable Rotary Position Embedding for EEG temporal attention.
+
+    Each dimension pair (2i, 2i+1) in Q/K is rotated by angle = n × ω_i,
+    where n is the token index and ω_i is a learnable rotation speed.
+
+    Frequencies are initialized log-uniformly over [freq_min, freq_max] Hz,
+    covering the physiologically relevant EEG frequency bands.
+
+    Args:
+        dim:       dimension of Q/K per head (must be even)
+        freq_min:  minimum initialization frequency in Hz (default: 0.5 = delta)
+        freq_max:  maximum initialization frequency in Hz (default: 50.0 = low gamma)
+    """
+    def __init__(self, dim, freq_min=0.5, freq_max=50.0):
+        super().__init__()
+        assert dim % 2 == 0, f"RoPE dim must be even, got {dim}"
+        n_pairs = dim // 2
+
+        # Initialize ω as radians per token step, log-uniform over EEG range.
+        # We store raw ω (radians/step) as the learnable parameter.
+        # At 128Hz, patch_size=16: one step = 0.125s, so ω = 2π·f·dt.
+        # But since dt is constant and ω is learnable, we just initialize
+        # to span a reasonable range and let the model adjust.
+        #
+        # Convert [freq_min, freq_max] Hz to radians/step assuming dt ≈ 0.125s
+        # (128Hz, patch_size=16). This is just for initialization — the model
+        # learns the actual values.
+        dt_approx = 16.0 / 128.0  # 0.125 seconds per token step
+        omega_min = 2.0 * math.pi * freq_min * dt_approx  # ~0.39 rad/step
+        omega_max = 2.0 * math.pi * freq_max * dt_approx   # ~39.3 rad/step
+
+        # Log-uniform initialization
+        log_omega = torch.linspace(
+            math.log(omega_min), math.log(omega_max), n_pairs
+        )
+        omega_init = torch.exp(log_omega)
+
+        self.omega = nn.Parameter(omega_init)  # (n_pairs,)
+
+    def forward(self, q, k):
+        """
+        Apply rotary embedding to temporal Q and K.
+
+        Args:
+            q: (B*C, H, N, d) temporal queries
+            k: (B*C, H, N, d) temporal keys
+
+        Returns:
+            q_rot, k_rot: rotated Q and K, same shape
+        """
+        N = q.shape[2]
+        device = q.device
+
+        # Token indices: 0, 1, ..., N-1
+        t = torch.arange(N, device=device, dtype=torch.float32)  # (N,)
+
+        # Rotation angles: (N, n_pairs)
+        angles = t.unsqueeze(-1) * self.omega.unsqueeze(0)  # (N, d//2)
+
+        cos_a = angles.cos()  # (N, d//2)
+        sin_a = angles.sin()  # (N, d//2)
+
+        # Reshape for broadcast: (1, 1, N, d//2)
+        cos_a = cos_a.unsqueeze(0).unsqueeze(0)
+        sin_a = sin_a.unsqueeze(0).unsqueeze(0)
+
+        q_rot = self._apply_rotary(q, cos_a, sin_a)
+        k_rot = self._apply_rotary(k, cos_a, sin_a)
+
+        return q_rot, k_rot
+
+    @staticmethod
+    def _apply_rotary(x, cos_a, sin_a):
+        """
+        Apply 2D rotation to consecutive dimension pairs.
+
+        x:     (B, H, N, d)
+        cos_a: (1, 1, N, d//2)
+        sin_a: (1, 1, N, d//2)
+
+        For each pair (x[..., 2i], x[..., 2i+1]):
+            x_rot[..., 2i]   = x[..., 2i] * cos - x[..., 2i+1] * sin
+            x_rot[..., 2i+1] = x[..., 2i] * sin + x[..., 2i+1] * cos
+        """
+        # Split into even/odd dimensions
+        x_even = x[..., 0::2]  # (B, H, N, d//2)
+        x_odd  = x[..., 1::2]  # (B, H, N, d//2)
+
+        # Cast cos/sin to match x dtype (fp16/fp32)
+        cos_a = cos_a.to(x.dtype)
+        sin_a = sin_a.to(x.dtype)
+
+        # Rotate
+        out_even = x_even * cos_a - x_odd * sin_a
+        out_odd  = x_even * sin_a + x_odd * cos_a
+
+        # Interleave back: stack on last dim then reshape
+        # (B, H, N, d//2, 2) → (B, H, N, d)
+        out = torch.stack([out_even, out_odd], dim=-1)
+        return out.reshape(x.shape)
+
+    def get_frequencies_hz(self, dt=0.125):
+        """
+        Convert learned ω to Hz for interpretability.
+
+        Args:
+            dt: seconds per token step (patch_size / sample_rate)
+
+        Returns:
+            freqs_hz: (n_pairs,) tensor of learned frequencies in Hz
+        """
+        return self.omega.detach() / (2.0 * math.pi * dt)
 
 
 # ─── fp32-safe eigendecomposition ────────────────────────────────────────────
@@ -1461,7 +1590,8 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
                  use_value_bias=True,
                  learn_mu_reference=True,
                  use_luna_temporal=False, luna_num_slots=16,
-                 luna_spd_beta_init=0.0):
+                 luna_spd_beta_init=0.0,
+                 use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0):
         super().__init__()
         assert num_heads % 2 == 0, "num_heads must be even for parallel split"
         assert embed_dim % num_heads == 0
@@ -1473,6 +1603,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.half_dim = self.heads_per_branch * self.dim_head
         self.use_value_bias = use_value_bias
         self.use_luna_temporal = use_luna_temporal
+        self.use_rope = use_rope
 
         # Shared QKV projection
         self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
@@ -1480,6 +1611,14 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.fc = nn.Linear(embed_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
         self.att_dropout = att_dropout
+
+        # EEG-adapted RoPE for temporal heads (per-layer learnable frequencies)
+        if use_rope:
+            self.temporal_rope = EEGRoPE(
+                dim=self.dim_head,
+                freq_min=rope_freq_min,
+                freq_max=rope_freq_max,
+            )
 
         # Adaptive Riemannian bias for spatial heads
         self.riemannian_bias = AdaptiveRiemannianAttentionBias(
@@ -1557,6 +1696,11 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=C)
         k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=C)
         v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=C)
+
+        # EEG-RoPE: inject relative temporal position via rotation
+        # Applied BEFORE attention (standard or Luna) so both paths benefit.
+        if self.use_rope:
+            q_t, k_t = self.temporal_rope(q_t, k_t)
 
         if self.use_luna_temporal:
             # C2: Luna pack-process-unpack with SPD-biased packing
@@ -1646,7 +1790,8 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
                  use_value_bias=True,
                  learn_mu_reference=True,
                  use_luna_temporal=False, luna_num_slots=16,
-                 luna_spd_beta_init=0.0):
+                 luna_spd_beta_init=0.0,
+                 use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0):
         super().__init__()
 
         self.attn = AdaptiveRiemannianParallelAttention(
@@ -1666,6 +1811,9 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
             use_luna_temporal=use_luna_temporal,
             luna_num_slots=luna_num_slots,
             luna_spd_beta_init=luna_spd_beta_init,
+            use_rope=use_rope,
+            rope_freq_min=rope_freq_min,
+            rope_freq_max=rope_freq_max,
         )
 
         self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()

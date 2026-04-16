@@ -155,7 +155,8 @@ class Pipeline:
                      clamp_channels=False, value_bias_layers=0,
                      learn_mu_reference=True,
                      use_luna_temporal=False, luna_num_slots=16,
-                     luna_start_layer=2, luna_spd_beta_init=0.0):
+                     luna_start_layer=2, luna_spd_beta_init=0.0,
+                     use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
@@ -236,6 +237,9 @@ class Pipeline:
                     luna_num_slots=luna_num_slots,
                     luna_start_layer=luna_start_layer,
                     luna_spd_beta_init=luna_spd_beta_init,
+                    use_rope=use_rope,
+                    rope_freq_min=rope_freq_min,
+                    rope_freq_max=rope_freq_max,
                 )
                 # Override log_mode in every encoder layer if needed
                 if log_mode == 'approx':
@@ -256,6 +260,8 @@ class Pipeline:
                     run_name += "-mu"
                 if use_luna_temporal:
                     run_name += f"-luna{luna_num_slots}"
+                if use_rope:
+                    run_name += "-rope"
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,

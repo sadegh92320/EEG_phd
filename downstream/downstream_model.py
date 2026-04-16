@@ -643,6 +643,10 @@ class DownstreamRiemannTransformerPara(Downstream):
         self._luna_num_slots = kwargs.pop("luna_num_slots", 16)
         self._luna_start_layer = kwargs.pop("luna_start_layer", 2)
         self._luna_spd_beta_init = kwargs.pop("luna_spd_beta_init", 0.0)
+        # EEG-RoPE temporal position encoding
+        self._use_rope = kwargs.pop("use_rope", False)
+        self._rope_freq_min = kwargs.pop("rope_freq_min", 0.5)
+        self._rope_freq_max = kwargs.pop("rope_freq_max", 50.0)
         if aggregation == "class":
             raise ValueError(
                 "DownstreamRiemannTransformerPara does not use a [CLS] token. "
@@ -657,6 +661,9 @@ class DownstreamRiemannTransformerPara(Downstream):
         luna_slots = getattr(self, '_luna_num_slots', 16)
         luna_start = getattr(self, '_luna_start_layer', 2)
         luna_beta = getattr(self, '_luna_spd_beta_init', 0.0)
+        use_rope = getattr(self, '_use_rope', False)
+        rope_freq_min = getattr(self, '_rope_freq_min', 0.5)
+        rope_freq_max = getattr(self, '_rope_freq_max', 50.0)
         return nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
@@ -665,6 +672,9 @@ class DownstreamRiemannTransformerPara(Downstream):
                 use_luna_temporal=(use_luna and i >= luna_start),
                 luna_num_slots=luna_slots,
                 luna_spd_beta_init=luna_beta,
+                use_rope=use_rope,
+                rope_freq_min=rope_freq_min,
+                rope_freq_max=rope_freq_max,
             ) for i in range(depth_e)
         ])
 
@@ -691,8 +701,11 @@ class DownstreamRiemannTransformerPara(Downstream):
         x = x + self._get_channel_embedding(channel_list, N, B, L)
 
         # Temporal embedding
-        seq_idx = torch.arange(0, N, device=device).unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
-        x = x + self.temporal_embedding(seq_idx)
+        # When RoPE is enabled, skip additive temporal PE — position is injected
+        # via rotation inside the temporal attention (no magnitude imbalance).
+        if not getattr(self, '_use_rope', False):
+            seq_idx = torch.arange(0, N, device=device).unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
+            x = x + self.temporal_embedding(seq_idx)
 
         # NOTE: No class token before encoder — the adaptive Riemannian
         # attention requires L = N * C (asserts L % num_chan == 0).
