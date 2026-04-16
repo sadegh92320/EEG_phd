@@ -487,8 +487,8 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                          on_step=False, on_epoch=True)
 
             # ── RoPE frequency logging ──
-            if hasattr(attn, 'temporal_rope'):
-                rope = attn.temporal_rope
+            if hasattr(layer.attn, 'temporal_rope'):
+                rope = layer.attn.temporal_rope
                 # Convert to Hz for interpretability (dt ≈ patch_size/128)
                 dt = self.patch_size / 128.0
                 freqs_hz = rope.omega.detach() / (2.0 * 3.14159 * dt)
