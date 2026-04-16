@@ -1384,62 +1384,72 @@ class RiemannianLunaTemporalCompression(nn.Module):
         BC, H, N, d = q_t.shape
         l = self.num_slots
 
-        # ── Pack: slots attend to input tokens ──
-        # Slot queries get their own projection; K and V reuse shared QKV output
-        slots = self.slots.expand(BC, -1, -1)  # (BC, l, H*d)
-        pq = self.pack_q(slots)  # (BC, l, H*d)
-        pq = rearrange(pq, 'bc l (h d) -> bc h l d', h=H)  # (BC, H, l, d)
+        # ── All Luna attention ops must run in fp32 ──
+        # AMP can cast manual matmuls to fp16, where max=65504.
+        # pq @ k_t^T or packed @ packed^T can exceed that → inf → NaN cascade
+        # into the residual stream → S = x @ x^T becomes NaN.
+        # F.scaled_dot_product_attention handles this internally, but Luna's
+        # manual attention path does not. Force fp32 for all three steps.
+        with torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False):
 
-        # Pack attention: (BC, H, l, N)
-        pack_score = (pq @ k_t.transpose(-2, -1)) * self.scale
+            q_t = q_t.float()
+            k_t = k_t.float()
+            v_t = v_t.float()
 
-        # ── SPD bias on pack attention ──
-        if L_n is not None and channel_idx is not None and C is not None:
-            B = BC // C
-            # L_n is (B*N, C_ch, C_ch) — one covariance per (batch, timestep).
-            # All C channels at timestep n share the SAME covariance, so we
-            # compute distances at (B, N) level and broadcast to (B*C) — saves
-            # a factor of C in both compute and memory.
-            # Detach L_n: SPD distances guide attention routing but we don't
-            # need gradients flowing back through the covariance computation
-            # (C1's Riemannian bias already trains L_n). Saves ~15-20% backward time.
-            L_per_sample = L_n.detach().reshape(B, N, *L_n.shape[1:])  # (B, N, C_ch, C_ch)
+            # ── Pack: slots attend to input tokens ──
+            # Slot queries get their own projection; K and V reuse shared QKV output
+            slots = self.slots.expand(BC, -1, -1)  # (BC, l, H*d)
+            pq = self.pack_q(slots.float())  # (BC, l, H*d)
+            pq = rearrange(pq, 'bc l (h d) -> bc h l d', h=H)  # (BC, H, l, d)
 
-            # SPD distances at sample level: (B, l, N)
-            spd_dist_b = self._compute_spd_distances(L_per_sample, channel_idx)
+            # Pack attention: (BC, H, l, N)
+            pack_score = (pq @ k_t.transpose(-2, -1)) * self.scale
 
-            # Broadcast to all channels: (B, l, N) → (B*C, l, N)
-            # Use repeat_interleave so each sample's distances are repeated C
-            # times contiguously (matching the (b c) layout of BC dimension).
-            # This allocates only (B*C, l, N) — no intermediate 4D tensor.
-            spd_dist = spd_dist_b.repeat_interleave(C, dim=0)  # (B*C, l, N)
+            # ── SPD bias on pack attention ──
+            if L_n is not None and channel_idx is not None and C is not None:
+                B = BC // C
+                # L_n is (B*N, C_ch, C_ch) — one covariance per (batch, timestep).
+                # All C channels at timestep n share the SAME covariance, so we
+                # compute distances at (B, N) level and broadcast to (B*C) — saves
+                # a factor of C in both compute and memory.
+                # Detach L_n: SPD distances guide attention routing but we don't
+                # need gradients flowing back through the covariance computation
+                # (C1's Riemannian bias already trains L_n). Saves ~15-20% backward time.
+                L_per_sample = L_n.detach().reshape(B, N, *L_n.shape[1:])  # (B, N, C_ch, C_ch)
 
-            # Subtract β · distance (higher distance → lower score)
-            # pack_score is (BC, H, l, N), spd_dist is (BC, l, N) → unsqueeze for heads
-            pack_score = pack_score - self.spd_beta * spd_dist.unsqueeze(1)
+                # SPD distances at sample level: (B, l, N)
+                spd_dist_b = self._compute_spd_distances(L_per_sample, channel_idx)
 
-        pack_attn = pack_score.softmax(dim=-1)
-        pack_attn = F.dropout(pack_attn, p=self.att_dropout, training=self.training)
+                # Broadcast to all channels: (B, l, N) → (B*C, l, N)
+                # Use repeat_interleave so each sample's distances are repeated C
+                # times contiguously (matching the (b c) layout of BC dimension).
+                # This allocates only (B*C, l, N) — no intermediate 4D tensor.
+                spd_dist = spd_dist_b.repeat_interleave(C, dim=0)  # (B*C, l, N)
 
-        # Packed representation: (BC, H, l, d)
-        packed = pack_attn @ v_t
+                # Subtract β · distance (higher distance → lower score)
+                # pack_score is (BC, H, l, N), spd_dist is (BC, l, N) → unsqueeze for heads
+                pack_score = pack_score - self.spd_beta * spd_dist.unsqueeze(1)
 
-        # ── Process: self-attention among packed slots (projection-free) ──
-        # packed is already (BC, H, l, d) — use directly as Q, K, V
-        # Manual attention is faster than F.scaled_dot_product_attention here
-        # because l=16 is too small for FlashAttention's kernel launch overhead.
-        self_score = (packed @ packed.transpose(-2, -1)) * self.scale
-        self_attn = self_score.softmax(dim=-1)
-        self_attn = F.dropout(self_attn, p=self.att_dropout, training=self.training)
-        processed = self_attn @ packed  # (BC, H, l, d)
+            pack_attn = pack_score.softmax(dim=-1)
+            pack_attn = F.dropout(pack_attn, p=self.att_dropout, training=self.training)
 
-        # ── Unpack: input tokens attend to processed slots ──
-        # Q = original q_t, K/V = processed slots (no extra projections)
-        # Manual attention: N×l is small enough that kernel overhead dominates.
-        unpack_score = (q_t @ processed.transpose(-2, -1)) * self.scale  # (BC, H, N, l)
-        unpack_attn = unpack_score.softmax(dim=-1)
-        unpack_attn = F.dropout(unpack_attn, p=self.att_dropout, training=self.training)
-        out = unpack_attn @ processed  # (BC, H, N, d)
+            # Packed representation: (BC, H, l, d)
+            packed = pack_attn @ v_t
+
+            # ── Process: self-attention among packed slots (projection-free) ──
+            # packed is already (BC, H, l, d) — use directly as Q, K, V
+            self_score = (packed @ packed.transpose(-2, -1)) * self.scale
+            self_attn = self_score.softmax(dim=-1)
+            self_attn = F.dropout(self_attn, p=self.att_dropout, training=self.training)
+            processed = self_attn @ packed  # (BC, H, l, d)
+
+            # ── Unpack: input tokens attend to processed slots ──
+            # Q = original q_t, K/V = processed slots (no extra projections)
+            unpack_score = (q_t @ processed.transpose(-2, -1)) * self.scale  # (BC, H, N, l)
+            unpack_attn = unpack_score.softmax(dim=-1)
+            unpack_attn = F.dropout(unpack_attn, p=self.att_dropout, training=self.training)
+            out = unpack_attn @ processed  # (BC, H, N, d)
 
         return out
 
