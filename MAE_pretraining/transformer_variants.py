@@ -1321,41 +1321,32 @@ class RiemannianLunaTemporalCompression(nn.Module):
         # (l, total_ch, r) → (l, C_ch, r)
         U_sub = self.mu_proto_factors[:, channel_idx]  # (l, C_ch, r)
 
-        # ‖L_t‖²_F: (BC, N)
+        # ── Normalize L to unit Frobenius norm (per token) ──
+        # The Padé log-map can produce large tangent vectors when the residual
+        # stream grows. Squaring these in the distance computation causes inf,
+        # and inf - inf = NaN. Normalizing makes distances scale-invariant:
+        # only the *direction* in tangent space matters for routing, not magnitude.
         L_flat = L_per_sample.reshape(BC, N, -1)  # (B, N, C_ch²)
-        L_sqnorm = (L_flat * L_flat).sum(dim=-1)  # (BC, N)
+        L_norm = L_flat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        L_flat = L_flat / L_norm
 
-        # ‖μ_q‖²_F = ‖U U^T‖²_F = tr((UU^T)(UU^T)) = ‖U^T U‖²_F
-        # U^T U: (l, r, r)
-        UtU = torch.bmm(U_sub.transpose(-2, -1), U_sub)  # (l, r, r)
-        mu_sqnorm = (UtU * UtU).sum(dim=(-2, -1))  # (l,)
-
-        # tr(L · UU^T) = tr(U^T L U) = ‖L_flat @ U‖²_F summed smartly
-        # L_per_token: (BC, N, C_ch, C_ch), U_sub: (l, C_ch, r)
-        # For each slot q: tr(L_t · U_q U_q^T) = ‖L_t @ U_q‖²_F ... no.
-        # Actually tr(L · UU^T) = sum_ij L_ij (UU^T)_ij
-        #   = vec(L)^T vec(UU^T)
-        # But we want to avoid forming UU^T.
-        # tr(L · UU^T) = tr(U^T L U) (cyclic property)
-        # L_t @ U_q: (BC, N, C_ch, r) for one slot. Then trace of U^T @ that.
-        # = sum of (U_q^T @ L_t @ U_q) diagonal entries
-        # Efficient: LU = einsum('bnij,ljr->bnlr' ... ) but that's a big tensor.
-        #
-        # Better: flatten L and UU^T and dot.
-        # UU^T_flat: (l, C_ch²). L_flat: (BC, N, C_ch²).
-        # cross = L_flat @ UU^T_flat^T → (BC, N, l). This needs UU^T_flat.
-        # UU^T = U @ U^T → (l, C_ch, C_ch) → reshape to (l, C_ch²).
-        # For C_ch=22, r=8: UU^T is (l, 22, 22) = 7.7K per slot. Very cheap.
+        # ── Prototype cross-term via flattened dot product ──
+        # UU^T = U @ U^T → (l, C_ch, C_ch) → flatten to (l, C_ch²).
+        # cross = L_flat · mu_flat^T gives vec(L)^T vec(μ) per slot-token pair.
         mu_sub = torch.bmm(U_sub, U_sub.transpose(-2, -1))  # (l, C_ch, C_ch)
         mu_flat = mu_sub.reshape(l, -1)  # (l, C_ch²)
+        # Normalize prototypes to match L_flat's unit-norm space
+        mu_norm = mu_flat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        mu_flat = mu_flat / mu_norm
 
         # cross = L_flat @ mu_flat^T → (BC, N, l)
         # Use einsum to avoid expanding mu_flat to (BC, ...)
         cross = torch.einsum('bni,li->bnl', L_flat, mu_flat)  # (BC, N, l)
 
         # ‖L - μ‖²_F = ‖L‖² + ‖μ‖² - 2·cross
-        dist_sq = L_sqnorm.unsqueeze(-1) + mu_sqnorm.unsqueeze(0).unsqueeze(0) - 2 * cross
-        dist_sq = dist_sq.clamp(min=0)
+        # After unit normalization: ‖L‖²=1, ‖μ‖²=1, so dist² = 2 - 2·cross.
+        # Bounded in [0, 4] — no overflow possible.
+        dist_sq = (2.0 - 2.0 * cross).clamp(min=0)
 
         # (BC, N, l) → (BC, l, N)
         distances = dist_sq.sqrt().permute(0, 2, 1)
