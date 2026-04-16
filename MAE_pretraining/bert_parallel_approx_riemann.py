@@ -129,26 +129,30 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                  mask_prob=0.5, patch_size=16, norm_pix_loss=False,
                  use_corr_masking=True,
                  value_bias_layers=4,
-                 learn_mu_reference=True):
+                 learn_mu_reference=True,
+                 use_luna_temporal=False, luna_num_slots=16,
+                 luna_start_layer=2, luna_spd_beta_init=0.0):
         super().__init__()
 
         self.config = config
         self.enc_dim = enc_dim
         self.num_channels = num_channels
         self.use_corr_masking = use_corr_masking
+        self.use_luna_temporal = use_luna_temporal
 
         # Adaptive Riemannian parallel transformer layers
         # log_mode='pade' → Padé [1,1] approximant: log(S) ≈ 2(S-I)(I+S)^{-1}
         # C1: Riemannian spatial attention bias (score bias α_h · log(Σ))
-        # C3: Learnable tangent-space centering — per-layer μ subtracted from
-        #     log(Σ) before the bias is applied. Shifts the effective
-        #     log-Euclidean reference away from identity toward the learned
-        #     Fréchet-mean-like center of the covariance distribution.
+        # C2: Luna temporal compression on layers >= luna_start_layer
+        #     (skip early layers where local temporal structure matters most)
         self.encoder = nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
                 use_value_bias=(i < value_bias_layers),
                 learn_mu_reference=learn_mu_reference,
+                use_luna_temporal=(use_luna_temporal and i >= luna_start_layer),
+                luna_num_slots=luna_num_slots,
+                luna_spd_beta_init=luna_spd_beta_init,
             ) for i in range(depth_e)
         ])
 
@@ -449,6 +453,20 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 self.log(f"mu_frobenius/layer_{i}", mu.detach().norm(),
                          on_step=False, on_epoch=True)
                 self.log(f"mu_max_abs/layer_{i}", mu.detach().abs().max(),
+                         on_step=False, on_epoch=True)
+
+            # C2: Luna temporal compression diagnostics
+            if hasattr(layer.attn, 'luna_temporal'):
+                luna = layer.attn.luna_temporal
+                # SPD distance weight β — should grow from 0 if geometry helps
+                self.log(f"luna_spd_beta/layer_{i}", luna.spd_beta.detach(),
+                         on_step=False, on_epoch=True)
+                # Prototype norms — track whether prototypes are specializing
+                mu_p = luna.mu_prototypes.detach()
+                proto_norms = mu_p.reshape(luna.num_slots, -1).norm(dim=-1)
+                self.log(f"luna_proto_norm_mean/layer_{i}", proto_norms.mean(),
+                         on_step=False, on_epoch=True)
+                self.log(f"luna_proto_norm_std/layer_{i}", proto_norms.std(),
                          on_step=False, on_epoch=True)
 
         return loss

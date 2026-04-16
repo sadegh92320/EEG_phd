@@ -153,45 +153,52 @@ class Pipeline:
     def load_encoder(self, pretrain=True, log_mode='pade',
                      use_corr_masking=False, resume_ckpt=None, use_global_norm=False,
                      clamp_channels=False, value_bias_layers=0,
-                     learn_mu_reference=True):
+                     learn_mu_reference=True,
+                     use_luna_temporal=False, luna_num_slots=16,
+                     luna_start_layer=2, luna_spd_beta_init=0.0):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
         Contributions:
             C1. Riemannian spatial attention bias (Padé [1,1] log map at identity)
                 Score bias: α_h · log(Σ) added to attention logits.
-            C2. Channel-invariant adaptive log map — global 144-channel reference
+            C2. Riemannian Luna temporal compression — Luna-style pack-unpack
+                bottleneck on temporal dimension (layers >= luna_start_layer).
+                SPD prototypes μ_q bias pack attention toward tokens from
+                similar covariance regimes, making compression geometry-aware.
+                Channel-invariant adaptive log map — global 144-channel reference
                 allows a single pretrained encoder to operate on any channel
                 layout via submatrix indexing.
-            C3. Learnable tangent-space centering — per-layer μ^(l) subtracted
-                from log(Σ) before the bias is applied. Shifts the effective
-                log-Euclidean reference from identity toward the learned
-                Fréchet-mean-like center of the covariance distribution, which
-                the diagnostic (Appendix X) shows is systematically far from I.
 
         Ablation table:
             1. baseline (parallel attn, no Riemannian)    → log_mode='baseline'
             2. approx (S-I)                               → log_mode='approx'
             3. pade                                       → log_mode='pade'
             4. pade + MAD normalization                   → + use_global_norm=True, clamp_channels=True
-            5. pade + MAD + mu centering (full C3)        → + learn_mu_reference=True
-            6. (negative) pade + MAD + Fréchet reference  → documented failure
+            5. pade + MAD + mu centering                  → + learn_mu_reference=True
+            6. pade + Luna temporal (no SPD)              → + use_luna_temporal=True, luna_spd_beta_init=0
+            7. pade + Luna temporal + SPD prototypes      → + use_luna_temporal=True, luna_spd_beta_init=0 (β learns)
+            8. (negative) pade + MAD + Fréchet reference  → documented failure
 
         Args:
-            pretrain:           if True, train from scratch; else load existing ckpt
-            log_mode:           'pade', 'approx', or 'baseline'
-            use_corr_masking:   correlation-aware vs random BERT masking
-            resume_ckpt:        checkpoint to resume from (None = from scratch)
-            use_global_norm:    True → MAD-based global normalization
-            clamp_channels:     True → clamp channels with variance > 10× median
-            value_bias_layers:  number of early layers using β·(L@V) value mixing.
-                                Default 0 (disabled — earlier experiments showed
-                                no benefit, see Appendix X).
-            learn_mu_reference: if True, enable C3 learnable tangent-space centering.
-                                Adds one (144,144) symmetric matrix per layer,
-                                subtracted from log(Σ) in the attention bias.
-                                Default True (recommended; negligible compute cost,
-                                motivated by SPREAD-regime covariance diagnostic).
+            pretrain:            if True, train from scratch; else load existing ckpt
+            log_mode:            'pade', 'approx', or 'baseline'
+            use_corr_masking:    correlation-aware vs random BERT masking
+            resume_ckpt:         checkpoint to resume from (None = from scratch)
+            use_global_norm:     True → MAD-based global normalization
+            clamp_channels:      True → clamp channels with variance > 10× median
+            value_bias_layers:   number of early layers using β·(L@V) value mixing.
+                                 Default 0 (disabled — earlier experiments showed
+                                 no benefit, see Appendix X).
+            learn_mu_reference:  if True, enable learnable tangent-space centering.
+            use_luna_temporal:   if True, enable C2 Luna temporal compression on
+                                 layers >= luna_start_layer. Replaces N×N temporal
+                                 self-attention with O(N·l) pack-process-unpack.
+            luna_num_slots:      l — number of compression slots (default 16).
+            luna_start_layer:    first layer to apply Luna (default 2; layers 0-1
+                                 keep full N×N for local temporal structure).
+            luna_spd_beta_init:  initial β for SPD distance weight in pack attention.
+                                 0 → starts as standard Luna, learns to use geometry.
         """
         assert log_mode in ('pade', 'approx', 'baseline'), \
             f"log_mode must be 'pade', 'approx', or 'baseline', got '{log_mode}'"
@@ -219,11 +226,16 @@ class Pipeline:
                 masking_str = "corr-masking" if use_corr_masking else "random-masking"
                 vb_str = f", value_bias_layers={value_bias_layers}"
                 mu_str = f", mu={'on' if learn_mu_reference else 'off'}"
-                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}{vb_str}{mu_str}")
+                luna_str = f", luna={'on' if use_luna_temporal else 'off'}"
+                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}{vb_str}{mu_str}{luna_str}")
                 model = ApproxAdaptiveRiemannBert(
                     use_corr_masking=use_corr_masking,
                     value_bias_layers=value_bias_layers,
                     learn_mu_reference=learn_mu_reference,
+                    use_luna_temporal=use_luna_temporal,
+                    luna_num_slots=luna_num_slots,
+                    luna_start_layer=luna_start_layer,
+                    luna_spd_beta_init=luna_spd_beta_init,
                 )
                 # Override log_mode in every encoder layer if needed
                 if log_mode == 'approx':
@@ -242,6 +254,8 @@ class Pipeline:
                     run_name += f"-vbias{value_bias_layers}"
                 if learn_mu_reference:
                     run_name += "-mu"
+                if use_luna_temporal:
+                    run_name += f"-luna{luna_num_slots}"
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
@@ -271,6 +285,10 @@ class Pipeline:
                 "clamp_channels": clamp_channels,
                 "value_bias_layers": value_bias_layers,
                 "learn_mu_reference": learn_mu_reference,
+                "use_luna_temporal": use_luna_temporal,
+                "luna_num_slots": luna_num_slots,
+                "luna_start_layer": luna_start_layer,
+                "luna_spd_beta_init": luna_spd_beta_init,
             })
 
             callbacks = [TQDMProgressBar(refresh_rate=20), ckpt_callback]

@@ -1192,6 +1192,243 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         return bias, L
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# C2: Riemannian Luna Temporal Compression
+#
+# Luna-style pack-unpack bottleneck restricted to the TEMPORAL dimension.
+# l learnable auxiliary tokens compress N temporal tokens via cross-attention,
+# process them with cheap l×l self-attention, then decompress back to N.
+#
+# The novelty: SPD-biased pack attention. Each auxiliary token carries a
+# learnable SPD prototype μ_q on the channel covariance manifold. During
+# packing, tokens whose spatial covariance S_t is close to μ_q (in Frobenius
+# distance on the tangent space) get higher attention scores. This makes the
+# compression geometry-aware: slots specialize in tokens from distinct
+# covariance regimes (brain states), rather than compressing arbitrarily.
+#
+# The SPD distance reuses L (the log-map output from C1's Riemannian bias),
+# so there is zero extra eigendecomposition cost — only l Frobenius distances
+# per token, which is negligible.
+#
+# Reference: Ma et al., "Luna: Linear Unified Nested Attention", NeurIPS 2021.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RiemannianLunaTemporalCompression(nn.Module):
+    """
+    Geometry-guided temporal token compression via Luna-style pack-unpack.
+
+    Replaces standard N×N temporal self-attention with:
+        1. Pack:   l queries cross-attend to N tokens  → O(l·N)
+        2. Process: self-attention among l tokens       → O(l²)
+        3. Unpack: N queries cross-attend to l tokens   → O(N·l)
+
+    Total: O(N·l) instead of O(N²).
+
+    SPD bias in pack step: score(q,t) = Q_q·K_t/√d − β·‖L_t − μ_q‖_F
+    where L_t = log(S_t) is the tangent-space covariance (reused from C1),
+    and μ_q is a learnable per-slot prototype in global channel space.
+
+    Args:
+        embed_dim:       Total embedding dimension (will use dim_head = embed_dim // num_heads_total)
+        num_temporal_heads: Number of temporal heads (typically 4)
+        num_slots:       l — number of auxiliary compression tokens
+        total_channels:  Size of global channel space (144)
+        att_dropout:     Attention dropout probability
+        spd_beta_init:   Initial value for β (SPD distance weight). 0 → starts
+                         as standard Luna, learns to use geometry.
+    """
+
+    def __init__(self, embed_dim, num_temporal_heads=4, num_slots=16,
+                 total_channels=TOTAL_GLOBAL_CHANNELS,
+                 att_dropout=0.1, spd_beta_init=0.0):
+        super().__init__()
+        self.num_heads = num_temporal_heads
+        self.num_slots = num_slots
+        self.dim_head = embed_dim // (num_temporal_heads * 2)  # half-dim since parallel split
+        self.total_channels = total_channels
+
+        d = self.dim_head
+
+        # ── Learnable auxiliary tokens (the "slots") ──
+        # Initialized small so pack attention starts near-uniform
+        self.slots = nn.Parameter(torch.randn(1, num_slots, num_temporal_heads * d) * 0.02)
+
+        # ── Pack cross-attention projections (slots attend to input) ──
+        self.pack_q = nn.Linear(num_temporal_heads * d, num_temporal_heads * d, bias=False)
+        self.pack_k = nn.Linear(num_temporal_heads * d, num_temporal_heads * d, bias=False)
+        self.pack_v = nn.Linear(num_temporal_heads * d, num_temporal_heads * d, bias=False)
+
+        # ── Self-attention among packed slots ──
+        self.self_q = nn.Linear(num_temporal_heads * d, num_temporal_heads * d, bias=False)
+        self.self_k = nn.Linear(num_temporal_heads * d, num_temporal_heads * d, bias=False)
+        self.self_v = nn.Linear(num_temporal_heads * d, num_temporal_heads * d, bias=False)
+
+        # ── Unpack cross-attention projections (input attends to slots) ──
+        self.unpack_q = nn.Linear(num_temporal_heads * d, num_temporal_heads * d, bias=False)
+        self.unpack_k = nn.Linear(num_temporal_heads * d, num_temporal_heads * d, bias=False)
+        self.unpack_v = nn.Linear(num_temporal_heads * d, num_temporal_heads * d, bias=False)
+
+        # ── SPD prototypes: one per slot, stored in global channel space ──
+        # Each μ_q is a symmetric matrix in tangent space. At runtime, the
+        # relevant C×C submatrix is extracted via channel_idx (same as μ_log).
+        # Shape: (num_slots, total_channels, total_channels)
+        # Initialized to zero → all slots start equidistant from all tokens.
+        self.mu_prototypes = nn.Parameter(
+            torch.zeros(num_slots, total_channels, total_channels)
+        )
+
+        # ── Learnable SPD distance weight ──
+        # β controls how much the SPD distance biases pack attention.
+        # Initialized to spd_beta_init (0 → starts as standard Luna).
+        self.spd_beta = nn.Parameter(torch.tensor(float(spd_beta_init)))
+
+        self.att_dropout = att_dropout
+        self.scale = d ** -0.5
+
+    def _compute_spd_distances(self, L_per_token, channel_idx):
+        """
+        Compute Frobenius distance between each token's tangent vector L_t
+        and each slot's prototype μ_q.
+
+        Uses ‖A - B‖²_F = ‖A‖²_F + ‖B‖²_F - 2·tr(A^T B) to avoid
+        materializing the full (BC, l, N, C_ch, C_ch) difference tensor.
+
+        Args:
+            L_per_token: (B*C, N, C_ch, C_ch) log-map output per temporal token.
+                         C_ch is the number of channels in this batch.
+            channel_idx: (C_ch,) global channel indices
+
+        Returns:
+            distances: (B*C, num_slots, N) — ‖L_t − μ_q‖_F for each slot-token pair
+        """
+        BC, N, C_ch, _ = L_per_token.shape
+        l = self.num_slots
+
+        # Extract submatrix of each prototype for this dataset's channels
+        # mu_prototypes: (l, total_ch, total_ch) → (l, C_ch, C_ch)
+        mu_sub = self.mu_prototypes[:, channel_idx][:, :, channel_idx]  # (l, C_ch, C_ch)
+        # Symmetrize
+        mu_sub = 0.5 * (mu_sub + mu_sub.transpose(-2, -1))
+
+        # Efficient Frobenius distance via expansion:
+        # ‖L_t - μ_q‖²_F = ‖L_t‖²_F + ‖μ_q‖²_F - 2·tr(L_t^T · μ_q)
+
+        # ‖L_t‖²_F: (BC, N)
+        L_flat = L_per_token.reshape(BC, N, -1)       # (BC, N, C_ch²)
+        L_sqnorm = (L_flat * L_flat).sum(dim=-1)      # (BC, N)
+
+        # ‖μ_q‖²_F: (l,)
+        mu_flat = mu_sub.reshape(l, -1)                # (l, C_ch²)
+        mu_sqnorm = (mu_flat * mu_flat).sum(dim=-1)    # (l,)
+
+        # tr(L_t^T · μ_q) = sum of elementwise product (since both are symmetric)
+        # = L_flat @ mu_flat^T → (BC, N, l)
+        cross = torch.bmm(
+            L_flat,                                    # (BC, N, C_ch²)
+            mu_flat.unsqueeze(0).expand(BC, -1, -1).transpose(-2, -1)  # (BC, C_ch², l)
+        )                                              # (BC, N, l)
+
+        # ‖L - μ‖²_F = ‖L‖² + ‖μ‖² - 2·cross
+        dist_sq = L_sqnorm.unsqueeze(-1) + mu_sqnorm.unsqueeze(0).unsqueeze(0) - 2 * cross
+        dist_sq = dist_sq.clamp(min=0)  # numerical safety
+
+        # (BC, N, l) → (BC, l, N)
+        distances = dist_sq.sqrt().permute(0, 2, 1)
+
+        return distances
+
+    def forward(self, q_t, k_t, v_t, L_n=None, channel_idx=None, C=None):
+        """
+        Luna-style temporal attention with SPD-biased packing.
+
+        Args:
+            q_t: (B*C, H_t, N, d) temporal queries (already reshaped by caller)
+            k_t: (B*C, H_t, N, d) temporal keys
+            v_t: (B*C, H_t, N, d) temporal values
+            L_n: (B*N, C_ch, C_ch) tangent vectors from C1's Riemannian bias.
+                 Reused to avoid recomputation. None → no SPD bias.
+            channel_idx: (C_ch,) global channel indices. Required if L_n is not None.
+            C:   Number of channels (needed to reshape L_n).
+
+        Returns:
+            out: (B*C, H_t, N, d) temporal attention output
+        """
+        BC, H, N, d = q_t.shape
+        l = self.num_slots
+
+        # ── Merge heads back to get token representations ──
+        # q_t, k_t, v_t are already QKV-projected by the shared projection.
+        # We use k_t for pack keys and v_t for pack values (matching their
+        # semantic roles), and q_t for unpack queries.
+        x_k = rearrange(k_t, 'bc h n d -> bc n (h d)')  # (BC, N, H*d)
+        x_v = rearrange(v_t, 'bc h n d -> bc n (h d)')  # (BC, N, H*d)
+        x_q = rearrange(q_t, 'bc h n d -> bc n (h d)')  # (BC, N, H*d)
+
+        # ── Pack: slots attend to input tokens ──
+        slots = self.slots.expand(BC, -1, -1)  # (BC, l, H*d)
+        pq = self.pack_q(slots)                 # (BC, l, H*d)
+        pk = self.pack_k(x_k)                   # (BC, N, H*d)
+        pv = self.pack_v(x_v)                   # (BC, N, H*d)
+
+        # Reshape for multi-head attention
+        pq = rearrange(pq, 'bc l (h d) -> bc h l d', h=H)  # (BC, H, l, d)
+        pk = rearrange(pk, 'bc n (h d) -> bc h n d', h=H)  # (BC, H, N, d)
+        pv = rearrange(pv, 'bc n (h d) -> bc h n d', h=H)  # (BC, H, N, d)
+
+        # Pack attention scores: (BC, H, l, N)
+        pack_score = (pq @ pk.transpose(-2, -1)) * self.scale
+
+        # ── SPD bias on pack attention ──
+        if L_n is not None and channel_idx is not None and C is not None:
+            B = BC // C
+            # L_n is (B*N, C_ch, C_ch). We need (B*C, N, C_ch, C_ch).
+            # L_n was computed as rearrange(x, 'b (n c) d -> (b n) c d', c=C)
+            # so L_n[b*N + n] = covariance at (batch=b, timestep=n).
+            # For temporal attention, all C channels at timestep n share the
+            # SAME covariance S_n (it's computed across channels).
+            # So L_per_token[b*c, n] = L_n[b*N + n] for all c.
+            L_reshaped = rearrange(L_n, '(b n) cc1 cc2 -> b n cc1 cc2',
+                                   b=B)  # (B, N, C_ch, C_ch)
+            # Repeat for each channel: (B, N, C_ch, C_ch) → (B*C, N, C_ch, C_ch)
+            L_per_token = L_reshaped.unsqueeze(1).expand(-1, C, -1, -1, -1)
+            L_per_token = rearrange(L_per_token, 'b c n cc1 cc2 -> (b c) n cc1 cc2')
+
+            # Compute distances: (BC, l, N)
+            spd_dist = self._compute_spd_distances(L_per_token, channel_idx)
+
+            # Subtract β · distance from pack scores (higher distance → lower score)
+            pack_score = pack_score - self.spd_beta * spd_dist.unsqueeze(1)  # broadcast over heads
+
+        pack_attn = pack_score.softmax(dim=-1)
+        pack_attn = F.dropout(pack_attn, p=self.att_dropout, training=self.training)
+
+        # Packed representation: (BC, H, l, d)
+        packed = pack_attn @ pv
+
+        # ── Process: self-attention among packed slots ──
+        packed_flat = rearrange(packed, 'bc h l d -> bc l (h d)')
+        sq = rearrange(self.self_q(packed_flat), 'bc l (h d) -> bc h l d', h=H)
+        sk = rearrange(self.self_k(packed_flat), 'bc l (h d) -> bc h l d', h=H)
+        sv = rearrange(self.self_v(packed_flat), 'bc l (h d) -> bc h l d', h=H)
+
+        self_score = (sq @ sk.transpose(-2, -1)) * self.scale
+        self_attn = self_score.softmax(dim=-1)
+        self_attn = F.dropout(self_attn, p=self.att_dropout, training=self.training)
+        processed = self_attn @ sv  # (BC, H, l, d)
+
+        # ── Unpack: input tokens attend to processed slots ──
+        processed_flat = rearrange(processed, 'bc h l d -> bc l (h d)')
+        uq = rearrange(self.unpack_q(x_q), 'bc n (h d) -> bc h n d', h=H)
+        uk = rearrange(self.unpack_k(processed_flat), 'bc l (h d) -> bc h l d', h=H)
+        uv = rearrange(self.unpack_v(processed_flat), 'bc l (h d) -> bc h l d', h=H)
+
+        unpack_score = (uq @ uk.transpose(-2, -1)) * self.scale  # (BC, H, N, l)
+        unpack_attn = unpack_score.softmax(dim=-1)
+        unpack_attn = F.dropout(unpack_attn, p=self.att_dropout, training=self.training)
+        out = unpack_attn @ uv  # (BC, H, N, d)
+
+        return out
+
 
 class AdaptiveRiemannianParallelAttention(nn.Module):
     """
@@ -1207,7 +1444,9 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
                  use_frechet=False, frechet_R_inv_sqrt=None,
                  use_temporal_cov=False,
                  use_value_bias=True,
-                 learn_mu_reference=True):
+                 learn_mu_reference=True,
+                 use_luna_temporal=False, luna_num_slots=16,
+                 luna_spd_beta_init=0.0):
         super().__init__()
         assert num_heads % 2 == 0, "num_heads must be even for parallel split"
         assert embed_dim % num_heads == 0
@@ -1218,6 +1457,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.embed_dim = embed_dim
         self.half_dim = self.heads_per_branch * self.dim_head
         self.use_value_bias = use_value_bias
+        self.use_luna_temporal = use_luna_temporal
 
         # Shared QKV projection
         self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
@@ -1237,6 +1477,17 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             frechet_R_inv_sqrt=frechet_R_inv_sqrt,
             learn_mu_reference=learn_mu_reference,
         )
+
+        # C2: Luna-style temporal compression with SPD-biased packing
+        if use_luna_temporal:
+            self.luna_temporal = RiemannianLunaTemporalCompression(
+                embed_dim=embed_dim,
+                num_temporal_heads=self.heads_per_branch,
+                num_slots=luna_num_slots,
+                total_channels=total_channels,
+                att_dropout=att_dropout,
+                spd_beta_init=luna_spd_beta_init,
+            )
 
         # Geometric value mixing: V' = V + β_h · (L @ V)
         # Injects covariance structure into attention values — complementary
@@ -1287,15 +1538,24 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         k_t, k_s = k[:, :H2], k[:, H2:]
         v_t, v_s = v[:, :H2], v[:, H2:]
 
-        # ── Temporal attention (standard) ──
+        # ── Temporal attention ──
         q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=C)
         k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=C)
         v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=C)
 
-        out_t = F.scaled_dot_product_attention(
-            q_t, k_t, v_t,
-            dropout_p=self.att_dropout if self.training else 0.0,
-        )
+        if self.use_luna_temporal:
+            # C2: Luna pack-process-unpack with SPD-biased packing
+            # L_n from C1's Riemannian bias is reused — zero extra cost
+            out_t = self.luna_temporal(
+                q_t, k_t, v_t,
+                L_n=L_n, channel_idx=channel_idx, C=C,
+            )
+        else:
+            # Standard N×N temporal self-attention
+            out_t = F.scaled_dot_product_attention(
+                q_t, k_t, v_t,
+                dropout_p=self.att_dropout if self.training else 0.0,
+            )
         out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=C)
 
         # ── Spatial attention (Riemannian-biased) ──
@@ -1369,7 +1629,9 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
                  use_frechet=False, frechet_R_inv_sqrt=None,
                  use_temporal_cov=False,
                  use_value_bias=True,
-                 learn_mu_reference=True):
+                 learn_mu_reference=True,
+                 use_luna_temporal=False, luna_num_slots=16,
+                 luna_spd_beta_init=0.0):
         super().__init__()
 
         self.attn = AdaptiveRiemannianParallelAttention(
@@ -1386,6 +1648,9 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
             use_temporal_cov=use_temporal_cov,
             use_value_bias=use_value_bias,
             learn_mu_reference=learn_mu_reference,
+            use_luna_temporal=use_luna_temporal,
+            luna_num_slots=luna_num_slots,
+            luna_spd_beta_init=luna_spd_beta_init,
         )
 
         self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()

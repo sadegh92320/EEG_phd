@@ -185,8 +185,14 @@ def build_riemann_loss(num_classes, checkpoint_path, num_channels, data_length, 
 
 def build_riemann_transformer_para(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
     """Adaptive Riemannian parallel transformer (Padé log map + geometric cross-channel mixing)."""
+    # Pass through Luna flags from kwargs if present
+    luna_kwargs = {}
+    for key in ('use_luna_temporal', 'luna_num_slots', 'luna_start_layer', 'luna_spd_beta_init'):
+        if key in kwargs:
+            luna_kwargs[key] = kwargs[key]
     model = DownstreamRiemannTransformerPara(
         num_classes=num_classes, checkpoint_path=checkpoint_path,
+        **luna_kwargs,
     )
     return model
 

@@ -638,6 +638,11 @@ class DownstreamRiemannTransformerPara(Downstream):
         self._value_bias_layers = kwargs.pop("value_bias_layers", 4)
         # C3: learnable tangent-space centering (replaces prior residual-stream experiments)
         self._learn_mu_reference = kwargs.pop("learn_mu_reference", True)
+        # C2: Luna temporal compression
+        self._use_luna_temporal = kwargs.pop("use_luna_temporal", False)
+        self._luna_num_slots = kwargs.pop("luna_num_slots", 16)
+        self._luna_start_layer = kwargs.pop("luna_start_layer", 2)
+        self._luna_spd_beta_init = kwargs.pop("luna_spd_beta_init", 0.0)
         if aggregation == "class":
             raise ValueError(
                 "DownstreamRiemannTransformerPara does not use a [CLS] token. "
@@ -648,11 +653,18 @@ class DownstreamRiemannTransformerPara(Downstream):
     def _build_encoder(self, enc_dim, depth_e):
         value_bias_layers = getattr(self, '_value_bias_layers', 4)
         learn_mu_reference = getattr(self, '_learn_mu_reference', True)
+        use_luna = getattr(self, '_use_luna_temporal', False)
+        luna_slots = getattr(self, '_luna_num_slots', 16)
+        luna_start = getattr(self, '_luna_start_layer', 2)
+        luna_beta = getattr(self, '_luna_spd_beta_init', 0.0)
         return nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
                 use_value_bias=(i < value_bias_layers),
                 learn_mu_reference=learn_mu_reference,
+                use_luna_temporal=(use_luna and i >= luna_start),
+                luna_num_slots=luna_slots,
+                luna_spd_beta_init=luna_beta,
             ) for i in range(depth_e)
         ])
 
