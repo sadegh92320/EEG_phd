@@ -126,7 +126,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
     """
     def __init__(self, config=None, num_channels=64,
                  max_embedding=2000, enc_dim=512, depth_e=8,
-                 mask_prob=0.5, patch_size=8, norm_pix_loss=False,
+                 mask_prob=0.5, patch_size=16, norm_pix_loss=False,
                  use_corr_masking=True,
                  value_bias_layers=4,
                  learn_mu_reference=True,

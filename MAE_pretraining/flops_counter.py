@@ -172,7 +172,7 @@ def _add_matmul_flops_hook(counter):
 
 @torch.no_grad()
 def count_flops(model, num_channels=32, seq_length=500, batch_size=2,
-                patch_size=8, device="cpu", verbose=True):
+                patch_size=16, device="cpu", verbose=True):
     """
     Count FLOPs for a single forward pass of any pretraining model.
 
@@ -431,8 +431,8 @@ def benchmark_throughput(model, num_channels=32, seq_length=500,
     return result
 
 
-def compare_all_models(num_channels=32, seq_length=768, batch_size=2,
-                        enc_dim=512, depth_e=8, patch_size=8, device="cpu"):
+def compare_all_models(num_channels=32, seq_length=512, batch_size=2,
+                        enc_dim=512, depth_e=8, patch_size=16, device="cpu"):
     """
     Compare FLOPs and parameters across all model variants.
     Prints a summary table ready for your paper.
@@ -619,15 +619,15 @@ def quick_count(model_module_path, num_channels=32, seq_length=500, **kwargs):
 
 if __name__ == "__main__":
     print("Comparing all model variants with default settings...")
-    print("(num_channels=32, seq_length=768, enc_dim=512, depth=8, patch_size=8)\n")
+    print("(num_channels=32, seq_length=512, enc_dim=512, depth=8, patch_size=16)\n")
 
     results = compare_all_models(
         num_channels=32,
-        seq_length=768,
+        seq_length=512,
         batch_size=2,
         enc_dim=512,
         depth_e=8,
-        patch_size=8,
+        patch_size=16,
         device="cpu"
     )
 
