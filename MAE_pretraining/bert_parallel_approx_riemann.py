@@ -780,6 +780,10 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         target_raw, _ = self.patchify_1d(data, self.patch_size)
         B, Seq, Ch, P = target_raw.shape
         target_flat = target_raw.view(B, Seq * Ch, P)
+        if self.norm_pix_loss:
+            mean = target_flat.mean(dim=-1, keepdim=True)
+            var = target_flat.var(dim=-1, unbiased=False, keepdim=True)
+            target_flat = (target_flat - mean) / (var + 1.e-6)**.5
 
         with torch.no_grad():
             pred_fft = torch.fft.rfft(pred, dim=-1).abs()    # (B, L, P//2+1)
