@@ -117,12 +117,10 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
     """
     BERT-style masked pretraining with adaptive Riemannian parallel transformer.
 
-    Uses first-order approximation log(M) ≈ M - I instead of eigendecomposition.
+    Uses first-order pade approximation instead of eigendecomposition.
     This avoids the B*N eigendecompositions per layer that the full version requires,
     while the adaptive reference R ensures M stays close to I for accuracy.
 
-    The only remaining eigendecomposition is for R^{-1/2} — a single C×C matrix
-    per layer, independent of batch size and sequence length.
     """
     def __init__(self, config=None, num_channels=64,
                  max_embedding=2000, enc_dim=512, depth_e=8,
@@ -132,7 +130,10 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                  learn_mu_reference=True,
                  use_luna_temporal=False, luna_num_slots=16,
                  luna_start_layer=2, luna_spd_beta_init=0.0,
-                 use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0):
+                 use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
+                 rope_learnable=True,
+                 spectral_loss_weight=0.0,
+                 mask_strategy='random', mask_block_size=4):
         super().__init__()
 
         self.config = config
@@ -158,10 +159,13 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 use_rope=use_rope,
                 rope_freq_min=rope_freq_min,
                 rope_freq_max=rope_freq_max,
+                rope_learnable=rope_learnable,
             ) for i in range(depth_e)
         ])
 
         self.mask_prob = mask_prob
+        self.mask_strategy = mask_strategy
+        self.mask_block_size = mask_block_size
         self.patch_size = patch_size
         self.patch = PatchEEG(patch_size=patch_size, embed_dim=enc_dim)
         self.mask_token = nn.Parameter(torch.zeros((1, 1, enc_dim)))
@@ -175,6 +179,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         self.criterion = nn.MSELoss()
         self.class_token = nn.Parameter(torch.zeros(1, 1, enc_dim))
         self.norm_pix_loss = norm_pix_loss
+        self.spectral_loss_weight = spectral_loss_weight
         self.initialize_weights()
 
     def _init_weights(self, m):
@@ -205,6 +210,61 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         mask_float = mask.unsqueeze(-1).float()
         x = x * (1 - mask_float) + mask_token * mask_float
         return x, mask
+
+    def mask_temporal_block(self, x, num_chan):
+        """
+        Block masking: mask contiguous temporal windows across ALL channels.
+
+        Instead of random per-token masking (which allows local interpolation),
+        this masks contiguous blocks of temporal patches. A masked block removes
+        entire time windows, forcing the model to reconstruct from:
+          - Distant temporal context (long-range temporal features)
+          - Cross-channel spatial information (Riemannian spatial branch)
+
+        Token layout: [t0_c0, t0_c1, ..., t0_cC, t1_c0, ..., tN_cC]
+        A temporal block masks all channels at times [t, t+1, ..., t+block_size-1].
+
+        Args:
+            x:        (B, L, D) where L = N * C
+            num_chan:  C — number of channels
+
+        Returns:
+            x:    (B, L, D) with blocked tokens replaced by mask_token
+            mask: (B, L) boolean — True = masked
+        """
+        device = x.device
+        B, L, D = x.shape
+        C = num_chan
+        N = L // C  # number of temporal positions
+        block_size = self.mask_block_size
+
+        # Number of blocks that fit in the temporal dimension
+        n_blocks = N // block_size
+        # If N isn't divisible, last few tokens handled separately
+        n_remainder = N % block_size
+
+        # Decide which blocks to mask: each block is masked with mask_prob
+        # Shape: (B, n_blocks)
+        block_mask = torch.rand(B, n_blocks, device=device) < self.mask_prob
+
+        # Expand block mask to per-timestep mask: (B, N)
+        time_mask = block_mask.unsqueeze(-1).expand(-1, -1, block_size).reshape(B, n_blocks * block_size)
+        if n_remainder > 0:
+            # Handle remainder: mask with same probability
+            remainder_mask = torch.rand(B, 1, device=device) < self.mask_prob
+            remainder_mask = remainder_mask.expand(-1, n_remainder)
+            time_mask = torch.cat([time_mask, remainder_mask], dim=-1)  # (B, N)
+
+        # Expand to all channels: when time t is masked, ALL channels at t are masked
+        # Token layout: (B, N, C) → (B, N*C)
+        token_mask = time_mask.unsqueeze(-1).expand(-1, -1, C).reshape(B, L)
+
+        # Apply mask
+        mask_token = self.mask_token.expand_as(x)
+        mask_float = token_mask.unsqueeze(-1).float()
+        x = x * (1 - mask_float) + mask_token * mask_float
+
+        return x, token_mask
 
     def mask_corr_channels(self, x, corr, num_chan, seed_prob=0.2,
                            patch_mask_prob=0.15, min_channels=8):
@@ -307,16 +367,145 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
 
         return x, combined_mask
 
+    def mask_block_corr(self, x, corr, num_chan, seed_prob=0.2):
+        """
+        Combined block + channel masking — eliminates BOTH shortcut axes.
+
+        Design rationale (co-designed with EEG-RoPE):
+            Why corr masking failed before (C1 only): the temporal branch was
+            useless (no PE → uniform attention), so the model had only ONE
+            functional branch to handle reconstruction. Not enough signal.
+
+            With EEG-RoPE the temporal branch becomes functional. Now when
+            correlated channels are masked, the temporal branch compensates
+            via long-range context. And when temporal blocks are masked,
+            the spatial branch compensates via Riemannian cross-channel
+            structure. The two branches form a complementary pair.
+
+            Double-masked tokens (both axes masked) are reconstructed via
+            a two-hop path through the shared residual stream: layer 1
+            enriches singly-masked intermediaries with cross-branch info,
+            layer 2+ reads that enriched context. The shared QKV is the
+            communication channel that makes this possible.
+
+        Token regions and reconstruction pathways:
+            Easy       (1-X)(1-Y): both branches have visible context
+            Block-only    X(1-Y): temporal branch → long-range RoPE attention
+            Chan-only  (1-X)Y   : spatial branch → Riemannian cross-channel
+            Cross      X·Y      : two-hop via shared residual (layer 2+)
+
+            Target: keep cross-region < 10% of tokens to avoid dominating
+            the loss with the hardest reconstruction targets.
+
+        Axis 1 (temporal): Block masking removes contiguous temporal windows.
+            Block size = 4 patches (0.5s at 128Hz/16) — chosen to exceed
+            the EEG-RoPE learned period (~0.25-0.33s at 3-4Hz).
+
+        Axis 2 (spatial): Channel masking removes entire channels.
+            For C >= 8: correlation chain (seed → partner → partner's partner)
+            For C < 8: mask exactly 1 random channel per sample.
+            This preserves the spatial learning signal (remaining channels
+            provide cross-channel covariance for Riemannian bias) while
+            forcing the model to actually learn that structure.
+
+        Args:
+            x:         (B, L, D) where L = N * C
+            corr:      (B, C, C) per-sample correlation matrix
+            num_chan:   C
+            seed_prob: fraction of C to seed for correlation chains (C >= 8)
+
+        Returns:
+            x:    (B, L, D) with masked tokens
+            mask: (B, L) boolean — True = masked
+        """
+        device = x.device
+        B, L, D = x.shape
+        C = num_chan
+        N = L // C
+        block_size = self.mask_block_size
+
+        # ══════════════════════════════════════════════════════════════
+        # ROUND 1: Temporal block masking
+        # Target ~25-30% of temporal positions → keeps cross-region small.
+        # With mask_prob=0.5: block_prob = 0.25-0.30
+        # With mask_prob=0.75: block_prob = 0.375 (capped at 0.5 for safety)
+        # ══════════════════════════════════════════════════════════════
+        block_prob = min(self.mask_prob * 0.5, 0.5)
+
+        n_blocks = N // block_size
+        n_remainder = N % block_size
+
+        block_mask = torch.rand(B, n_blocks, device=device) < block_prob
+        time_mask = block_mask.unsqueeze(-1).expand(-1, -1, block_size).reshape(B, n_blocks * block_size)
+        if n_remainder > 0:
+            remainder_mask = torch.rand(B, 1, device=device) < block_prob
+            remainder_mask = remainder_mask.expand(-1, n_remainder)
+            time_mask = torch.cat([time_mask, remainder_mask], dim=-1)
+
+        # Expand to all channels: (B, N) → (B, N*C) = (B, L)
+        token_mask_r1 = time_mask.unsqueeze(-1).expand(-1, -1, C).reshape(B, L)
+
+        # Apply round 1
+        mask_tok = self.mask_token.expand_as(x)
+        mask_float = token_mask_r1.unsqueeze(-1).float()
+        x = x * (1 - mask_float) + mask_tok * mask_float
+
+        # ══════════════════════════════════════════════════════════════
+        # ROUND 2: Channel masking — strategy depends on channel count
+        # ══════════════════════════════════════════════════════════════
+        if C >= 8:
+            # Many channels: use correlation chain (seed → partner → partner's partner)
+            # This masks ~40-50% of channels — correlated groups together.
+            num_seed = max(1, math.ceil(seed_prob * C))
+            shuffle = torch.argsort(torch.rand(B, C, device=device), dim=-1)
+            seeds = shuffle[:, :num_seed]
+
+            corr_clean = corr.clone()
+            corr_clean.diagonal(dim1=-2, dim2=-1).zero_()
+            best_match = corr_clean.argmax(dim=-1)
+
+            partners = best_match.gather(dim=-1, index=seeds)
+            partners_partners = best_match.gather(dim=-1, index=partners)
+
+            chan_mask = torch.zeros(B, C, device=device, dtype=torch.bool)
+            chan_mask.scatter_(dim=-1, index=seeds, value=True)
+            chan_mask.scatter_(dim=-1, index=partners, value=True)
+            chan_mask.scatter_(dim=-1, index=partners_partners, value=True)
+        else:
+            # Few channels (C=3 for BCI 2b: C3, Cz, C4):
+            # Mask exactly 1 random channel per sample.
+            # Why not random patches? Because the spatial axis has only 3 tokens —
+            # masking must be structured to create a meaningful cross-channel task.
+            # The model must learn: C3↔C4 anti-correlation during lateralized
+            # motor imagery, Cz as baseline — exactly the structure that matters
+            # for downstream BCI classification.
+            # Fraction masked: 1/C (33% for C=3) — conservative, keeps
+            # cross-region at block_prob/3 ≈ 8-10%.
+            chan_idx = torch.randint(0, C, (B,), device=device)  # (B,)
+            chan_mask = torch.zeros(B, C, device=device, dtype=torch.bool)
+            chan_mask.scatter_(1, chan_idx.unsqueeze(1), True)
+
+        # Expand channel mask to all timesteps: (B, C) → (B, N, C) → (B, L)
+        token_mask_r2 = chan_mask.unsqueeze(1).expand(-1, N, -1).reshape(B, L)
+
+        # Apply round 2 (only to tokens NOT already masked in round 1)
+        new_masks = token_mask_r2 & ~token_mask_r1
+        new_float = new_masks.unsqueeze(-1).float()
+        x = x * (1 - new_float) + mask_tok * new_float
+
+        combined_mask = token_mask_r1 | new_masks
+        return x, combined_mask
+
     def encoder_forward(self, x, channel_list):
         B, C, T = x.shape
         device = x.device
         channel_list = torch.tensor(channel_list, dtype=torch.long, device=device) if not isinstance(channel_list, torch.Tensor) else channel_list.to(device)
 
         # ── Compute per-sample channel correlation from RAW EEG ──
-        # Only needed when correlation-aware masking is enabled.
+        # Needed for correlation-aware masking or combined block+corr masking.
         # The correlation matrix is the same geometric object that
         # the Riemannian attention branch operates on (covariance → SPD).
-        if self.use_corr_masking:
+        if self.use_corr_masking or self.mask_strategy == 'block_corr':
             with torch.no_grad():
                 x_centered = x - x.mean(dim=-1, keepdim=True)          # (B, C, T)
                 x_normed = x_centered / (x_centered.std(dim=-1, keepdim=True) + 1e-8)
@@ -346,7 +535,13 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             x += tp
 
         # ── Masking ──
-        if self.use_corr_masking:
+        # Strategies: 'random' (BERT), 'block' (temporal blocks),
+        #             'corr' (correlation chains), 'block_corr' (combined)
+        if self.mask_strategy == 'block_corr':
+            x, mask = self.mask_block_corr(x, corr, C)
+        elif self.mask_strategy == 'block':
+            x, mask = self.mask_temporal_block(x, C)
+        elif self.use_corr_masking or self.mask_strategy == 'corr':
             x, mask = self.mask_corr_channels(x, corr, C)
         else:
             x, mask = self.mask_bert(x)
@@ -365,6 +560,35 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
 
         return x, mask
 
+    def _encode_features(self, eeg, channel_list):
+        """Run encoder WITHOUT masking — returns normalized features.
+        Used for online diagnostic metrics during validation."""
+        B, C, T = eeg.shape
+        device = eeg.device
+        channel_list = torch.tensor(channel_list, dtype=torch.long, device=device) \
+            if not isinstance(channel_list, torch.Tensor) else channel_list.to(device)
+
+        x = self.patch(eeg)
+        N = x.shape[1]
+        L = N * C
+        x = x.reshape(B, L, -1)
+
+        if channel_list.dim() == 1:
+            channel_list = channel_list.unsqueeze(0).expand(B, -1)
+        chan_id = channel_list.unsqueeze(1).repeat(1, N, 1).view(B, L)
+        x = x + self.channel_embedding_e(chan_id)
+
+        if not self.use_rope:
+            seq_idx = torch.arange(N, device=device)
+            eeg_seq = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
+            x = x + self.temporal_embedding_e(eeg_seq)
+
+        channel_idx = channel_list[0]
+        for layer in self.encoder:
+            x = layer(x, C, channel_idx=channel_idx)
+
+        return self.norm_enc(x)
+
     def forward(self, eeg, channel_list):
         pred, mask = self.encoder_forward(eeg, channel_list)
         target, pad = self.patchify_1d(eeg, self.patch_size)
@@ -374,8 +598,31 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, unbiased=False, keepdim=True)
             target = (target - mean) / (var + 1.e-6)**.5
+
+        # ── Time-domain reconstruction loss ──
         loss_per_patch = ((pred - target) ** 2).mean(dim=-1)
-        loss = (loss_per_patch * mask).sum() / mask.sum().clamp_min(1.0)
+        loss_time = (loss_per_patch * mask).sum() / mask.sum().clamp_min(1.0)
+
+        # ── Spectral auxiliary loss ──
+        # Forces the encoder to represent frequency content explicitly.
+        # Per-patch FFT: 16 samples → 9 frequency bins (0, 8, 16, ..., 64 Hz).
+        # Log-magnitude for better dynamic range (small spectral differences
+        # at low power levels matter for EEG band features).
+        if self.spectral_loss_weight > 0:
+            pred_spec = torch.fft.rfft(pred, dim=-1).abs()    # (B, L, P//2+1)
+            tgt_spec  = torch.fft.rfft(target, dim=-1).abs()  # (B, L, P//2+1)
+            # Log1p for numerical stability and to compress dynamic range
+            spec_loss_per_patch = (
+                (torch.log1p(pred_spec) - torch.log1p(tgt_spec)) ** 2
+            ).mean(dim=-1)
+            loss_spec = (spec_loss_per_patch * mask).sum() / mask.sum().clamp_min(1.0)
+            loss = loss_time + self.spectral_loss_weight * loss_spec
+            # Store for logging in training_step
+            self._last_loss_time = loss_time.detach()
+            self._last_loss_spec = loss_spec.detach()
+        else:
+            loss = loss_time
+
         return loss, pred, mask
 
     def patchify_1d(self, x, patch_size: int):
@@ -446,6 +693,11 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         mask_ratio = mask.float().mean()
         self.log("mask_ratio", mask_ratio, on_step=False, on_epoch=True, prog_bar=True)
 
+        # Log spectral vs time loss components (when spectral loss is active)
+        if self.spectral_loss_weight > 0 and hasattr(self, '_last_loss_time'):
+            self.log("loss_time", self._last_loss_time, on_step=False, on_epoch=True)
+            self.log("loss_spec", self._last_loss_spec, on_step=False, on_epoch=True)
+
         # Log the learned head scales across layers for analysis
         for i, layer in enumerate(self.encoder):
             # Spatial Riemannian bias head scales (Contribution 1: score bias α_h)
@@ -514,6 +766,134 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             {"val_mse": mse, "val_rmse": rmse, "val_pred_std": pred_std},
             prog_bar=True, on_step=False, on_epoch=True
         )
+
+        # ════════════════════════════════════════════════════════════
+        # DIAGNOSTIC METRICS — early warning signals for feature quality
+        # These let you judge in 5 epochs whether the model is learning
+        # the right features, without waiting for downstream evaluation.
+        # ════════════════════════════════════════════════════════════
+
+        # ── 1. Per-frequency-band reconstruction quality ──
+        # Decompose MSE into low-freq (0-16Hz) and high-freq (16-64Hz).
+        # If the model only learns amplitude, low-freq MSE drops fast
+        # but high-freq stays high. Good features → both improve.
+        target_raw, _ = self.patchify_1d(data, self.patch_size)
+        B, Seq, Ch, P = target_raw.shape
+        target_flat = target_raw.view(B, Seq * Ch, P)
+
+        with torch.no_grad():
+            pred_fft = torch.fft.rfft(pred, dim=-1).abs()    # (B, L, P//2+1)
+            tgt_fft = torch.fft.rfft(target_flat, dim=-1).abs()
+            spec_mse = (pred_fft - tgt_fft) ** 2              # (B, L, P//2+1)
+
+            # Split: bins 0-1 = 0-16Hz (low), bins 2+ = 16-64Hz (high)
+            # At 128Hz / patch_size=16: freq_resolution = 8Hz per bin
+            low_mse = (spec_mse[..., :2] * mask.unsqueeze(-1)).sum() / mask.sum().clamp_min(1.0) / 2
+            high_mse = (spec_mse[..., 2:] * mask.unsqueeze(-1)).sum() / mask.sum().clamp_min(1.0) / (P//2 - 1)
+
+            self.log("val_mse_freq_low", low_mse, on_step=False, on_epoch=True)
+            self.log("val_mse_freq_high", high_mse, on_step=False, on_epoch=True)
+
+        # ── 2. Temporal attention structure ──
+        # Entropy of temporal attention weights. Low entropy = peaked/local
+        # (model learned temporal structure). High entropy = uniform
+        # (temporal branch not learning). Track per-layer.
+        # Only compute every 5 batches to limit overhead.
+        if batch_idx % 5 == 0:
+            with torch.no_grad():
+                # Run a forward pass through encoder to capture attention
+                x_diag = self.patch(data)
+                N_diag = x_diag.shape[1]
+                C_diag = x_diag.shape[2]
+                L_diag = N_diag * C_diag
+                x_diag = x_diag.reshape(B, L_diag, -1)
+
+                # Add channel embeddings
+                ch_list = channel_list
+                if not isinstance(ch_list, torch.Tensor):
+                    ch_list = torch.tensor(ch_list, dtype=torch.long, device=data.device)
+                if ch_list.dim() == 1:
+                    ch_list = ch_list.unsqueeze(0).expand(B, -1)
+                chan_id = ch_list.unsqueeze(1).repeat(1, N_diag, 1).view(B, L_diag)
+                x_diag = x_diag + self.channel_embedding_e(chan_id)
+
+                if not self.use_rope:
+                    seq_idx = torch.arange(N_diag, device=data.device)
+                    eeg_seq = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C_diag).view(B, L_diag)
+                    x_diag = x_diag + self.temporal_embedding_e(eeg_seq)
+
+                # Forward through first and last encoder layer, capture temporal scores
+                channel_idx = ch_list[0]
+                for li, layer in enumerate(self.encoder):
+                    if li in (0, len(self.encoder) - 1):
+                        # Compute temporal attention scores for this layer
+                        attn = layer.attn
+                        x_n = layer.norm1(x_diag)
+                        H = attn.num_heads
+                        H2 = attn.heads_per_branch
+                        d = attn.dim_head
+
+                        qkv = attn.qkv(x_n).reshape(B, L_diag, 3, H, d).permute(2, 0, 3, 1, 4)
+                        q, k = qkv[0], qkv[1]
+                        q_t = q[:, :H2]
+                        k_t = k[:, :H2]
+
+                        q_t = q_t.reshape(B, H2, N_diag, C_diag, d)
+                        k_t = k_t.reshape(B, H2, N_diag, C_diag, d)
+                        # Average across channels for efficiency
+                        q_t_avg = q_t.mean(dim=3)  # (B, H2, N, d)
+                        k_t_avg = k_t.mean(dim=3)
+
+                        if hasattr(attn, 'temporal_rope') and attn.use_rope:
+                            # RoPE expects (BC, H, N, d) — here B acts as the BC dim
+                            q_t_avg, k_t_avg = attn.temporal_rope(q_t_avg, k_t_avg)
+
+                        scores = (q_t_avg @ k_t_avg.transpose(-2, -1)) / (d ** 0.5)
+                        attn_w = scores.softmax(dim=-1)  # (B, H2, N, N)
+
+                        # Entropy: -sum(p * log(p))
+                        entropy = -(attn_w * (attn_w + 1e-10).log()).sum(dim=-1).mean()
+                        max_entropy = math.log(N_diag)  # uniform distribution entropy
+                        norm_entropy = entropy / max_entropy  # 0=peaked, 1=uniform
+
+                        # Locality: fraction of attention on nearest 3 positions
+                        diag_mask = torch.zeros(N_diag, N_diag, device=data.device)
+                        for offset in range(-1, 2):
+                            diag_mask += torch.diag(torch.ones(N_diag - abs(offset),
+                                                    device=data.device), offset)
+                        locality = (attn_w * diag_mask.unsqueeze(0).unsqueeze(0)).sum(dim=-1).mean()
+
+                        tag = "first" if li == 0 else "last"
+                        self.log(f"val_attn_entropy_{tag}", norm_entropy,
+                                 on_step=False, on_epoch=True)
+                        self.log(f"val_attn_locality_{tag}", locality,
+                                 on_step=False, on_epoch=True)
+
+                    x_diag = layer(x_diag, C_diag, channel_idx=channel_idx)
+
+        # ── 3. Feature sensitivity to temporal shuffle ──
+        # Online version of the temporal diagnostic.
+        # Run every 10 batches: shuffle temporal order, compare features.
+        # Cosine < 0.95 = model uses temporal structure (good).
+        if batch_idx % 10 == 0:
+            with torch.no_grad():
+                # Get features from normal input
+                feat_normal = self._encode_features(data, channel_list)
+                # Shuffle temporal order
+                B_s, C_s, T_s = data.shape
+                perm = torch.randperm(T_s // self.patch_size, device=data.device)
+                # Reshape to patches, shuffle, reshape back
+                data_patched = data.reshape(B_s, C_s, -1, self.patch_size)
+                data_shuffled = data_patched[:, :, perm, :].reshape(B_s, C_s, T_s)
+                feat_shuffled = self._encode_features(data_shuffled, channel_list)
+
+                # Cosine similarity
+                cos_sim = F.cosine_similarity(
+                    feat_normal.reshape(B_s, -1),
+                    feat_shuffled.reshape(B_s, -1),
+                    dim=-1
+                ).mean()
+                self.log("val_shuffle_cosine", cos_sim, on_step=False, on_epoch=True)
 
 
 if __name__ == "__main__":

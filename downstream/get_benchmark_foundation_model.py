@@ -185,14 +185,15 @@ def build_riemann_loss(num_classes, checkpoint_path, num_channels, data_length, 
 
 def build_riemann_transformer_para(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
     """Adaptive Riemannian parallel transformer (Padé log map + geometric cross-channel mixing)."""
-    # Pass through Luna flags from kwargs if present
-    luna_kwargs = {}
-    for key in ('use_luna_temporal', 'luna_num_slots', 'luna_start_layer', 'luna_spd_beta_init'):
+    # Pass through Luna and RoPE flags from kwargs if present
+    extra_kwargs = {}
+    for key in ('use_luna_temporal', 'luna_num_slots', 'luna_start_layer', 'luna_spd_beta_init',
+                'use_rope', 'rope_freq_min', 'rope_freq_max', 'rope_learnable'):
         if key in kwargs:
-            luna_kwargs[key] = kwargs[key]
+            extra_kwargs[key] = kwargs[key]
     model = DownstreamRiemannTransformerPara(
         num_classes=num_classes, checkpoint_path=checkpoint_path,
-        **luna_kwargs,
+        **extra_kwargs,
     )
     return model
 
@@ -1165,6 +1166,18 @@ def main():
         help="ToME-style token merging: total number of temporal token pairs to merge, "
              "distributed evenly across encoder layers. 0 = disabled (default).",
     )
+    parser.add_argument(
+        "--use_rope", action="store_true", default=False,
+        help="Use Rotary Position Embedding instead of sinusoidal temporal PE.",
+    )
+    parser.add_argument(
+        "--rope_learnable", action="store_true", default=True,
+        help="Learnable EEG-RoPE frequencies (default). Use --no_rope_learnable for standard RoPE.",
+    )
+    parser.add_argument(
+        "--no_rope_learnable", action="store_true", default=False,
+        help="Use standard RoPE with fixed geometric frequencies (ablation).",
+    )
 
     args = parser.parse_args()
 
@@ -1208,6 +1221,7 @@ def main():
     )
 
     # ── Build model ──
+    rope_learnable = not args.no_rope_learnable
     builder = MODEL_BUILDERS[args.model]
     model = builder(
         num_classes=ds_cfg["num_classes"],
@@ -1219,6 +1233,8 @@ def main():
         config_yaml=ds_cfg["config_yaml"],
         log_mode=args.log_mode,
         merge_k=args.merge_k,
+        use_rope=args.use_rope,
+        rope_learnable=rope_learnable,
     )
 
     print(f"\n{'='*60}")

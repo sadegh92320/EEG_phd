@@ -22,7 +22,7 @@ from analysis.embedding_vs_bias import run_embedding_vs_bias
 
 def run(checkpoint_path, data_path="downstream/data/bci_comp_2a",
         config_path="MAE_pretraining/info_dataset/bci_comp_2a.yaml",
-        num_layers=8, batch_size=32, max_batches=None):
+        num_layers=8, batch_size=32, max_batches=None, use_rope=False):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -36,6 +36,7 @@ def run(checkpoint_path, data_path="downstream/data/bci_comp_2a",
         depth_e=8,
         patch_size=16,
         num_classes=4,
+        use_rope=use_rope,
     )
     model.to(device)
     model.eval()
@@ -83,6 +84,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_layers", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--max_batches", type=int, default=None)
+    parser.add_argument("--use_rope", action="store_true", default=False,
+                        help="Build encoder with EEG-RoPE (must match pretrained checkpoint).")
     args = parser.parse_args()
 
     run(
@@ -92,4 +95,5 @@ if __name__ == "__main__":
         num_layers=args.num_layers,
         batch_size=args.batch_size,
         max_batches=args.max_batches,
+        use_rope=args.use_rope,
     )

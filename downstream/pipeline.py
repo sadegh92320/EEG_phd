@@ -156,7 +156,10 @@ class Pipeline:
                      learn_mu_reference=True,
                      use_luna_temporal=False, luna_num_slots=16,
                      luna_start_layer=2, luna_spd_beta_init=0.0,
-                     use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0):
+                     use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
+                     rope_learnable=True,
+                     mask_strategy='random', mask_prob=0.5, mask_block_size=4,
+                     norm_pix_loss=False, spectral_loss_weight=0.0):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
@@ -176,10 +179,16 @@ class Pipeline:
             2. approx (S-I)                               → log_mode='approx'
             3. pade                                       → log_mode='pade'
             4. pade + MAD normalization                   → + use_global_norm=True, clamp_channels=True
-            5. pade + MAD + mu centering                  → + learn_mu_reference=True
-            6. pade + Luna temporal (no SPD)              → + use_luna_temporal=True, luna_spd_beta_init=0
-            7. pade + Luna temporal + SPD prototypes      → + use_luna_temporal=True, luna_spd_beta_init=0 (β learns)
-            8. (negative) pade + MAD + Fréchet reference  → documented failure
+            5. pade + MAD + mu centering (C1)             → + learn_mu_reference=True
+            6. C1 + EEG-RoPE (50% random)                → + use_rope=True (positional shortcut — fails downstream)
+            7. C1 + EEG-RoPE + block+chan masking          → + mask_strategy='block_corr', mask_prob=0.5
+               Block masking (temporal) + 1-chan masking (spatial). RoPE enables
+               temporal branch → corr masking now feasible (failed without RoPE).
+               norm_pix_loss=True removes amplitude bias, spectral_loss pushes
+               frequency features. Two-hop cross-branch flow via shared residual.
+            8. (negative) C1 + corr masking (no RoPE)     → too hard, temporal branch useless
+            9. (negative) C1 + EEG-RoPE (50% random)     → positional shortcut, downstream -10%
+            10.(negative) pade + MAD + Fréchet reference  → documented failure
 
         Args:
             pretrain:            if True, train from scratch; else load existing ckpt
@@ -240,6 +249,12 @@ class Pipeline:
                     use_rope=use_rope,
                     rope_freq_min=rope_freq_min,
                     rope_freq_max=rope_freq_max,
+                    rope_learnable=rope_learnable,
+                    mask_strategy=mask_strategy,
+                    mask_prob=mask_prob,
+                    mask_block_size=mask_block_size,
+                    norm_pix_loss=norm_pix_loss,
+                    spectral_loss_weight=spectral_loss_weight,
                 )
                 # Override log_mode in every encoder layer if needed
                 if log_mode == 'approx':
@@ -261,7 +276,15 @@ class Pipeline:
                 if use_luna_temporal:
                     run_name += f"-luna{luna_num_slots}"
                 if use_rope:
-                    run_name += "-rope"
+                    run_name += "-ropeeg" if rope_learnable else "-rope"
+                if mask_strategy != 'random':
+                    run_name += f"-{mask_strategy}"
+                if mask_prob != 0.5:
+                    run_name += f"-m{int(mask_prob*100)}"
+                if norm_pix_loss:
+                    run_name += "-npx"
+                if spectral_loss_weight > 0:
+                    run_name += f"-spec{spectral_loss_weight}"
 
             ckpt_callback = ModelCheckpoint(
                     dirpath=CKPT_DIR,
@@ -295,6 +318,13 @@ class Pipeline:
                 "luna_num_slots": luna_num_slots,
                 "luna_start_layer": luna_start_layer,
                 "luna_spd_beta_init": luna_spd_beta_init,
+                "mask_strategy": mask_strategy,
+                "mask_prob": mask_prob,
+                "mask_block_size": mask_block_size,
+                "use_rope": use_rope,
+                "rope_learnable": rope_learnable,
+                "norm_pix_loss": norm_pix_loss,
+                "spectral_loss_weight": spectral_loss_weight,
             })
 
             callbacks = [TQDMProgressBar(refresh_rate=20), ckpt_callback]

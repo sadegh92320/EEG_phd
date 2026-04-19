@@ -647,6 +647,7 @@ class DownstreamRiemannTransformerPara(Downstream):
         self._use_rope = kwargs.pop("use_rope", False)
         self._rope_freq_min = kwargs.pop("rope_freq_min", 0.5)
         self._rope_freq_max = kwargs.pop("rope_freq_max", 50.0)
+        self._rope_learnable = kwargs.pop("rope_learnable", True)
         if aggregation == "class":
             raise ValueError(
                 "DownstreamRiemannTransformerPara does not use a [CLS] token. "
@@ -664,6 +665,7 @@ class DownstreamRiemannTransformerPara(Downstream):
         use_rope = getattr(self, '_use_rope', False)
         rope_freq_min = getattr(self, '_rope_freq_min', 0.5)
         rope_freq_max = getattr(self, '_rope_freq_max', 50.0)
+        rope_learnable = getattr(self, '_rope_learnable', True)
         return nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
@@ -675,6 +677,7 @@ class DownstreamRiemannTransformerPara(Downstream):
                 use_rope=use_rope,
                 rope_freq_min=rope_freq_min,
                 rope_freq_max=rope_freq_max,
+                rope_learnable=rope_learnable,
             ) for i in range(depth_e)
         ])
 

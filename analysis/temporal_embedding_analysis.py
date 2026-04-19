@@ -53,19 +53,39 @@ def run_temporal_analysis(model, dataloader, device, num_layers=None,
     print("TEMPORAL EMBEDDING ANALYSIS")
     print("=" * 70)
 
-    # Get temporal embedding values for typical sequence length
-    # The temporal embedding is sinusoidal with shape (1, max_len, D)
-    temp_emb = model.temporal_embedding
-    pe_buffer = temp_emb.pe  # (1, max_len, D)
-
-    # For a typical 6s window at 128Hz with patch_size=16: N=48
-    N_typical = 48
-    pe_slice = pe_buffer[0, :N_typical, :]  # (N, D)
-    pe_norm = pe_slice.norm(dim=-1).mean().item()
+    # Check if model uses RoPE
+    has_rope = any(
+        hasattr(encoder[l].attn, 'use_rope') and encoder[l].attn.use_rope
+        for l in range(n_layers)
+    )
 
     print(f"\nPart 1: Embedding Magnitude")
     print("-" * 40)
-    print(f"   Temporal embed norm (avg over {N_typical} positions): {pe_norm:.4f}")
+
+    if has_rope:
+        print("   Temporal position: RoPE (rotary, no additive embedding)")
+        print("   Sinusoidal PE is unused — magnitude analysis not applicable")
+        # Show learned RoPE frequencies instead
+        for l in range(n_layers):
+            if hasattr(encoder[l].attn, 'temporal_rope'):
+                rope = encoder[l].attn.temporal_rope
+                dt = 16.0 / 128.0
+                freqs = rope.omega.detach() / (2.0 * 3.14159 * dt)
+                print(f"   Layer {l} RoPE freq: mean={freqs.mean():.2f} Hz, "
+                      f"min={freqs.min():.2f}, max={freqs.max():.2f}, "
+                      f"std={freqs.std():.2f}")
+        pe_norm = 0.0  # no additive PE contribution
+    else:
+        # Get temporal embedding values for typical sequence length
+        # The temporal embedding is sinusoidal with shape (1, max_len, D)
+        temp_emb = model.temporal_embedding
+        pe_buffer = temp_emb.pe  # (1, max_len, D)
+
+        # For a typical 6s window at 128Hz with patch_size=16: N=48
+        N_typical = 48
+        pe_slice = pe_buffer[0, :N_typical, :]  # (N, D)
+        pe_norm = pe_slice.norm(dim=-1).mean().item()
+        print(f"   Temporal embed norm (avg over {N_typical} positions): {pe_norm:.4f}")
 
     # ══════════════════════════════════════════════════════════
     # Part 2: Forward pass analysis — temporal attention patterns
@@ -110,6 +130,10 @@ def run_temporal_analysis(model, dataloader, device, num_layers=None,
                 k_t = k[:, :H2]
                 q_t_r = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=C)
                 k_t_r = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=C)
+
+                # Apply RoPE rotation if present (must match actual forward)
+                if hasattr(attn_ref, 'use_rope') and attn_ref.use_rope:
+                    q_t_r, k_t_r = attn_ref.temporal_rope(q_t_r, k_t_r)
 
                 # Temporal attention scores (before softmax)
                 with torch.amp.autocast('cuda', enabled=False), \
@@ -178,16 +202,17 @@ def run_temporal_analysis(model, dataloader, device, num_layers=None,
                     chan_id = cl.unsqueeze(1).repeat(1, N, 1).view(B, L)
                     chan_emb = model.channel_embedding(chan_id)
 
-                    # Temporal embedding
-                    seq_idx = torch.arange(0, N, device=device).unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
-                    temp_emb_val = model.temporal_embedding(seq_idx)
-
                     patch_norm_val = x_flat.norm(dim=-1).mean().item()
                     chan_norm_val = chan_emb.norm(dim=-1).mean().item()
-                    temp_norm_val = temp_emb_val.norm(dim=-1).mean().item()
 
-                    full_token = x_flat + chan_emb + temp_emb_val
-                    full_norm_val = full_token.norm(dim=-1).mean().item()
+                    if has_rope:
+                        # RoPE: no additive temporal embedding
+                        temp_norm_val = 0.0
+                    else:
+                        # Sinusoidal PE: measure its norm
+                        seq_idx = torch.arange(0, N, device=device).unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
+                        temp_emb_val = model.temporal_embedding(seq_idx)
+                        temp_norm_val = temp_emb_val.norm(dim=-1).mean().item()
 
                 magnitude_collected = True
 
@@ -234,24 +259,39 @@ def run_temporal_analysis(model, dataloader, device, num_layers=None,
 
             temporal_attn_storage.clear()
 
-            # ── Pass 2: Counterfactual — zero temporal embedding ──
-            # Temporarily replace temporal embedding forward
-            original_temp_forward = model.temporal_embedding.forward
+            # ── Pass 2: Counterfactual — remove temporal position info ──
+            # For sinusoidal PE: zero the additive embedding
+            # For RoPE: temporarily disable the rotation
+            has_rope = any(
+                hasattr(encoder[l].attn, 'use_rope') and encoder[l].attn.use_rope
+                for l in range(n_layers)
+            )
 
-            def zero_temporal(seq_indices):
-                batch_size, seq_len = seq_indices.shape
-                return torch.zeros(batch_size, seq_len,
-                                   model.temporal_embedding.pe.shape[-1],
-                                   device=seq_indices.device)
-
-            model.temporal_embedding.forward = zero_temporal
+            if has_rope:
+                # Disable RoPE rotation across all layers
+                for l in range(n_layers):
+                    encoder[l].attn.use_rope = False
+            else:
+                # Zero the additive sinusoidal PE
+                original_temp_forward = model.temporal_embedding.forward
+                def zero_temporal(seq_indices):
+                    batch_size, seq_len = seq_indices.shape
+                    return torch.zeros(batch_size, seq_len,
+                                       model.temporal_embedding.pe.shape[-1],
+                                       device=seq_indices.device)
+                model.temporal_embedding.forward = zero_temporal
 
             try:
                 _ = model(eeg, channel_ids)
             except Exception:
                 pass
 
-            model.temporal_embedding.forward = original_temp_forward
+            # Restore
+            if has_rope:
+                for l in range(n_layers):
+                    encoder[l].attn.use_rope = True
+            else:
+                model.temporal_embedding.forward = original_temp_forward
 
             # Compare attention patterns
             for l in range(n_layers):
@@ -277,14 +317,25 @@ def run_temporal_analysis(model, dataloader, device, num_layers=None,
     print()
     print("Part 1: Embedding Magnitudes (L2 norm)")
     print("-" * 50)
-    print(f"   Patch embedding:    {patch_norm_val:.4f}")
-    print(f"   Channel embedding:  {chan_norm_val:.4f}")
-    print(f"   Temporal embedding: {temp_norm_val:.4f}")
-    total_components = patch_norm_val + chan_norm_val + temp_norm_val
-    if total_components > 0:
-        print(f"   Temporal fraction:  {temp_norm_val / total_components * 100:.1f}%")
-        print(f"   Channel fraction:   {chan_norm_val / total_components * 100:.1f}%")
-        print(f"   Patch fraction:     {patch_norm_val / total_components * 100:.1f}%")
+    if has_rope:
+        print("   Temporal position: RoPE (rotary, applied in attention — no additive embedding)")
+        print(f"   Patch embedding:    {patch_norm_val:.4f}")
+        print(f"   Channel embedding:  {chan_norm_val:.4f}")
+        print(f"   Temporal embedding: 0.0000 (RoPE — not additive)")
+        total_components = patch_norm_val + chan_norm_val
+        if total_components > 0:
+            print(f"   Temporal fraction:  0.0%")
+            print(f"   Channel fraction:   {chan_norm_val / total_components * 100:.1f}%")
+            print(f"   Patch fraction:     {patch_norm_val / total_components * 100:.1f}%")
+    else:
+        print(f"   Patch embedding:    {patch_norm_val:.4f}")
+        print(f"   Channel embedding:  {chan_norm_val:.4f}")
+        print(f"   Temporal embedding: {temp_norm_val:.4f}")
+        total_components = patch_norm_val + chan_norm_val + temp_norm_val
+        if total_components > 0:
+            print(f"   Temporal fraction:  {temp_norm_val / total_components * 100:.1f}%")
+            print(f"   Channel fraction:   {chan_norm_val / total_components * 100:.1f}%")
+            print(f"   Patch fraction:     {patch_norm_val / total_components * 100:.1f}%")
 
     print()
     print("Part 2: Temporal Attention Structure per Layer")

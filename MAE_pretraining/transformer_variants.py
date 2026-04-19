@@ -32,35 +32,46 @@ class EEGRoPE(nn.Module):
         freq_min:  minimum initialization frequency in Hz (default: 0.5 = delta)
         freq_max:  maximum initialization frequency in Hz (default: 50.0 = low gamma)
     """
-    def __init__(self, dim, freq_min=0.5, freq_max=50.0):
+    def __init__(self, dim, freq_min=0.5, freq_max=50.0, learnable=True):
         super().__init__()
         assert dim % 2 == 0, f"RoPE dim must be even, got {dim}"
         n_pairs = dim // 2
+        self.learnable = learnable
 
-        # Initialize ω as radians per token step, log-uniform over EEG range.
-        # We store raw ω (radians/step) as the learnable parameter.
-        # At 128Hz, patch_size=16: one step = 0.125s, so ω = 2π·f·dt.
-        # But since dt is constant and ω is learnable, we just initialize
-        # to span a reasonable range and let the model adjust.
-        #
-        # Convert [freq_min, freq_max] Hz to radians/step assuming dt ≈ 0.125s
-        # (128Hz, patch_size=16). This is just for initialization — the model
-        # learns the actual values.
-        dt_approx = 16.0 / 128.0  # 0.125 seconds per token step
-        omega_min = 2.0 * math.pi * freq_min * dt_approx  # ~0.39 rad/step
-        omega_max = 2.0 * math.pi * freq_max * dt_approx   # ~39.3 rad/step
+        if learnable:
+            # EEG-RoPE: learnable ω initialized log-uniform over EEG range.
+            # Convert [freq_min, freq_max] Hz to radians/step assuming dt ≈ 0.125s
+            # (128Hz, patch_size=16). This is just for initialization — the model
+            # learns the actual values.
+            dt_approx = 16.0 / 128.0  # 0.125 seconds per token step
+            omega_min = 2.0 * math.pi * freq_min * dt_approx  # ~0.39 rad/step
+            omega_max = 2.0 * math.pi * freq_max * dt_approx   # ~39.3 rad/step
 
-        # Log-uniform initialization
-        log_omega = torch.linspace(
-            math.log(omega_min), math.log(omega_max), n_pairs
-        )
-        omega_init = torch.exp(log_omega)
-
-        self.omega = nn.Parameter(omega_init)  # (n_pairs,)
+            log_omega = torch.linspace(
+                math.log(omega_min), math.log(omega_max), n_pairs
+            )
+            omega_init = torch.exp(log_omega)
+            self.omega = nn.Parameter(omega_init)  # (n_pairs,)
+        else:
+            # Standard RoPE: fixed geometric series ω_i = 1/10000^(2i/d)
+            # Same formula as in "Attention Is All You Need" / RoFormer.
+            omega_init = 1.0 / (10000.0 ** (torch.arange(0, n_pairs).float() / n_pairs))
+            self.register_buffer('omega', omega_init)  # (n_pairs,) — NOT learned
 
     def forward(self, q, k):
         """
         Apply rotary embedding to temporal Q and K.
+
+        RoPE is applied to ALL positions (masked and visible alike).
+        Position information is essential for reconstruction — the model
+        must know WHERE to reconstruct. The shortcut prevention comes
+        from the masking strategy (block masking), not from modifying RoPE.
+
+        Note: We considered mask-aware RoPE (skipping rotation for masked
+        positions) but this creates an absolute-position bias: unrotated
+        Q attending to rotated K produces scores that depend on absolute
+        position j rather than relative distance (j-i). This biases
+        mask token attention toward early positions — strictly worse.
 
         Args:
             q: (B*C, H, N, d) temporal queries
@@ -1591,7 +1602,8 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
                  learn_mu_reference=True,
                  use_luna_temporal=False, luna_num_slots=16,
                  luna_spd_beta_init=0.0,
-                 use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0):
+                 use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
+                 rope_learnable=True):
         super().__init__()
         assert num_heads % 2 == 0, "num_heads must be even for parallel split"
         assert embed_dim % num_heads == 0
@@ -1612,12 +1624,15 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.att_dropout = att_dropout
 
-        # EEG-adapted RoPE for temporal heads (per-layer learnable frequencies)
+        # RoPE for temporal heads
+        # learnable=True  → EEG-RoPE (frequencies init on EEG bands, learned)
+        # learnable=False → Standard RoPE (fixed geometric series like LLMs)
         if use_rope:
             self.temporal_rope = EEGRoPE(
                 dim=self.dim_head,
                 freq_min=rope_freq_min,
                 freq_max=rope_freq_max,
+                learnable=rope_learnable,
             )
 
         # Adaptive Riemannian bias for spatial heads
@@ -1699,6 +1714,9 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
 
         # EEG-RoPE: inject relative temporal position via rotation
         # Applied BEFORE attention (standard or Luna) so both paths benefit.
+        # RoPE rotates ALL positions (including masked tokens) — the model
+        # needs position info for reconstruction. Shortcut prevention comes
+        # from the masking STRATEGY (block masking), not from modifying RoPE.
         if self.use_rope:
             q_t, k_t = self.temporal_rope(q_t, k_t)
 
@@ -1791,7 +1809,8 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
                  learn_mu_reference=True,
                  use_luna_temporal=False, luna_num_slots=16,
                  luna_spd_beta_init=0.0,
-                 use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0):
+                 use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
+                 rope_learnable=True):
         super().__init__()
 
         self.attn = AdaptiveRiemannianParallelAttention(
@@ -1814,6 +1833,7 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
             use_rope=use_rope,
             rope_freq_min=rope_freq_min,
             rope_freq_max=rope_freq_max,
+            rope_learnable=rope_learnable,
         )
 
         self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
