@@ -875,29 +875,53 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
 
                     x_diag = layer(x_diag, C_diag, channel_idx=channel_idx)
 
-        # ── 3. Feature sensitivity to temporal shuffle ──
-        # Online version of the temporal diagnostic.
-        # Run once per epoch (first batch only) — two encoder forward passes.
-        # Cosine < 0.95 = model uses temporal structure (good).
+        # ── 3. Online temporal diagnostic ──
+        # Mirrors the offline temporal_importance_diagnostic.py so you can
+        # compare directly with C1 results (shuffle=0.994, constant=0.725,
+        # channel_only=0.811) and C1+RoPE (shuffle=0.996, constant=0.477,
+        # channel_only=0.556).
+        # Runs once per epoch (batch_idx==0): 4 encoder forward passes.
+        # ~10-15s overhead per epoch.
         if batch_idx == 0:
             with torch.no_grad():
-                # Get features from normal input
-                feat_normal = self._encode_features(data, channel_list)
-                # Shuffle temporal order
                 B_s, C_s, T_s = data.shape
+                feat_normal = self._encode_features(data, channel_list)
+                feat_flat = feat_normal.reshape(B_s, -1)
+
+                # ── Shuffle: randomize temporal order of patches ──
+                # Tests if model uses temporal ORDER.
+                # C1: 0.994, C1+RoPE: 0.996 (no effect = model ignores order)
                 perm = torch.randperm(T_s // self.patch_size, device=data.device)
-                # Reshape to patches, shuffle, reshape back
                 data_patched = data.reshape(B_s, C_s, -1, self.patch_size)
                 data_shuffled = data_patched[:, :, perm, :].reshape(B_s, C_s, T_s)
                 feat_shuffled = self._encode_features(data_shuffled, channel_list)
-
-                # Cosine similarity
-                cos_sim = F.cosine_similarity(
-                    feat_normal.reshape(B_s, -1),
-                    feat_shuffled.reshape(B_s, -1),
-                    dim=-1
+                cos_shuffle = F.cosine_similarity(
+                    feat_flat, feat_shuffled.reshape(B_s, -1), dim=-1
                 ).mean()
-                self.log("val_shuffle_cosine", cos_sim, on_step=False, on_epoch=True)
+                self.log("val_shuffle_cosine", cos_shuffle, on_step=False, on_epoch=True)
+
+                # ── Constant: replace all patches with channel mean ──
+                # Tests if model uses temporal CONTENT.
+                # C1: 0.725, C1+RoPE: 0.477 (lower = stronger content dependence)
+                chan_mean = data.mean(dim=-1, keepdim=True).expand_as(data)
+                feat_const = self._encode_features(chan_mean, channel_list)
+                cos_const = F.cosine_similarity(
+                    feat_flat, feat_const.reshape(B_s, -1), dim=-1
+                ).mean()
+                self.log("val_constant_cosine", cos_const, on_step=False, on_epoch=True)
+
+                # ── Channel-only: keep channel identity, remove temporal variation ──
+                # Each patch replaced by the channel's global mean patch.
+                # Tests if model uses temporal VARIATION.
+                # C1: 0.811, C1+RoPE: 0.556
+                data_patched_co = data.reshape(B_s, C_s, -1, self.patch_size)
+                mean_patch = data_patched_co.mean(dim=2, keepdim=True)  # (B, C, 1, P)
+                data_chanonly = mean_patch.expand_as(data_patched_co).reshape(B_s, C_s, T_s)
+                feat_chanonly = self._encode_features(data_chanonly, channel_list)
+                cos_chanonly = F.cosine_similarity(
+                    feat_flat, feat_chanonly.reshape(B_s, -1), dim=-1
+                ).mean()
+                self.log("val_chanonly_cosine", cos_chanonly, on_step=False, on_epoch=True)
 
 
 if __name__ == "__main__":
