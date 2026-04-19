@@ -801,9 +801,9 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         # ── 2. Temporal attention structure ──
         # Entropy of temporal attention weights. Low entropy = peaked/local
         # (model learned temporal structure). High entropy = uniform
-        # (temporal branch not learning). Track per-layer.
-        # Only compute every 5 batches to limit overhead.
-        if batch_idx % 5 == 0:
+        # (temporal branch not learning). Track first and last layer.
+        # Only compute on first validation batch per epoch (cheap enough).
+        if batch_idx == 0:
             with torch.no_grad():
                 # Run a forward pass through encoder to capture attention
                 x_diag = self.patch(data)
@@ -877,9 +877,9 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
 
         # ── 3. Feature sensitivity to temporal shuffle ──
         # Online version of the temporal diagnostic.
-        # Run every 10 batches: shuffle temporal order, compare features.
+        # Run once per epoch (first batch only) — two encoder forward passes.
         # Cosine < 0.95 = model uses temporal structure (good).
-        if batch_idx % 10 == 0:
+        if batch_idx == 0:
             with torch.no_grad():
                 # Get features from normal input
                 feat_normal = self._encode_features(data, channel_list)
