@@ -923,6 +923,21 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 ).mean()
                 self.log("val_chanonly_cosine", cos_chanonly, on_step=False, on_epoch=True)
 
+                # ── Channel shuffle: permute channel assignments ──
+                # Tests if model uses SPATIAL (cross-channel) structure.
+                # If spatial branch learned good features, shuffling which
+                # channel each patch belongs to should destroy features (low cosine).
+                # High cosine = spatial branch not contributing much.
+                chan_perm = torch.randperm(C_s, device=data.device)
+                data_chan_shuffled = data[:, chan_perm, :]
+                # Also permute channel_list to match shuffled data
+                chan_list_shuffled = [ch[chan_perm] for ch in channel_list]
+                feat_chan_shuffled = self._encode_features(data_chan_shuffled, chan_list_shuffled)
+                cos_chan_shuffle = F.cosine_similarity(
+                    feat_flat, feat_chan_shuffled.reshape(B_s, -1), dim=-1
+                ).mean()
+                self.log("val_chan_shuffle_cosine", cos_chan_shuffle, on_step=False, on_epoch=True)
+
 
 if __name__ == "__main__":
     seed_everything(42)
