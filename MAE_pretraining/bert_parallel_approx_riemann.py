@@ -931,7 +931,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 chan_perm = torch.randperm(C_s, device=data.device)
                 data_chan_shuffled = data[:, chan_perm, :]
                 # Also permute channel_list to match shuffled data
-                chan_list_shuffled = [ch[chan_perm] for ch in channel_list]
+                chan_list_shuffled = torch.stack([ch[chan_perm] for ch in channel_list])
                 feat_chan_shuffled = self._encode_features(data_chan_shuffled, chan_list_shuffled)
                 cos_chan_shuffle = F.cosine_similarity(
                     feat_flat, feat_chan_shuffled.reshape(B_s, -1), dim=-1
