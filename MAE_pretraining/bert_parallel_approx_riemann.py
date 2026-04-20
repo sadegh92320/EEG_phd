@@ -133,7 +133,8 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                  use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
                  rope_learnable=True,
                  spectral_loss_weight=0.0,
-                 mask_strategy='random', mask_block_size=4):
+                 mask_strategy='random', mask_block_size=4,
+                 use_brain_state_injection=False, brain_state_beta_init=0.05):
         super().__init__()
 
         self.config = config
@@ -142,6 +143,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         self.use_corr_masking = use_corr_masking
         self.use_luna_temporal = use_luna_temporal
         self.use_rope = use_rope
+        self.use_brain_state_injection = use_brain_state_injection
 
         # Adaptive Riemannian parallel transformer layers
         # log_mode='pade' → Padé [1,1] approximant: log(S) ≈ 2(S-I)(I+S)^{-1}
@@ -160,6 +162,8 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 rope_freq_min=rope_freq_min,
                 rope_freq_max=rope_freq_max,
                 rope_learnable=rope_learnable,
+                use_brain_state_injection=use_brain_state_injection,
+                brain_state_beta_init=brain_state_beta_init,
             ) for i in range(depth_e)
         ])
 
@@ -738,6 +742,23 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 self.log(f"luna_proto_norm_std/layer_{i}", proto_norms.std(),
                          on_step=False, on_epoch=True)
 
+            # ── C2 v2: brain-state injection diagnostics ──
+            # Kill condition: grad_brain_proj norm should be > 1e-4 by epoch 5.
+            # If it stays near zero, the cooperation pathway is dead on arrival
+            # (the projection isn't receiving useful gradient from temporal loss).
+            if hasattr(layer.attn, 'brain_state_injection'):
+                bsi = layer.attn.brain_state_injection
+                beta_vec = bsi.beta.detach()
+                self.log(f"brain_beta_mean/layer_{i}", beta_vec.mean(),
+                         on_step=False, on_epoch=True)
+                self.log(f"brain_beta_max_abs/layer_{i}", beta_vec.abs().max(),
+                         on_step=False, on_epoch=True)
+                # Per-head β so we can see whether all heads specialize or only some use it
+                for h_idx in range(bsi.num_heads):
+                    self.log(f"brain_beta/layer_{i}_h{h_idx}",
+                             beta_vec[h_idx],
+                             on_step=False, on_epoch=True)
+
             # ── RoPE frequency logging ──
             if hasattr(layer.attn, 'temporal_rope'):
                 rope = layer.attn.temporal_rope
@@ -754,6 +775,28 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                          on_step=False, on_epoch=True)
 
         return loss
+
+    def on_after_backward(self):
+        """Log gradient norms for C2 v2 brain_state pathway.
+
+        Runs after loss.backward() but before optimizer.step()/zero_grad,
+        so .grad is still populated. We only log once per step (on the last
+        accumulated batch Lightning already handles this via training_step
+        calling order). Cheap: a few norm() calls.
+        """
+        if not self.use_brain_state_injection:
+            return
+        for i, layer in enumerate(self.encoder):
+            if hasattr(layer.attn, 'brain_state_injection'):
+                bsi = layer.attn.brain_state_injection
+                if bsi.proj.weight.grad is not None:
+                    self.log(f"grad_brain_proj/layer_{i}",
+                             bsi.proj.weight.grad.detach().norm(),
+                             on_step=False, on_epoch=True)
+                if bsi.beta.grad is not None:
+                    self.log(f"grad_brain_beta/layer_{i}",
+                             bsi.beta.grad.detach().norm(),
+                             on_step=False, on_epoch=True)
 
     def validation_step(self, batch, batch_idx):
         data, channel_list = batch

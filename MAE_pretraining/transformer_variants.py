@@ -1585,6 +1585,90 @@ class RiemannianLunaTemporalCompression(nn.Module):
         return out
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# C2 v2 — Geometric Brain-State Injection into Temporal Values
+# ─────────────────────────────────────────────────────────────────────────────
+# Explicit spatial→temporal branch cooperation. The branch-isolation diagnostic
+# showed that C1's combined separability (0.189 at epoch 40) grows almost
+# entirely through branch COOPERATION: spatial_only and temporal_only barely
+# change past epoch 15, but their combined representation does. This module
+# turns that emergent phenomenon into an architectural prior.
+#
+# Per timestep n:
+#   brain_state = mean_c(L_n @ x_space)       # geometry-mixed channel pool  (B*N, D)
+#   brain_emb   = Linear(D → d)(brain_state)  # project to head dim           (B*N, d)
+#   v_t[:,h,n,:] += β_h · brain_emb            # per-head gain injected into V_t
+#
+# Design choices that differentiate from the failed Luna-C2:
+#   - β init 0.05 (non-zero) AND live gradient path through x_space → the
+#     optimizer can move β from step 0, not after symmetry breaks by chance.
+#   - L_n is detached but x_space is NOT — C1 owns covariance training, C2
+#     shapes spatial features via temporal loss signal.
+#   - Per-head β — heads specialize; unused heads can shrink β → 0.
+#   - No new attention mechanism — temporal self-attention/RoPE untouched.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BrainStateInjection(nn.Module):
+    """
+    C2 v2 — Geometric brain-state injection into temporal values.
+
+    Args:
+        embed_dim:          Residual stream dimension D.
+        num_temporal_heads: Number of temporal heads H_t.
+        beta_init:          Initial per-head β (default 0.05).
+        proj_init_std:      std for Linear(D→d) weight init (default 0.01) —
+                            keeps initial injection magnitude ~1e-3 · ‖v‖,
+                            small enough not to disrupt C1 at epoch 0.
+    """
+
+    def __init__(self, embed_dim, num_temporal_heads, beta_init=0.05,
+                 proj_init_std=0.01):
+        super().__init__()
+        self.num_heads = num_temporal_heads
+        # Parallel half-split: temporal branch = half of embed_dim across H_t heads
+        self.dim_head = embed_dim // (2 * num_temporal_heads)
+
+        self.proj = nn.Linear(embed_dim, self.dim_head, bias=False)
+        nn.init.normal_(self.proj.weight, std=proj_init_std)
+
+        self.beta = nn.Parameter(torch.full((num_temporal_heads,), float(beta_init)))
+
+    def forward(self, L_n, x_space, v_t, B, C):
+        """
+        Args:
+            L_n:     (B*N, C, C)    tangent vectors from C1 — caller passes .detach()
+            x_space: (B*N, C, D)    spatial-reshaped residual stream (masked ch zeroed)
+            v_t:     (B*C, H, N, d) temporal values in parallel-split layout
+            B:       batch size
+            C:       number of channels
+
+        Returns:
+            v_t: (B*C, H, N, d) — augmented with β_h · brain_emb
+        """
+        BN, _, _ = x_space.shape
+        N = BN // B
+        H = self.num_heads
+        d = self.dim_head
+
+        # Geometry-mix channels: L_n @ x_space → (B*N, C, D)
+        # Dtype: promote L_n to x_space dtype so mixed precision is consistent.
+        mixed = torch.bmm(L_n.to(x_space.dtype), x_space)
+
+        # Channel pool: (B*N, D)
+        brain_state = mixed.mean(dim=1)
+
+        # Project to head dim: (B*N, d)
+        brain_emb = self.proj(brain_state)
+
+        # Reshape for broadcast into v_t (B*C, H, N, d)
+        # brain_emb: (B, 1, 1, N, d) × β_h: (1, 1, H, 1, 1) → (B, C, H, N, d) via broadcast
+        brain_emb = brain_emb.view(B, 1, 1, N, d)
+        v_t_shaped = rearrange(v_t, '(b c) h n d -> b c h n d', c=C)
+        beta_h = self.beta.view(1, 1, H, 1, 1).to(v_t_shaped.dtype)
+        v_t_shaped = v_t_shaped + beta_h * brain_emb.to(v_t_shaped.dtype)
+        return rearrange(v_t_shaped, 'b c h n d -> (b c) h n d')
+
+
 class AdaptiveRiemannianParallelAttention(nn.Module):
     """
     Parallel spatial-temporal attention with Riemannian spatial bias (C1).
@@ -1592,6 +1676,9 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
     4 temporal heads + 4 spatial heads, shared QKV.
     Spatial heads get additive Riemannian bias: score += α_h · log(S)
     Temporal heads are standard (no bias).
+
+    Optional C2 v2: brain-state injection into temporal values
+    (use_brain_state_injection=True).
     """
     def __init__(self, embed_dim, num_heads=8, total_channels=TOTAL_GLOBAL_CHANNELS,
                  dropout=0.1, att_dropout=0.1, spd_eps=1e-5,
@@ -1603,7 +1690,8 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
                  use_luna_temporal=False, luna_num_slots=16,
                  luna_spd_beta_init=0.0,
                  use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
-                 rope_learnable=True):
+                 rope_learnable=True,
+                 use_brain_state_injection=False, brain_state_beta_init=0.05):
         super().__init__()
         assert num_heads % 2 == 0, "num_heads must be even for parallel split"
         assert embed_dim % num_heads == 0
@@ -1616,6 +1704,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.use_value_bias = use_value_bias
         self.use_luna_temporal = use_luna_temporal
         self.use_rope = use_rope
+        self.use_brain_state_injection = use_brain_state_injection
 
         # Shared QKV projection
         self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
@@ -1665,6 +1754,15 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         if use_value_bias:
             self.value_beta = nn.Parameter(torch.zeros(self.heads_per_branch))
 
+        # C2 v2: brain-state injection into temporal values.
+        # Built separately from Luna — complementary, not alternative.
+        if use_brain_state_injection:
+            self.brain_state_injection = BrainStateInjection(
+                embed_dim=embed_dim,
+                num_temporal_heads=self.heads_per_branch,
+                beta_init=brain_state_beta_init,
+            )
+
     def forward(self, x_norm, num_chan, residual=None, channel_idx=None,
                 mask=None):
         """
@@ -1711,6 +1809,20 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=C)
         k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=C)
         v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=C)
+
+        # C2 v2: geometric brain-state injection into temporal values.
+        # Applied BEFORE RoPE (RoPE only rotates Q/K, V is untouched anyway).
+        # L_n is detached — C1 owns covariance training, C2 consumes its output.
+        # x_space keeps its gradient path — spatial features get a temporal-loss
+        # signal that encourages them to be useful for cross-branch cooperation.
+        if self.use_brain_state_injection:
+            v_t = self.brain_state_injection(
+                L_n=L_n.detach(),
+                x_space=x_space,
+                v_t=v_t,
+                B=B,
+                C=C,
+            )
 
         # EEG-RoPE: inject relative temporal position via rotation
         # Applied BEFORE attention (standard or Luna) so both paths benefit.
@@ -1810,7 +1922,8 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
                  use_luna_temporal=False, luna_num_slots=16,
                  luna_spd_beta_init=0.0,
                  use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
-                 rope_learnable=True):
+                 rope_learnable=True,
+                 use_brain_state_injection=False, brain_state_beta_init=0.05):
         super().__init__()
 
         self.attn = AdaptiveRiemannianParallelAttention(
@@ -1834,6 +1947,8 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
             rope_freq_min=rope_freq_min,
             rope_freq_max=rope_freq_max,
             rope_learnable=rope_learnable,
+            use_brain_state_injection=use_brain_state_injection,
+            brain_state_beta_init=brain_state_beta_init,
         )
 
         self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
