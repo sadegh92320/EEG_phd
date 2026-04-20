@@ -45,7 +45,7 @@ def extract_features(model, dataloader, device, mode="normal", max_batches=20):
     all_labels = []
 
     def ablation_hook(module, input, output):
-        """output: (B, N, C, D) — modify temporal dim N."""
+        """output: (B, N, C, D) — modify temporal dim N or channel dim C."""
         if mode == "normal":
             return output
         B, N, C, D = output.shape
@@ -61,6 +61,13 @@ def extract_features(model, dataloader, device, mode="normal", max_batches=20):
             return output[:, :1].expand(-1, N, -1, -1).contiguous()
         elif mode == "channel_only":
             return output.mean(dim=1, keepdim=True).expand(-1, N, -1, -1).contiguous()
+        elif mode == "channel_shuffle":
+            # Permute channel dim — tests if spatial (cross-channel) structure matters
+            out = output.clone()
+            for b in range(B):
+                perm = torch.randperm(C, device=output.device)
+                out[b] = output[b, :, perm, :]
+            return out
         return output
 
     handle = model.patch.register_forward_hook(ablation_hook)
@@ -160,7 +167,7 @@ def run_diagnostic(checkpoint_path, data_path="downstream/data/bci_comp_2a",
     feat_normal, labels = extract_features(model, test_loader, device,
                                             mode="normal", max_batches=max_batches)
 
-    conditions = ["shuffle", "reverse", "constant", "channel_only"]
+    conditions = ["shuffle", "reverse", "constant", "channel_only", "channel_shuffle"]
     results = {}
 
     for cond in conditions:
@@ -254,7 +261,14 @@ def run_diagnostic(checkpoint_path, data_path="downstream/data/bci_comp_2a",
     print("GUIDE:")
     print("   Cosine ~1.0  = ablation doesn't change features = model ignores that info")
     print("   Cosine <0.95 = ablation changes features = model uses that info")
-    print("   Shuffle tests ORDER, Constant tests CONTENT, Channel-only tests VARIATION")
+    print("   Shuffle tests temporal ORDER, Constant tests CONTENT, Channel-only tests VARIATION")
+    print("   Channel-shuffle tests SPATIAL structure (low = spatial branch is working)")
+    print()
+    print("   SPATIAL QUALITY CHECK:")
+    print("   Compare channel_shuffle across models:")
+    print("     C1 should be LOW (spatial is all it has)")
+    print("     C1+RoPE(random) may be HIGHER (spatial branch coasted)")
+    print("     C1+RoPE(block_corr) should match C1 (both branches active)")
     print()
     print("   Higher class separability = better linear probe accuracy (typically)")
     print()
