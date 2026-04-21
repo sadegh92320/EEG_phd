@@ -422,7 +422,11 @@ def build_labram(num_classes, checkpoint_path, num_channels, data_length, **kwar
             if ch_low in labram_lower:
                 labram_channel_idx.append(labram_lower.index(ch_low) + 1)
             else:
-                print(f"  [LaBraM] WARNING: channel '{ch}' not found in LaBraM montage, skipping")
+                # Unknown channel — assign fallback positional embedding (first electrode position)
+                # so tensor dimensions stay consistent. The embedding will be suboptimal for these
+                # channels but avoids a shape mismatch crash.
+                labram_channel_idx.append(1)
+                print(f"  [LaBraM] WARNING: channel '{ch}' not in montage, using fallback embedding")
 
         input_chans_tensor = torch.tensor(labram_channel_idx, dtype=torch.long)
         # Register as buffer so it moves to GPU with model.to(device)

@@ -134,7 +134,8 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                  rope_learnable=True,
                  spectral_loss_weight=0.0,
                  mask_strategy='random', mask_block_size=4,
-                 use_brain_state_injection=False, brain_state_beta_init=0.05):
+                 use_brain_state_injection=False, brain_state_beta_init=0.05,
+                 use_mean_pool_temporal=False):
         super().__init__()
 
         self.config = config
@@ -144,6 +145,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         self.use_luna_temporal = use_luna_temporal
         self.use_rope = use_rope
         self.use_brain_state_injection = use_brain_state_injection
+        self.use_mean_pool_temporal = use_mean_pool_temporal
 
         # Adaptive Riemannian parallel transformer layers
         # log_mode='pade' → Padé [1,1] approximant: log(S) ≈ 2(S-I)(I+S)^{-1}
@@ -164,6 +166,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 rope_learnable=rope_learnable,
                 use_brain_state_injection=use_brain_state_injection,
                 brain_state_beta_init=brain_state_beta_init,
+                use_mean_pool_temporal=use_mean_pool_temporal,
             ) for i in range(depth_e)
         ])
 
@@ -846,7 +849,8 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         # (model learned temporal structure). High entropy = uniform
         # (temporal branch not learning). Track first and last layer.
         # Only compute on first validation batch per epoch (cheap enough).
-        if batch_idx == 0:
+        # Skip when temporal branch is mean-pool: no attention weights to log.
+        if batch_idx == 0 and not self.use_mean_pool_temporal:
             with torch.no_grad():
                 # Run a forward pass through encoder to capture attention
                 x_diag = self.patch(data)

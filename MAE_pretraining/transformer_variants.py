@@ -1691,7 +1691,8 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
                  luna_spd_beta_init=0.0,
                  use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
                  rope_learnable=True,
-                 use_brain_state_injection=False, brain_state_beta_init=0.05):
+                 use_brain_state_injection=False, brain_state_beta_init=0.05,
+                 use_mean_pool_temporal=False):
         super().__init__()
         assert num_heads % 2 == 0, "num_heads must be even for parallel split"
         assert embed_dim % num_heads == 0
@@ -1705,9 +1706,31 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.use_luna_temporal = use_luna_temporal
         self.use_rope = use_rope
         self.use_brain_state_injection = use_brain_state_injection
+        self.use_mean_pool_temporal = use_mean_pool_temporal
 
-        # Shared QKV projection
-        self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
+        # Run 2-clean: temporal branch uses mean-pool, not attention.
+        # → Q_t and K_t are unused. Shrink QKV projection to save params.
+        # Also disable temporal-attention-specific features (RoPE, Luna, BSI)
+        # because they would operate on a now-unused pathway.
+        if use_mean_pool_temporal:
+            assert not use_rope, \
+                "use_mean_pool_temporal=True is incompatible with use_rope " \
+                "(RoPE rotates Q_t/K_t which are no longer computed)"
+            assert not use_luna_temporal, \
+                "use_mean_pool_temporal=True is incompatible with use_luna_temporal " \
+                "(Luna replaces temporal SDPA; mean-pool already replaces it)"
+            assert not use_brain_state_injection, \
+                "use_mean_pool_temporal=True is incompatible with " \
+                "use_brain_state_injection (BSI augments V_t before temporal SDPA; " \
+                "mean-pool of an augmented V_t is equivalent to mean-pool of V_t " \
+                "plus a per-channel DC shift, which is absorbed into LayerNorm)"
+            # QKV output = Q_s (half_dim) + K_s (half_dim) + V (full embed_dim)
+            # = 2 * embed_dim total (vs 3 * embed_dim in baseline).
+            # Saves D² params per layer.
+            self.qkv = nn.Linear(embed_dim, 2 * embed_dim)
+        else:
+            # Shared QKV projection
+            self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
         # Output projection
         self.fc = nn.Linear(embed_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
@@ -1798,54 +1821,87 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         )
 
         # ── Shared QKV ──
-        qkv = self.qkv(x_norm).reshape(B, L, 3, H, d).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        q_t, q_s = q[:, :H2], q[:, H2:]
-        k_t, k_s = k[:, :H2], k[:, H2:]
-        v_t, v_s = v[:, :H2], v[:, H2:]
-
-        # ── Temporal attention ──
-        q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=C)
-        k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=C)
-        v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=C)
-
-        # C2 v2: geometric brain-state injection into temporal values.
-        # Applied BEFORE RoPE (RoPE only rotates Q/K, V is untouched anyway).
-        # L_n is detached — C1 owns covariance training, C2 consumes its output.
-        # x_space keeps its gradient path — spatial features get a temporal-loss
-        # signal that encourages them to be useful for cross-branch cooperation.
-        if self.use_brain_state_injection:
-            v_t = self.brain_state_injection(
-                L_n=L_n.detach(),
-                x_space=x_space,
-                v_t=v_t,
-                B=B,
-                C=C,
-            )
-
-        # EEG-RoPE: inject relative temporal position via rotation
-        # Applied BEFORE attention (standard or Luna) so both paths benefit.
-        # RoPE rotates ALL positions (including masked tokens) — the model
-        # needs position info for reconstruction. Shortcut prevention comes
-        # from the masking STRATEGY (block masking), not from modifying RoPE.
-        if self.use_rope:
-            q_t, k_t = self.temporal_rope(q_t, k_t)
-
-        if self.use_luna_temporal:
-            # C2: Luna pack-process-unpack with SPD-biased packing
-            # L_n from C1's Riemannian bias is reused — zero extra cost
-            out_t = self.luna_temporal(
-                q_t, k_t, v_t,
-                L_n=L_n, channel_idx=channel_idx, C=C,
-            )
+        if self.use_mean_pool_temporal:
+            # Run 2-clean: QKV = [Q_s | K_s | V_all].
+            # Shape: (B, L, 2*D). Split sizes: half_dim, half_dim, embed_dim.
+            qkv = self.qkv(x_norm)
+            hd = self.half_dim
+            q_s = qkv[..., :hd].reshape(B, L, H2, d).permute(0, 2, 1, 3)
+            k_s = qkv[..., hd:2 * hd].reshape(B, L, H2, d).permute(0, 2, 1, 3)
+            v  = qkv[..., 2 * hd:].reshape(B, L, H,  d).permute(0, 2, 1, 3)
+            v_t, v_s = v[:, :H2], v[:, H2:]
+            # Q_t and K_t do not exist — temporal branch never uses them.
         else:
-            # Standard N×N temporal self-attention
-            out_t = F.scaled_dot_product_attention(
-                q_t, k_t, v_t,
-                dropout_p=self.att_dropout if self.training else 0.0,
-            )
-        out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=C)
+            qkv = self.qkv(x_norm).reshape(B, L, 3, H, d).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+
+            q_t, q_s = q[:, :H2], q[:, H2:]
+            k_t, k_s = k[:, :H2], k[:, H2:]
+            v_t, v_s = v[:, :H2], v[:, H2:]
+
+        # ── Temporal branch ──
+        if self.use_mean_pool_temporal:
+            # Mean-pool across time, per (batch, channel, head).
+            # Layout: v_t is (B, H_t, L=N*C, d). Group N along time axis:
+            #   → (B*C, H_t, N, d), pool over N, broadcast back.
+            #
+            # Mask-aware pooling: when a patch (b, c, t) is masked, its V entry
+            # is still the mask-token's V (a learned constant). Including it in
+            # the mean would leak "how many patches are masked" through the
+            # magnitude of the pooled vector. Exclude masked positions.
+            v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=C)
+            if mask is not None:
+                mask_t = rearrange(mask, 'b (n c) -> (b c) n', c=C)  # True=masked
+                valid = (~mask_t).to(v_t.dtype).unsqueeze(1).unsqueeze(-1)  # (B*C,1,N,1)
+                v_t_sum = (v_t * valid).sum(dim=2, keepdim=True)
+                denom = valid.sum(dim=2, keepdim=True).clamp_min(1.0)
+                v_t_pool = v_t_sum / denom
+            else:
+                v_t_pool = v_t.mean(dim=2, keepdim=True)
+            out_t = v_t_pool.expand_as(v_t)
+            out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=C)
+        else:
+            # ── Temporal attention (baseline) ──
+            q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=C)
+            k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=C)
+            v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=C)
+
+            # C2 v2: geometric brain-state injection into temporal values.
+            # Applied BEFORE RoPE (RoPE only rotates Q/K, V is untouched anyway).
+            # L_n is detached — C1 owns covariance training, C2 consumes its output.
+            # x_space keeps its gradient path — spatial features get a temporal-loss
+            # signal that encourages them to be useful for cross-branch cooperation.
+            if self.use_brain_state_injection:
+                v_t = self.brain_state_injection(
+                    L_n=L_n.detach(),
+                    x_space=x_space,
+                    v_t=v_t,
+                    B=B,
+                    C=C,
+                )
+
+            # EEG-RoPE: inject relative temporal position via rotation
+            # Applied BEFORE attention (standard or Luna) so both paths benefit.
+            # RoPE rotates ALL positions (including masked tokens) — the model
+            # needs position info for reconstruction. Shortcut prevention comes
+            # from the masking STRATEGY (block masking), not from modifying RoPE.
+            if self.use_rope:
+                q_t, k_t = self.temporal_rope(q_t, k_t)
+
+            if self.use_luna_temporal:
+                # C2: Luna pack-process-unpack with SPD-biased packing
+                # L_n from C1's Riemannian bias is reused — zero extra cost
+                out_t = self.luna_temporal(
+                    q_t, k_t, v_t,
+                    L_n=L_n, channel_idx=channel_idx, C=C,
+                )
+            else:
+                # Standard N×N temporal self-attention
+                out_t = F.scaled_dot_product_attention(
+                    q_t, k_t, v_t,
+                    dropout_p=self.att_dropout if self.training else 0.0,
+                )
+            out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=C)
 
         # ── Spatial attention (Riemannian-biased) ──
         q_s = rearrange(q_s, 'b h (n c) d -> (b n) h c d', c=C)
@@ -1923,7 +1979,8 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
                  luna_spd_beta_init=0.0,
                  use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
                  rope_learnable=True,
-                 use_brain_state_injection=False, brain_state_beta_init=0.05):
+                 use_brain_state_injection=False, brain_state_beta_init=0.05,
+                 use_mean_pool_temporal=False):
         super().__init__()
 
         self.attn = AdaptiveRiemannianParallelAttention(
@@ -1949,6 +2006,7 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
             rope_learnable=rope_learnable,
             use_brain_state_injection=use_brain_state_injection,
             brain_state_beta_init=brain_state_beta_init,
+            use_mean_pool_temporal=use_mean_pool_temporal,
         )
 
         self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()

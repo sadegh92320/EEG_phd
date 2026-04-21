@@ -160,7 +160,8 @@ class Pipeline:
                      rope_learnable=True,
                      mask_strategy='random', mask_prob=0.5, mask_block_size=4,
                      norm_pix_loss=False, spectral_loss_weight=0.0,
-                     use_brain_state_injection=False, brain_state_beta_init=0.05):
+                     use_brain_state_injection=False, brain_state_beta_init=0.05,
+                     use_mean_pool_temporal=False):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
@@ -258,6 +259,7 @@ class Pipeline:
                     spectral_loss_weight=spectral_loss_weight,
                     use_brain_state_injection=use_brain_state_injection,
                     brain_state_beta_init=brain_state_beta_init,
+                    use_mean_pool_temporal=use_mean_pool_temporal,
                 )
                 # Override log_mode in every encoder layer if needed
                 if log_mode == 'approx':
@@ -282,6 +284,8 @@ class Pipeline:
                     run_name += "-ropeeg" if rope_learnable else "-rope"
                 if use_brain_state_injection:
                     run_name += f"-bsi{brain_state_beta_init}"
+                if use_mean_pool_temporal:
+                    run_name += "-tpool"
                 if mask_strategy != 'random':
                     run_name += f"-{mask_strategy}"
                 if mask_prob != 0.5:
@@ -332,6 +336,7 @@ class Pipeline:
                 "spectral_loss_weight": spectral_loss_weight,
                 "use_brain_state_injection": use_brain_state_injection,
                 "brain_state_beta_init": brain_state_beta_init,
+                "use_mean_pool_temporal": use_mean_pool_temporal,
             })
 
             callbacks = [TQDMProgressBar(refresh_rate=20), ckpt_callback]

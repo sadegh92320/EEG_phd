@@ -648,6 +648,9 @@ class DownstreamRiemannTransformerPara(Downstream):
         self._rope_freq_min = kwargs.pop("rope_freq_min", 0.5)
         self._rope_freq_max = kwargs.pop("rope_freq_max", 50.0)
         self._rope_learnable = kwargs.pop("rope_learnable", True)
+        # Run 2: replace temporal SDPA with mean-pool over time (V-pool mixer).
+        # Q_t / K_t projections are dropped — QKV shrinks from D→3D to D→2D.
+        self._use_mean_pool_temporal = kwargs.pop("use_mean_pool_temporal", False)
         if aggregation == "class":
             raise ValueError(
                 "DownstreamRiemannTransformerPara does not use a [CLS] token. "
@@ -666,6 +669,7 @@ class DownstreamRiemannTransformerPara(Downstream):
         rope_freq_min = getattr(self, '_rope_freq_min', 0.5)
         rope_freq_max = getattr(self, '_rope_freq_max', 50.0)
         rope_learnable = getattr(self, '_rope_learnable', True)
+        use_mean_pool_temporal = getattr(self, '_use_mean_pool_temporal', False)
         return nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
@@ -678,6 +682,7 @@ class DownstreamRiemannTransformerPara(Downstream):
                 rope_freq_min=rope_freq_min,
                 rope_freq_max=rope_freq_max,
                 rope_learnable=rope_learnable,
+                use_mean_pool_temporal=use_mean_pool_temporal,
             ) for i in range(depth_e)
         ])
 
