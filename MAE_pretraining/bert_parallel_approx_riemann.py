@@ -135,7 +135,8 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                  spectral_loss_weight=0.0,
                  mask_strategy='random', mask_block_size=4,
                  use_brain_state_injection=False, brain_state_beta_init=0.05,
-                 use_mean_pool_temporal=False):
+                 use_mean_pool_temporal=False,
+                 use_spatial_only=False):
         super().__init__()
 
         self.config = config
@@ -146,6 +147,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         self.use_rope = use_rope
         self.use_brain_state_injection = use_brain_state_injection
         self.use_mean_pool_temporal = use_mean_pool_temporal
+        self.use_spatial_only = use_spatial_only
 
         # Adaptive Riemannian parallel transformer layers
         # log_mode='pade' → Padé [1,1] approximant: log(S) ≈ 2(S-I)(I+S)^{-1}
@@ -167,6 +169,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 use_brain_state_injection=use_brain_state_injection,
                 brain_state_beta_init=brain_state_beta_init,
                 use_mean_pool_temporal=use_mean_pool_temporal,
+                use_spatial_only=use_spatial_only,
             ) for i in range(depth_e)
         ])
 
@@ -532,26 +535,73 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         chan_embedding = self.channel_embedding_e(chan_id)
         x += chan_embedding
 
-        # Temporal embeddings
-        # When RoPE is enabled, skip additive temporal PE — position is injected
-        # via rotation inside the temporal attention (no magnitude imbalance).
-        if not self.use_rope:
+        # ── Spatial-only vs default additive-PE path ──
+        # Default path: add PE + chan_emb to ALL tokens BEFORE masking. The mask
+        #   substitution then wipes both for masked positions — they're replaced
+        #   by a bare mask_token. The model recovers position/channel info via
+        #   attention context from unmasked neighbours.
+        #
+        # Spatial-only path (Run 3): restructure so unmasked tokens stay clean
+        #   (content + chan_emb only, NO sinusoidal contamination of spatial Q/K)
+        #   and masked tokens carry explicit position + channel after substitution.
+        #   This fixes two problems at once:
+        #     (a) 79.3% sinusoidal token-magnitude dominance observed in the
+        #         temporal-attention diagnostic no longer applies — the only
+        #         tokens with PE are the ones that actually need it for target
+        #         disambiguation during reconstruction.
+        #     (b) Masked positions now carry chan_emb[c] + PE(t), so a
+        #         fully-masked time slot is no longer a set of identical
+        #         mask_tokens — spatial attention can distinguish channels.
+        if self.use_spatial_only:
+            # Mask FIRST (this wipes chan_emb on masked positions — we'll restore below).
+            if self.mask_strategy == 'block_corr':
+                x, mask = self.mask_block_corr(x, corr, C)
+            elif self.mask_strategy == 'block':
+                x, mask = self.mask_temporal_block(x, C)
+            elif self.use_corr_masking or self.mask_strategy == 'corr':
+                x, mask = self.mask_corr_channels(x, corr, C)
+            else:
+                x, mask = self.mask_bert(x)
+
+            # Re-add chan_emb AND add PE on masked positions only.
+            # Unmasked positions keep their original (content + chan_emb) — no PE.
             seq_idx = torch.arange(0, N, device=device, dtype=torch.long)
             eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
             tp = self.temporal_embedding_e(eeg_seq_indices)
-            x += tp
+            mask_f = mask.unsqueeze(-1).to(x.dtype)
+            x = x + (chan_embedding + tp) * mask_f
 
-        # ── Masking ──
-        # Strategies: 'random' (BERT), 'block' (temporal blocks),
-        #             'corr' (correlation chains), 'block_corr' (combined)
-        if self.mask_strategy == 'block_corr':
-            x, mask = self.mask_block_corr(x, corr, C)
-        elif self.mask_strategy == 'block':
-            x, mask = self.mask_temporal_block(x, C)
-        elif self.use_corr_masking or self.mask_strategy == 'corr':
-            x, mask = self.mask_corr_channels(x, corr, C)
+            # One-shot sanity print: PE magnitude vs mask_token magnitude on masked positions.
+            # If ratio < 0.2, PE is drowned out and masked tokens at different time steps
+            # become near-indistinguishable → kill run and scale tp.
+            if not getattr(self, '_pe_check_done', False):
+                with torch.no_grad():
+                    pe_norm = (tp * mask_f).norm(dim=-1).sum().item() / max(mask_f.sum().item(), 1.0)
+                    mt_norm = self.mask_token.norm().item()
+                    ratio = pe_norm / max(mt_norm, 1e-8)
+                    print(f"[PE/mask_token check] PE_norm={pe_norm:.4f}  mask_token_norm={mt_norm:.4f}  ratio={ratio:.3f}")
+                self._pe_check_done = True
         else:
-            x, mask = self.mask_bert(x)
+            # Default path: PE added to all tokens before masking.
+            # When RoPE is enabled, skip additive temporal PE — position is injected
+            # via rotation inside the temporal attention (no magnitude imbalance).
+            if not self.use_rope:
+                seq_idx = torch.arange(0, N, device=device, dtype=torch.long)
+                eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
+                tp = self.temporal_embedding_e(eeg_seq_indices)
+                x += tp
+
+            # ── Masking ──
+            # Strategies: 'random' (BERT), 'block' (temporal blocks),
+            #             'corr' (correlation chains), 'block_corr' (combined)
+            if self.mask_strategy == 'block_corr':
+                x, mask = self.mask_block_corr(x, corr, C)
+            elif self.mask_strategy == 'block':
+                x, mask = self.mask_temporal_block(x, C)
+            elif self.use_corr_masking or self.mask_strategy == 'corr':
+                x, mask = self.mask_corr_channels(x, corr, C)
+            else:
+                x, mask = self.mask_bert(x)
 
         # Extract channel indices for the adaptive Riemannian reference
         channel_idx = channel_list[0]  # (C,) global channel indices
@@ -585,7 +635,10 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         chan_id = channel_list.unsqueeze(1).repeat(1, N, 1).view(B, L)
         x = x + self.channel_embedding_e(chan_id)
 
-        if not self.use_rope:
+        # Spatial-only: no mask in this path → no positions get PE (matches
+        # pretraining semantics where PE is gated on mask_f). Unmasked tokens
+        # during both training and inference stay in (content + chan_emb) space.
+        if not self.use_rope and not self.use_spatial_only:
             seq_idx = torch.arange(N, device=device)
             eeg_seq = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
             x = x + self.temporal_embedding_e(eeg_seq)

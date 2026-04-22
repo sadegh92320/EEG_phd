@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import copy
 import os
 import random
 import torch
@@ -127,7 +128,7 @@ DATASET_CONFIGS = {
         "data_path": "downstream/data/binocular",
         "config_yaml": "downstream/info_dataset/binocular.yaml",
         "num_channels": 64,
-        "data_length": 250,  # 1s * 250Hz (sliding window segments)
+        "data_length": 1250,  # 5s * 250Hz (sliding window segments)
         "sampling_rate": 250,
     },
     "seed_vig": {
@@ -164,6 +165,18 @@ DATASET_CONFIGS = {
         "data_length": 6000,  # 30s * 200Hz
         "sampling_rate": 200,
     },
+    "tuev": {
+        "num_classes": 6,
+        "metric": "bacc",
+        "model_path": "downstream/saved_models",
+        "result_output": "downstream/results",
+        "data_path": "downstream/data/tuev",
+        "config_yaml": "downstream/info_dataset/tuev.yaml",
+        "num_channels": 21,
+        "data_length": 1250,  # 5s * 250Hz
+        "sampling_rate": 250,
+        "pre_split": True,
+    },
 }
 
 
@@ -185,10 +198,12 @@ def build_riemann_loss(num_classes, checkpoint_path, num_channels, data_length, 
 
 def build_riemann_transformer_para(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
     """Adaptive Riemannian parallel transformer (Padé log map + geometric cross-channel mixing)."""
-    # Pass through Luna and RoPE flags from kwargs if present
+    # Pass through Luna, RoPE, and Run 2/3 temporal-branch flags from kwargs if present
     extra_kwargs = {}
     for key in ('use_luna_temporal', 'luna_num_slots', 'luna_start_layer', 'luna_spd_beta_init',
-                'use_rope', 'rope_freq_min', 'rope_freq_max', 'rope_learnable'):
+                'use_rope', 'rope_freq_min', 'rope_freq_max', 'rope_learnable',
+                'use_mean_pool_temporal', 'use_spatial_only', 'value_bias_layers',
+                'learn_mu_reference'):
         if key in kwargs:
             extra_kwargs[key] = kwargs[key]
     model = DownstreamRiemannTransformerPara(
@@ -980,8 +995,15 @@ def run_population(model, model_name, loader, config):
 def run_per_subject(model, model_name, loader, config):
     """Protocol 2 & 3: Per-subject self + transfer evaluation."""
     all_metrics = []
+    # Fresh init per fold — snapshot BEFORE loop so each subject starts
+    # from identical initial weights. Otherwise Trainer.__init__'s internal
+    # deepcopy(model.state_dict()) captures post-training weights from the
+    # previous iteration, contaminating all subjects after the first.
+    fresh_state = copy.deepcopy(model.state_dict())
     for pid in loader.participant_ids:
-        
+
+        model.load_state_dict(fresh_state)  # guarantee fresh init each subject
+
         train_sub, val_sub, test_sub = loader.per_subject(pid)
         transfer_test = loader.get_subject_transfer(pid)
 
@@ -1015,7 +1037,10 @@ def run_per_subject(model, model_name, loader, config):
 def run_loso_zero_shot(model, model_name, loader, config):
     """Protocol 4: Leave-one-subject-out zero-shot evaluation."""
     all_metrics = []
+    # Fresh init per fold — see comment in run_per_subject.
+    fresh_state = copy.deepcopy(model.state_dict())
     for pid in loader.participant_ids:
+        model.load_state_dict(fresh_state)  # guarantee fresh init each fold
         train_pop, val_pop = loader.get_loso_train_dataset(pid)
         test_sub = loader.get_full_subject_dataset(pid)
 
@@ -1048,7 +1073,10 @@ def run_loso_zero_shot(model, model_name, loader, config):
 def run_loso_fine_tune(model, model_name, loader, config):
     """Protocol 5: Leave-one-subject-out + per-subject fine-tuning."""
     all_metrics = []
+    # Fresh init per fold — see comment in run_per_subject.
+    fresh_state = copy.deepcopy(model.state_dict())
     for pid in loader.participant_ids:
+        model.load_state_dict(fresh_state)  # guarantee fresh init each fold
         train_pop, val_pop = loader.get_loso_train_dataset(pid)
         train_sub, val_sub, test_sub = loader.per_subject(pid)
 
@@ -1222,6 +1250,7 @@ def main():
         custom_dataset_class=Downstream_Dataset,
         norm_mode=norm_mode_key,
         base_sfreq=ds_cfg["sampling_rate"],
+        pre_split=ds_cfg.get("pre_split", False),
     )
 
     # ── Build model ──

@@ -15,6 +15,9 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+*.tex
+*.png
+*.md
 .pytest_cache/
 .mypy_cache/
 

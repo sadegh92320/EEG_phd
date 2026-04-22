@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import copy
 import os
 import random
 import torch
@@ -121,7 +122,7 @@ DATASET_CONFIGS = {
         "data_path": "downstream/data/binocular",
         "config_yaml": "downstream/info_dataset/binocular.yaml",
         "num_channels": 64,
-        "data_length": 250,  # 1s * 250Hz (sliding window segments)
+        "data_length": 1250,  # 5s * 250Hz (sliding window segments)
         "sampling_rate": 250,
     },
     "seed_vig": {
@@ -157,6 +158,18 @@ DATASET_CONFIGS = {
         "num_channels": 6,
         "data_length": 6000,  # 30s * 200Hz
         "sampling_rate": 200,
+    },
+    "tuev": {
+        "num_classes": 6,
+        "metric": "balanced_accuracy",
+        "model_path": "downstream/saved_models",
+        "result_output": "downstream/results",
+        "data_path": "downstream/data/tuev",
+        "config_yaml": "downstream/info_dataset/tuev.yaml",
+        "num_channels": 21,
+        "data_length": 1250,  # 5s * 250Hz
+        "sampling_rate": 250,
+        "pre_split": True,
     },
 }
 
@@ -259,7 +272,14 @@ def run_population(model, model_name, loader, config):
 def run_per_subject(model, model_name, loader, config):
     """Protocol 2 & 3: Per-subject self + transfer evaluation."""
     all_metrics = []
+    # Snapshot the fresh random init BEFORE the loop so every subject
+    # starts from identical initial weights. Without this, the model
+    # object is mutated by subject k's training and subject k+1 warm-
+    # starts from those post-training weights (Trainer.__init__ captures
+    # self.initial_state = deepcopy(model.state_dict()) only when built).
+    fresh_state = copy.deepcopy(model.state_dict())
     for pid in loader.participant_ids:
+        model.load_state_dict(fresh_state)  # guarantee fresh init each subject
         train_sub, val_sub, test_sub = loader.per_subject(pid)
         transfer_test = loader.get_subject_transfer(pid)
 
@@ -293,7 +313,10 @@ def run_per_subject(model, model_name, loader, config):
 def run_loso_zero_shot(model, model_name, loader, config):
     """Protocol 4: Leave-one-subject-out zero-shot evaluation."""
     all_metrics = []
+    # Fresh init per fold — see comment in run_per_subject.
+    fresh_state = copy.deepcopy(model.state_dict())
     for pid in loader.participant_ids:
+        model.load_state_dict(fresh_state)
         train_pop, val_pop = loader.get_loso_train_dataset(pid)
         test_sub = loader.get_full_subject_dataset(pid)
 
@@ -326,7 +349,10 @@ def run_loso_zero_shot(model, model_name, loader, config):
 def run_loso_fine_tune(model, model_name, loader, config):
     """Protocol 5: Leave-one-subject-out + per-subject fine-tuning."""
     all_metrics = []
+    # Fresh init per fold — see comment in run_per_subject.
+    fresh_state = copy.deepcopy(model.state_dict())
     for pid in loader.participant_ids:
+        model.load_state_dict(fresh_state)
         train_pop, val_pop = loader.get_loso_train_dataset(pid)
         train_sub, val_sub, test_sub = loader.per_subject(pid)
 
@@ -445,6 +471,7 @@ def main():
         data_path=ds_cfg["data_path"],
         config=ds_cfg["config_yaml"],
         custom_dataset_class=Downstream_Dataset,
+        pre_split=ds_cfg.get("pre_split", False),
     )
 
     # ── Build model ──

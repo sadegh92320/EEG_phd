@@ -75,6 +75,7 @@ def extract_features_branch(model, dataloader, device, branch="both", max_batche
                     H = attn_module.num_heads
                     H2 = attn_module.heads_per_branch
                     d = attn_module.dim_head
+                    use_mp = getattr(attn_module, 'use_mean_pool_temporal', False)
 
                     # Riemannian bias
                     bias_source = residual if residual is not None else x_norm
@@ -87,26 +88,50 @@ def extract_features_branch(model, dataloader, device, branch="both", max_batche
                         x_space, channel_idx, mask_space=mask_space
                     )
 
-                    # Shared QKV
-                    qkv = attn_module.qkv(x_norm).reshape(B, L, 3, H, d).permute(2, 0, 3, 1, 4)
-                    q, k, v = qkv[0], qkv[1], qkv[2]
-                    q_t, q_s = q[:, :H2], q[:, H2:]
-                    k_t, k_s = k[:, :H2], k[:, H2:]
-                    v_t, v_s = v[:, :H2], v[:, H2:]
-
-                    # Temporal attention
-                    q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=C)
-                    k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=C)
-                    v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=C)
-
-                    if attn_module.use_rope:
-                        q_t, k_t = attn_module.temporal_rope(q_t, k_t)
-
-                    if getattr(attn_module, 'use_luna_temporal', False) and attn_module.luna_temporal is not None:
-                        out_t = attn_module.luna_temporal(q_t, k_t, v_t, L_n=L_n, channel_idx=channel_idx, C=C)
+                    # Shared QKV — layout depends on use_mean_pool_temporal
+                    if use_mp:
+                        # Run 2: [Q_s | K_s | V_all], projection shape (D, 2D)
+                        qkv = attn_module.qkv(x_norm)
+                        hd = attn_module.half_dim
+                        q_s = qkv[..., :hd].reshape(B, L, H2, d).permute(0, 2, 1, 3)
+                        k_s = qkv[..., hd:2 * hd].reshape(B, L, H2, d).permute(0, 2, 1, 3)
+                        v = qkv[..., 2 * hd:].reshape(B, L, H, d).permute(0, 2, 1, 3)
+                        v_t, v_s = v[:, :H2], v[:, H2:]
+                        q_t = k_t = None
                     else:
-                        out_t = F.scaled_dot_product_attention(q_t, k_t, v_t, dropout_p=0.0)
-                    out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=C)
+                        qkv = attn_module.qkv(x_norm).reshape(B, L, 3, H, d).permute(2, 0, 3, 1, 4)
+                        q, k, v = qkv[0], qkv[1], qkv[2]
+                        q_t, q_s = q[:, :H2], q[:, H2:]
+                        k_t, k_s = k[:, :H2], k[:, H2:]
+                        v_t, v_s = v[:, :H2], v[:, H2:]
+
+                    # Temporal branch
+                    if use_mp:
+                        # Mask-aware mean-pool across time, per (batch, channel, head)
+                        v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=C)
+                        if mask is not None:
+                            mask_t = rearrange(mask, 'b (n c) -> (b c) n', c=C)
+                            valid = (~mask_t).to(v_t.dtype).unsqueeze(1).unsqueeze(-1)
+                            v_t_sum = (v_t * valid).sum(dim=2, keepdim=True)
+                            denom = valid.sum(dim=2, keepdim=True).clamp_min(1.0)
+                            v_t_pool = v_t_sum / denom
+                        else:
+                            v_t_pool = v_t.mean(dim=2, keepdim=True)
+                        out_t = v_t_pool.expand_as(v_t)
+                        out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=C)
+                    else:
+                        q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=C)
+                        k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=C)
+                        v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=C)
+
+                        if attn_module.use_rope:
+                            q_t, k_t = attn_module.temporal_rope(q_t, k_t)
+
+                        if getattr(attn_module, 'use_luna_temporal', False) and attn_module.luna_temporal is not None:
+                            out_t = attn_module.luna_temporal(q_t, k_t, v_t, L_n=L_n, channel_idx=channel_idx, C=C)
+                        else:
+                            out_t = F.scaled_dot_product_attention(q_t, k_t, v_t, dropout_p=0.0)
+                        out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=C)
 
                     # Spatial attention
                     q_s = rearrange(q_s, 'b h (n c) d -> (b n) h c d', c=C)
@@ -223,7 +248,8 @@ def compute_separability(features, labels):
 
 def run_diagnostic(checkpoint_path, data_path="downstream/data/bci_comp_2a",
                    config_path="MAE_pretraining/info_dataset/bci_comp_2a.yaml",
-                   batch_size=32, use_rope=False, max_batches=20):
+                   batch_size=32, use_rope=False, use_mean_pool_temporal=False,
+                   max_batches=20):
 
     device = torch.device(
         "cuda" if torch.cuda.is_available()
@@ -233,6 +259,7 @@ def run_diagnostic(checkpoint_path, data_path="downstream/data/bci_comp_2a",
     print(f"Device: {device}")
     print(f"Checkpoint: {checkpoint_path}")
     print(f"RoPE: {use_rope}")
+    print(f"Mean-pool temporal: {use_mean_pool_temporal}")
     print()
 
     model = Downstream(
@@ -240,6 +267,7 @@ def run_diagnostic(checkpoint_path, data_path="downstream/data/bci_comp_2a",
         enc_dim=512, depth_e=8, patch_size=16,
         num_classes=4,
         use_rope=use_rope,
+        use_mean_pool_temporal=use_mean_pool_temporal,
     )
     model.to(device)
     model.eval()
@@ -315,6 +343,7 @@ if __name__ == "__main__":
                         default="MAE_pretraining/info_dataset/bci_comp_2a.yaml")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--use_rope", action="store_true", default=False)
+    parser.add_argument("--use_mean_pool_temporal", action="store_true", default=False)
     parser.add_argument("--max_batches", type=int, default=20)
     args = parser.parse_args()
 
@@ -324,5 +353,6 @@ if __name__ == "__main__":
         config_path=args.config_path,
         batch_size=args.batch_size,
         use_rope=args.use_rope,
+        use_mean_pool_temporal=args.use_mean_pool_temporal,
         max_batches=args.max_batches,
     )

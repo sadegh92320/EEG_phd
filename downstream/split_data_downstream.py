@@ -32,13 +32,14 @@ from torch.utils.data import Subset
 
 
 class DownstreamDataLoader:
-    def __init__(self, data_path, config, custom_dataset_class=None, norm_mode="default", base_sfreq=256):
+    def __init__(self, data_path, config, custom_dataset_class=None, norm_mode="default", base_sfreq=256, pre_split=False):
         random.seed(92)
         self.data_path = data_path
         self.config = config
         self.custom_dataset_class = custom_dataset_class
         self.norm_mode = norm_mode  # per-model normalization key (e.g. "steegformer", "biot")
         self.base_sfreq = base_sfreq  # baseline sampling rate of the stored data
+        self.pre_split = pre_split  # if True, train/eval split is pre-defined (e.g. TUEV)
 
         self.train_data_path = os.path.join(self.data_path, "train.h5")
         self.val_data_path = os.path.join(self.data_path, "val.h5")
@@ -225,8 +226,45 @@ class DownstreamDataLoader:
         This combines all data from train.h5 + val.h5 first
         (since the export splits trials, not subjects).
 
+        Exception: if the dataset config has pre_split=True (e.g. TUEV),
+        the train/eval split is pre-defined by the dataset authors.
+        In that case we respect it: train.h5 → train+val, val.h5 → test.
+
         Returns: (train_dataset, val_dataset, test_dataset)
         """
+        # ── Pre-split datasets (e.g. TUEV): respect the original split ──
+        if self.pre_split:
+            x_train_full, y_train_full = self._load_split_by_participant(self.train_data_path)
+            x_test, y_test = self._load_split_by_participant(self.val_data_path)
+
+            # Split train into train/val (by participant, not by trial)
+            with h5py.File(self.train_data_path, "r") as f:
+                train_parts = f["participant"][:]
+
+            train_pids = np.unique(train_parts)
+            rng = np.random.default_rng(seed)
+            rng.shuffle(train_pids)
+            n_val = max(1, int(round(len(train_pids) * val_ratio)))
+            val_pids = set(train_pids[:n_val].tolist())
+            actual_train_pids = set(train_pids[n_val:].tolist())
+
+            train_idx = np.array([i for i, p in enumerate(train_parts) if p in actual_train_pids])
+            val_idx = np.array([i for i, p in enumerate(train_parts) if p in val_pids])
+
+            print(f"  Pre-split dataset: {len(actual_train_pids)} train, {len(val_pids)} val subjects (from train.h5)")
+            with h5py.File(self.val_data_path, "r") as f:
+                test_parts = f["participant"][:]
+            n_test_subj = len(np.unique(test_parts))
+            print(f"  Test: {n_test_subj} subjects (from val.h5)")
+            print(f"  Samples: {len(train_idx)} train, {len(val_idx)} val, {len(x_test)} test")
+
+            train_ds = self.make_dataset(x_train_full[train_idx], y_train_full[train_idx], custom_dataset_class=self.custom_dataset_class)
+            val_ds = self.make_dataset(x_train_full[val_idx], y_train_full[val_idx], custom_dataset_class=self.custom_dataset_class)
+            test_ds = self.make_dataset(x_test, y_test, custom_dataset_class=self.custom_dataset_class)
+
+            return train_ds, val_ds, test_ds
+
+        # ── Standard cross-subject: pool and reshuffle ──
         # Load ALL data (combine trial-level splits back together)
         x_all, y_all, part_all = self._load_all_data()
 

@@ -234,6 +234,11 @@ class ImportIsruc(DataImport):
         ordered = [RENAME_MAP[ch] for ch in RAW_EEG_CHANNELS if ch in available]
         raw.reorder_channels(ordered)
 
+        # ── Preprocessing: notch 50/60 Hz + bandpass 0.1–64 Hz (IIR) ──
+        raw.notch_filter(freqs=50, method="iir", verbose="ERROR")
+        raw.notch_filter(freqs=60, method="iir", verbose="ERROR")
+        raw.filter(l_freq=0.1, h_freq=64.0, method="iir", verbose="ERROR")
+
         data = raw.get_data()  # (C, T)
         C, T_total = data.shape
 

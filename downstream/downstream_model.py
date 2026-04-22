@@ -651,6 +651,10 @@ class DownstreamRiemannTransformerPara(Downstream):
         # Run 2: replace temporal SDPA with mean-pool over time (V-pool mixer).
         # Q_t / K_t projections are dropped — QKV shrinks from D→3D to D→2D.
         self._use_mean_pool_temporal = kwargs.pop("use_mean_pool_temporal", False)
+        # Run 3: spatial-only. Remove the temporal branch entirely and gate
+        # the additive temporal PE behind the mask (which is empty at fine-tune
+        # time → no PE added at all, matching pretraining unmasked-token dist).
+        self._use_spatial_only = kwargs.pop("use_spatial_only", False)
         if aggregation == "class":
             raise ValueError(
                 "DownstreamRiemannTransformerPara does not use a [CLS] token. "
@@ -670,6 +674,7 @@ class DownstreamRiemannTransformerPara(Downstream):
         rope_freq_max = getattr(self, '_rope_freq_max', 50.0)
         rope_learnable = getattr(self, '_rope_learnable', True)
         use_mean_pool_temporal = getattr(self, '_use_mean_pool_temporal', False)
+        use_spatial_only = getattr(self, '_use_spatial_only', False)
         return nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
@@ -683,6 +688,7 @@ class DownstreamRiemannTransformerPara(Downstream):
                 rope_freq_max=rope_freq_max,
                 rope_learnable=rope_learnable,
                 use_mean_pool_temporal=use_mean_pool_temporal,
+                use_spatial_only=use_spatial_only,
             ) for i in range(depth_e)
         ])
 
@@ -709,9 +715,15 @@ class DownstreamRiemannTransformerPara(Downstream):
         x = x + self._get_channel_embedding(channel_list, N, B, L)
 
         # Temporal embedding
-        # When RoPE is enabled, skip additive temporal PE — position is injected
-        # via rotation inside the temporal attention (no magnitude imbalance).
-        if not getattr(self, '_use_rope', False):
+        # Skipped when:
+        #  - RoPE is enabled (position injected by rotation inside temporal attn)
+        #  - Spatial-only: at fine-tune time there's no masking, so the
+        #    mask-gated PE of pretraining adds zero — we match that here by
+        #    adding no PE at all. Keeps pretrain/fine-tune input distributions
+        #    aligned so the spatial block sees the same (content + chan_emb)
+        #    space in both regimes.
+        skip_pe = getattr(self, '_use_rope', False) or getattr(self, '_use_spatial_only', False)
+        if not skip_pe:
             seq_idx = torch.arange(0, N, device=device).unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
             x = x + self.temporal_embedding(seq_idx)
 

@@ -1692,7 +1692,8 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
                  use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
                  rope_learnable=True,
                  use_brain_state_injection=False, brain_state_beta_init=0.05,
-                 use_mean_pool_temporal=False):
+                 use_mean_pool_temporal=False,
+                 use_spatial_only=False):
         super().__init__()
         assert num_heads % 2 == 0, "num_heads must be even for parallel split"
         assert embed_dim % num_heads == 0
@@ -1707,12 +1708,34 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.use_rope = use_rope
         self.use_brain_state_injection = use_brain_state_injection
         self.use_mean_pool_temporal = use_mean_pool_temporal
+        self.use_spatial_only = use_spatial_only
 
+        # Run 3: spatial-only — remove temporal branch entirely.
+        # All heads go to spatial. QKV stays at 3*D but every dim feeds
+        # spatial attention. No temporal path at all — no Q_t, K_t, V_t,
+        # no RoPE, no Luna, no BSI, no mean-pool fusion.
+        if use_spatial_only:
+            assert not use_mean_pool_temporal, \
+                "use_spatial_only is exclusive with use_mean_pool_temporal " \
+                "(both kill the temporal branch; pick one)"
+            assert not use_rope, \
+                "use_spatial_only is exclusive with use_rope " \
+                "(RoPE rotates temporal Q/K which no longer exist)"
+            assert not use_luna_temporal, \
+                "use_spatial_only is exclusive with use_luna_temporal " \
+                "(Luna is a temporal compression; the branch is gone)"
+            assert not use_brain_state_injection, \
+                "use_spatial_only is exclusive with use_brain_state_injection " \
+                "(BSI augments V_t which does not exist in spatial-only)"
+            # Override: all H heads go to spatial (not H/2).
+            self.heads_per_branch = num_heads
+            self.half_dim = self.heads_per_branch * self.dim_head  # = embed_dim
+            self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
         # Run 2-clean: temporal branch uses mean-pool, not attention.
         # → Q_t and K_t are unused. Shrink QKV projection to save params.
         # Also disable temporal-attention-specific features (RoPE, Luna, BSI)
         # because they would operate on a now-unused pathway.
-        if use_mean_pool_temporal:
+        elif use_mean_pool_temporal:
             assert not use_rope, \
                 "use_mean_pool_temporal=True is incompatible with use_rope " \
                 "(RoPE rotates Q_t/K_t which are no longer computed)"
@@ -1821,7 +1844,12 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         )
 
         # ── Shared QKV ──
-        if self.use_mean_pool_temporal:
+        if self.use_spatial_only:
+            # Run 3: all H heads go to spatial. QKV = [Q_s | K_s | V_s], each D.
+            # No temporal branch means no Q_t/K_t/V_t exist at all.
+            qkv = self.qkv(x_norm).reshape(B, L, 3, H, d).permute(2, 0, 3, 1, 4)
+            q_s, k_s, v_s = qkv[0], qkv[1], qkv[2]
+        elif self.use_mean_pool_temporal:
             # Run 2-clean: QKV = [Q_s | K_s | V_all].
             # Shape: (B, L, 2*D). Split sizes: half_dim, half_dim, embed_dim.
             qkv = self.qkv(x_norm)
@@ -1840,7 +1868,10 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             v_t, v_s = v[:, :H2], v[:, H2:]
 
         # ── Temporal branch ──
-        if self.use_mean_pool_temporal:
+        if self.use_spatial_only:
+            # Run 3: no temporal branch. Skip entirely.
+            pass
+        elif self.use_mean_pool_temporal:
             # Mean-pool across time, per (batch, channel, head).
             # Layout: v_t is (B, H_t, L=N*C, d). Group N along time axis:
             #   → (B*C, H_t, N, d), pool over N, broadcast back.
@@ -1937,9 +1968,14 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
 
         out_s = rearrange(out_s, '(b n) h c d -> b h (n c) d', b=B, n=N)
 
-        # ── Concatenate and project ──
-        out = torch.cat([out_t, out_s], dim=1)
-        out = rearrange(out, 'b h l d -> b l (h d)')
+        # ── Output projection ──
+        if self.use_spatial_only:
+            # Run 3: no temporal branch, spatial output covers all H heads.
+            out = rearrange(out_s, 'b h l d -> b l (h d)')
+        else:
+            # Concatenate temporal + spatial heads, then project.
+            out = torch.cat([out_t, out_s], dim=1)
+            out = rearrange(out, 'b h l d -> b l (h d)')
         out = self.fc(out)
         return self.dropout(out)
 
@@ -1980,7 +2016,8 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
                  use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
                  rope_learnable=True,
                  use_brain_state_injection=False, brain_state_beta_init=0.05,
-                 use_mean_pool_temporal=False):
+                 use_mean_pool_temporal=False,
+                 use_spatial_only=False):
         super().__init__()
 
         self.attn = AdaptiveRiemannianParallelAttention(
@@ -2007,6 +2044,7 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
             use_brain_state_injection=use_brain_state_injection,
             brain_state_beta_init=brain_state_beta_init,
             use_mean_pool_temporal=use_mean_pool_temporal,
+            use_spatial_only=use_spatial_only,
         )
 
         self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()

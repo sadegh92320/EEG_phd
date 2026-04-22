@@ -948,10 +948,13 @@ class TrainerDownstream:
                 # Log to WandB with the trial number included
                 wandb.log({"acc": perf, "epoch": epoch, "fold": fold, "trial": trial.number})
 
-                if early_stopper.should_stop(perf):
+                # Skip early stopping during warmup (LR ~0 → val_acc cannot move).
+                if epoch >= warmup_epochs and early_stopper.should_stop(perf):
                     break
 
-                if perf > best:
+                # Only capture best_model after warmup; otherwise a noisy early
+                # val_acc from the frozen-LR window gets locked in.
+                if epoch >= warmup_epochs and perf > best:
                     best_model = deepcopy(model.state_dict())
                     best = perf
                     all_met = metrics
@@ -1072,10 +1075,12 @@ class TrainerDownstream:
             if not step_per_batch and not use_iter_lr and scheduler is not None:
                 scheduler.step()
 
-            if early_stopper.should_stop(perf):
+            # Skip early stopping during warmup (LR ~0 → val_acc cannot move).
+            if epoch >= warmup_epochs and early_stopper.should_stop(perf):
                 break
 
-            if perf > best:
+            # Only update best after warmup (noise during frozen-LR window).
+            if epoch >= warmup_epochs and perf > best:
                 best = perf
 
             trial.report(best, step=epoch)
@@ -1170,13 +1175,23 @@ class TrainerDownstream:
 
                 if not step_per_batch and not use_iter_lr and scheduler is not None:
                     scheduler.step()
-                if perf > best:
+                # Only track best_model AFTER warmup. During warmup the effective
+                # LR is ~1e-3 × base_lr, so any val-acc "high" here is pure noise
+                # from a tiny val set (~46 samples on BCI-2a per-subject → σ≈6.4%
+                # at chance). If captured, it produces a near-init snapshot that
+                # no post-warmup epoch can beat, and final test acc collapses to
+                # chance regardless of how well later epochs actually trained.
+                if epoch >= warmup_epochs and perf > best:
                     best = perf
                     best_model = deepcopy(model.state_dict())
                 wandb.log({"val_acc": perf, "best_val_acc": best, "train_loss": loss, "epoch": epoch}, step=epoch)
 
-                # Stop training if the val accuracy has not improved for a while
-                if early_stopper.should_stop(perf):
+                # Stop training if the val accuracy has not improved for a while.
+                # Skip the warmup window: during linear warmup the effective LR is
+                # ~1e-3 × base_lr, so val_acc genuinely does not move and the
+                # stopper would otherwise fire right at the end of warmup, reverting
+                # the model to its fresh-init state and producing chance-level test acc.
+                if epoch >= warmup_epochs and early_stopper.should_stop(perf):
                     break
             else:
                 # LOSO (paper protocol): no val set, just log training loss

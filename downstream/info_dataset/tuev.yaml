@@ -1,0 +1,36 @@
+name_dataset: tuev
+
+channel_list:
+  - Fp1
+  - Fp2
+  - F3
+  - F4
+  - F7
+  - F8
+  - Fz
+  - C3
+  - C4
+  - Cz
+  - T3
+  - T4
+  - T5
+  - T6
+  - P3
+  - P4
+  - Pz
+  - O1
+  - O2
+  - A1
+  - A2
+
+frequency: 250
+data_unit: V
+
+num_participant: 370  # 290 train + 80 eval
+num_classes: 6  # spsw, gped, pled, eyem, artf, bckg
+task: classification
+
+# Pre-split by TUH: train and eval have different participants
+pre_split: true
+
+data_file: downstream/data/tuev
