@@ -135,7 +135,8 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                  mask_strategy='random', mask_block_size=4,
                  use_filter_bank=False, fb_num_bands=5,
                  fb_sample_rate=128.0, fb_kernel_size=65,
-                 fb_band_edges=None, fb_learnable_cutoffs=False):
+                 fb_band_edges=None, fb_learnable_cutoffs=False,
+                 fb_beta_init=0.0, fb_l1_weight=0.0):
         super().__init__()
 
         self.config = config
@@ -145,6 +146,10 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         self.use_rope = use_rope
         self.use_filter_bank = use_filter_bank
         self.fb_num_bands = fb_num_bands
+        # FB sparsity penalty on per-layer (H_spatial × K) β tensor.
+        # 0.0 → off (probe contract). ~1e-5 encourages band specialization
+        # in fresh pretraining without crushing the bias to zero.
+        self.fb_l1_weight = float(fb_l1_weight)
         self.patch_size = patch_size
 
         # Adaptive Riemannian parallel transformer layers
@@ -161,6 +166,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 rope_learnable=rope_learnable,
                 use_filter_bank=use_filter_bank,
                 fb_num_bands=fb_num_bands,
+                fb_beta_init=fb_beta_init,
             ) for i in range(depth_e)
         ])
 
@@ -770,6 +776,24 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 self.log(f"value_beta_mean/layer_{i}", vbeta.mean(), on_step=False, on_epoch=True)
                 self.log(f"value_beta_max/layer_{i}", vbeta.abs().max(), on_step=False, on_epoch=True)
 
+            # Filter-bank β_{h,k,l} (Run 4 FB-C1: per-head per-band scalars).
+            # Kill-condition for FB: if fb_beta_norm stays < 0.05 at epoch 30,
+            # the bands are not being used → FB contributes nothing and the
+            # model is effectively reduced to Run 2. Log Frobenius norm and
+            # per-band magnitude (mean over heads) for diagnostics.
+            if hasattr(layer.attn, 'fb_beta'):
+                fb_beta = layer.attn.fb_beta.detach()  # (H_spatial, K)
+                self.log(f"fb_beta_norm/layer_{i}", fb_beta.norm(),
+                         on_step=False, on_epoch=True)
+                self.log(f"fb_beta_max/layer_{i}", fb_beta.abs().max(),
+                         on_step=False, on_epoch=True)
+                # Per-band mean |β| — exposes which bands are "winning"
+                # (δ θ α β γ for K=5 with default cutoffs).
+                per_band = fb_beta.abs().mean(dim=0)  # (K,)
+                for k in range(per_band.shape[0]):
+                    self.log(f"fb_beta_band{k}/layer_{i}", per_band[k],
+                             on_step=False, on_epoch=True)
+
             # C3: Learnable tangent-space reference μ^(l).
             # Should converge toward the log-Euclidean Fréchet mean of the
             # covariance distribution — the diagnostic showed ‖mean log S‖_F
@@ -796,6 +820,22 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                          on_step=False, on_epoch=True)
                 self.log(f"rope_freq_std_hz/layer_{i}", freqs_hz.std(),
                          on_step=False, on_epoch=True)
+
+        # ── FB sparsity penalty (Run 4 FB-C1) ──
+        # Tiny L1 on the per-layer (H_spatial × K) β tensor encourages band
+        # specialization: each head settles on 1–2 bands instead of a flat
+        # mixture. Off by default (fb_l1_weight=0). Recommended ~1e-5 for
+        # fresh pretraining; logged as `fb_l1_loss` so we can confirm it's
+        # not dominating the reconstruction loss.
+        if self.use_filter_bank and self.fb_l1_weight > 0.0:
+            fb_l1 = sum(
+                layer.attn.fb_beta.abs().sum()
+                for layer in self.encoder
+                if hasattr(layer.attn, 'fb_beta')
+            )
+            fb_penalty = self.fb_l1_weight * fb_l1
+            self.log("fb_l1_loss", fb_penalty, on_step=False, on_epoch=True)
+            loss = loss + fb_penalty
 
         return loss
 

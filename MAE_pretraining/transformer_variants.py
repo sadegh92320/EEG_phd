@@ -1158,7 +1158,7 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
                  use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
                  rope_learnable=True,
                  use_branch_gate=False,
-                 use_filter_bank=False, fb_num_bands=5):
+                 use_filter_bank=False, fb_num_bands=5, fb_beta_init=0.0):
         super().__init__()
         assert num_heads % 2 == 0, "num_heads must be even for parallel split"
         assert embed_dim % num_heads == 0
@@ -1171,13 +1171,18 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
 
         # Filter-bank bias (Run 4 FB-C1): per-layer (H_spatial × K) scalars that
         # weight the static raw-signal band biases precomputed at the encoder
-        # level. β init = 0 → model matches pure C1+C3 at epoch 0 when loading
-        # from a checkpoint that doesn't have FB.
+        # level. fb_beta_init controls the starting value:
+        #   • 0.0 (default) → bit-exact match with non-FB ckpt at load (probe).
+        #   • ~0.2 (= 1/K with K=5) → uniform init for fresh pretraining; FB
+        #     enters the bias from step 1 so gradient flows through β
+        #     immediately rather than waiting for it to be discovered.
         self.use_filter_bank = use_filter_bank
         self.fb_num_bands = fb_num_bands
         if self.use_filter_bank:
             # Shape: (H_spatial, K). Each spatial head gets K band weights.
-            self.fb_beta = nn.Parameter(torch.zeros(self.heads_per_branch, fb_num_bands))
+            self.fb_beta = nn.Parameter(
+                torch.full((self.heads_per_branch, fb_num_bands), float(fb_beta_init))
+            )
         self.use_rope = use_rope
 
         # Branch gate: per-layer learnable scalars that scale each branch's
@@ -1404,7 +1409,7 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
                  use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
                  rope_learnable=True,
                  use_branch_gate=False,
-                 use_filter_bank=False, fb_num_bands=5):
+                 use_filter_bank=False, fb_num_bands=5, fb_beta_init=0.0):
         super().__init__()
 
         self.attn = AdaptiveRiemannianParallelAttention(
@@ -1427,6 +1432,7 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
             use_branch_gate=use_branch_gate,
             use_filter_bank=use_filter_bank,
             fb_num_bands=fb_num_bands,
+            fb_beta_init=fb_beta_init,
         )
 
         self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()

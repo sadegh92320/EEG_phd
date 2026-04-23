@@ -161,7 +161,8 @@ class Pipeline:
                      # ── Filter-Bank C1 (Run 4 FB-C1) ──
                      use_filter_bank=False, fb_num_bands=5,
                      fb_sample_rate=128.0, fb_kernel_size=65,
-                     fb_band_edges=None, fb_learnable_cutoffs=False):
+                     fb_band_edges=None, fb_learnable_cutoffs=False,
+                     fb_beta_init=0.0, fb_l1_weight=0.0):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
@@ -229,6 +230,8 @@ class Pipeline:
                     fb_kernel_size=fb_kernel_size,
                     fb_band_edges=fb_band_edges,
                     fb_learnable_cutoffs=fb_learnable_cutoffs,
+                    fb_beta_init=fb_beta_init,
+                    fb_l1_weight=fb_l1_weight,
                 )
                 # Override log_mode in every encoder layer if needed
                 if log_mode == 'approx':
