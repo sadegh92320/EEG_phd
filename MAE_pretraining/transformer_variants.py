@@ -940,18 +940,19 @@ class SincConv1d(nn.Module):
 
         # Safe division: where t==0, directly substitute the limit later.
         eps = 1e-12
-        # sinc(2f t) = sin(2π f t) / (π t), using t in samples → replace π t with
-        # the normalized formula via (1/t).
-        # Here t is in samples — use the standard form with π:
+        # sinc(2f t) in unnormalized form = sin(2π f t) / (π t). At t=0 the
+        # analytic limit is 2f. `torch.where` broadcasts cond(1,L), A(K,1),
+        # B(K,L) → (K, L) without any explicit expand_as (which would fail
+        # because f_*_norm has shape (K, 1) ≠ t's shape (1, L)).
         sinc_hi = torch.where(
             t.abs() < 1e-9,
-            2.0 * f_hi_norm.expand_as(t) * torch.ones_like(t),
-            torch.sin(two_pi_hi_t) / (math.pi * t + eps),
+            2.0 * f_hi_norm,                               # (K, 1) broadcast
+            torch.sin(two_pi_hi_t) / (math.pi * t + eps),  # (K, L)
         )
         sinc_lo = torch.where(
             t.abs() < 1e-9,
-            2.0 * f_lo_norm.expand_as(t) * torch.ones_like(t),
-            torch.sin(two_pi_lo_t) / (math.pi * t + eps),
+            2.0 * f_lo_norm,                               # (K, 1) broadcast
+            torch.sin(two_pi_lo_t) / (math.pi * t + eps),  # (K, L)
         )
         filt = sinc_hi - sinc_lo                               # (K, L)
         filt = filt * self.window.unsqueeze(0)                 # Hamming window
