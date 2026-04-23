@@ -51,6 +51,39 @@ def seed_everything(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
+def hilbert_transform_last_dim(x):
+    """
+    Compute the Hilbert transform along the last dimension via FFT.
+
+    Input:  (..., T) real tensor
+    Output: (..., T) real tensor — imaginary part of the analytic signal.
+
+    The analytic signal is z(t) = x(t) + i·H[x(t)] where |z| is the
+    instantaneous amplitude envelope and angle(z) is the instantaneous
+    phase. Predicting (x, H[x]) forces the encoder to represent phase
+    explicitly because H[x] cannot be recovered from x by amplitude-only
+    interpolation.
+
+    Implementation: standard FFT-domain filter (keep DC + Nyquist, double
+    positive frequencies, zero negatives) — matches scipy.signal.hilbert.
+    """
+    N = x.shape[-1]
+    # Cast to float for FFT even if input is in autocast dtype — ensures
+    # correct analytic-signal construction without precision drift.
+    x_f = x.float()
+    Xf = torch.fft.fft(x_f, dim=-1)
+    h = torch.zeros(N, device=x.device, dtype=Xf.dtype)
+    if N % 2 == 0:
+        h[0] = 1.0
+        h[N // 2] = 1.0
+        h[1:N // 2] = 2.0
+    else:
+        h[0] = 1.0
+        h[1:(N + 1) // 2] = 2.0
+    analytic = torch.fft.ifft(Xf * h, dim=-1)
+    return analytic.imag.to(x.dtype)
+
+
 channel_list = ["Fp1","Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]
 channel_list_2 = ["Fp2","AF3","AF4","F7","F3","Fz","F4","F8","FC5","FC1","FC2","FC6","T7","C3","Cz","C4","T8","CP5","CP1","CP2","CP6","P7","P3","Pz","P4","P8","PO7","PO3","PO4","PO8","Oz",]
 CHANNEL_DICT = dict(zip(range(len(channel_list)), channel_list))
@@ -136,7 +169,8 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                  use_filter_bank=False, fb_num_bands=5,
                  fb_sample_rate=128.0, fb_kernel_size=65,
                  fb_band_edges=None, fb_learnable_cutoffs=False,
-                 fb_beta_init=0.0, fb_l1_weight=0.0):
+                 fb_beta_init=0.0, fb_l1_weight=0.0,
+                 use_hilbert_target=False):
         super().__init__()
 
         self.config = config
@@ -150,6 +184,12 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         # 0.0 → off (probe contract). ~1e-5 encourages band specialization
         # in fresh pretraining without crushing the bias to zero.
         self.fb_l1_weight = float(fb_l1_weight)
+        # Cheap Hilbert analytic-signal target: predict (x, H[x]) per patch
+        # instead of just x. Forces phase-aware representation via explicit
+        # target supervision, at negligible compute cost. The output head
+        # doubles (patch_size → 2*patch_size) and the target gains a Hilbert
+        # component computed via FFT.
+        self.use_hilbert_target = use_hilbert_target
         self.patch_size = patch_size
 
         # Adaptive Riemannian parallel transformer layers
@@ -189,7 +229,11 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         self.patch_size = patch_size
         self.patch = PatchEEG(patch_size=patch_size, embed_dim=enc_dim)
         self.mask_token = nn.Parameter(torch.zeros((1, 1, enc_dim)))
-        self.fc = nn.Linear(enc_dim, patch_size)
+        # Output head: predicts (x, H[x]) if Hilbert target, else just x.
+        # 2 × patch_size output when Hilbert is active — first half is the
+        # raw-signal prediction, second half is the Hilbert prediction.
+        _out_dim = 2 * patch_size if use_hilbert_target else patch_size
+        self.fc = nn.Linear(enc_dim, _out_dim)
         self.norm_enc = nn.LayerNorm(enc_dim)
 
         # Temporal and channel embeddings
@@ -664,31 +708,63 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             var = target.var(dim=-1, unbiased=False, keepdim=True)
             target = (target - mean) / (var + 1.e-6)**.5
 
-        # ── Time-domain reconstruction loss ──
-        loss_per_patch = ((pred - target) ** 2).mean(dim=-1)
-        loss_time = (loss_per_patch * mask).sum() / mask.sum().clamp_min(1.0)
+        # ── Hilbert analytic-signal target (cheap phase supervision) ──
+        # Split the doubled output head into (pred_x, pred_h): first half
+        # predicts the raw signal, second half predicts its Hilbert transform.
+        # Target: the Hilbert transform is computed on the full trial then
+        # patchified identically to the raw target. Loss = MSE(x) + MSE(H[x]).
+        # This is mathematically equivalent to predicting the analytic signal
+        # z = x + i·H[x] with joint MSE — phase is in the target, so gradient
+        # signal cannot be optimized away by amplitude-only features.
+        if self.use_hilbert_target:
+            # Split output head halves
+            pred_x, pred_h = pred.chunk(2, dim=-1)  # each (B, L, P)
 
-        # ── Spectral auxiliary loss ──
-        # Forces the encoder to represent frequency content explicitly.
-        # Per-patch FFT: 16 samples → 9 frequency bins (0, 8, 16, ..., 64 Hz).
-        # Log-magnitude for better dynamic range (small spectral differences
-        # at low power levels matter for EEG band features).
+            # Compute Hilbert of the raw trial and patchify to match target
+            eeg_h = hilbert_transform_last_dim(eeg)
+            target_h, _ = self.patchify_1d(eeg_h, self.patch_size)
+            target_h = target_h.view(B, Seq * Ch, P)
+            if self.norm_pix_loss:
+                mean_h = target_h.mean(dim=-1, keepdim=True)
+                var_h = target_h.var(dim=-1, unbiased=False, keepdim=True)
+                target_h = (target_h - mean_h) / (var_h + 1.e-6) ** .5
+
+            # Per-component MSE over masked positions
+            loss_per_patch_x = ((pred_x - target) ** 2).mean(dim=-1)
+            loss_per_patch_h = ((pred_h - target_h) ** 2).mean(dim=-1)
+            loss_time = (loss_per_patch_x * mask).sum() / mask.sum().clamp_min(1.0)
+            loss_hilbert = (loss_per_patch_h * mask).sum() / mask.sum().clamp_min(1.0)
+
+            # Store component losses for per-step logging
+            self._last_loss_time = loss_time.detach()
+            self._last_loss_hilbert = loss_hilbert.detach()
+
+            # Use pred_x as the returned pred for downstream diagnostics
+            # (val_pred_std, per-band MSE etc. operate on raw-signal prediction)
+            pred_for_diagnostics = pred_x
+            loss = loss_time + loss_hilbert
+        else:
+            # Original path — raw-signal prediction only.
+            loss_per_patch = ((pred - target) ** 2).mean(dim=-1)
+            loss_time = (loss_per_patch * mask).sum() / mask.sum().clamp_min(1.0)
+            pred_for_diagnostics = pred
+            loss = loss_time
+            self._last_loss_time = loss_time.detach()
+
+        # ── Spectral auxiliary loss (orthogonal to Hilbert) ──
+        # Only applied when explicitly enabled; operates on the raw-signal
+        # prediction component (pred_for_diagnostics) for consistency.
         if self.spectral_loss_weight > 0:
-            pred_spec = torch.fft.rfft(pred, dim=-1).abs()    # (B, L, P//2+1)
-            tgt_spec  = torch.fft.rfft(target, dim=-1).abs()  # (B, L, P//2+1)
-            # Log1p for numerical stability and to compress dynamic range
+            pred_spec = torch.fft.rfft(pred_for_diagnostics, dim=-1).abs()
+            tgt_spec  = torch.fft.rfft(target, dim=-1).abs()
             spec_loss_per_patch = (
                 (torch.log1p(pred_spec) - torch.log1p(tgt_spec)) ** 2
             ).mean(dim=-1)
             loss_spec = (spec_loss_per_patch * mask).sum() / mask.sum().clamp_min(1.0)
-            loss = loss_time + self.spectral_loss_weight * loss_spec
-            # Store for logging in training_step
-            self._last_loss_time = loss_time.detach()
+            loss = loss + self.spectral_loss_weight * loss_spec
             self._last_loss_spec = loss_spec.detach()
-        else:
-            loss = loss_time
 
-        return loss, pred, mask
+        return loss, pred_for_diagnostics, mask
 
     def patchify_1d(self, x, patch_size: int):
         """Segment the target eeg signal in patch and pad if necessary"""
@@ -762,6 +838,15 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         if self.spectral_loss_weight > 0 and hasattr(self, '_last_loss_time'):
             self.log("loss_time", self._last_loss_time, on_step=False, on_epoch=True)
             self.log("loss_spec", self._last_loss_spec, on_step=False, on_epoch=True)
+
+        # Log Hilbert target components separately.
+        # loss_time = MSE on raw signal reconstruction.
+        # loss_hilbert = MSE on Hilbert (phase-shifted) component reconstruction.
+        # If loss_hilbert stays near its init value while loss_time drops, the
+        # model is learning amplitude only — early warning for phase collapse.
+        if self.use_hilbert_target and hasattr(self, '_last_loss_hilbert'):
+            self.log("loss_time_raw", self._last_loss_time, on_step=False, on_epoch=True)
+            self.log("loss_hilbert", self._last_loss_hilbert, on_step=False, on_epoch=True)
 
         # Log the learned head scales across layers for analysis
         for i, layer in enumerate(self.encoder):

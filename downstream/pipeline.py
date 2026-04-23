@@ -162,7 +162,13 @@ class Pipeline:
                      use_filter_bank=False, fb_num_bands=5,
                      fb_sample_rate=128.0, fb_kernel_size=65,
                      fb_band_edges=None, fb_learnable_cutoffs=False,
-                     fb_beta_init=0.0, fb_l1_weight=0.0):
+                     fb_beta_init=0.0, fb_l1_weight=0.0,
+                     # ── Cheap Hilbert target + larger patches (Run 5) ──
+                     # patch_size=32 halves sequence length (~2x faster training)
+                     # and provides more per-patch frequency context. Combined
+                     # with Hilbert analytic-signal target, this forces phase-
+                     # aware representation learning under standard MAE loss.
+                     patch_size=32, use_hilbert_target=True):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
@@ -232,6 +238,9 @@ class Pipeline:
                     fb_learnable_cutoffs=fb_learnable_cutoffs,
                     fb_beta_init=fb_beta_init,
                     fb_l1_weight=fb_l1_weight,
+                    # Run 5: larger patches + Hilbert target
+                    patch_size=patch_size,
+                    use_hilbert_target=use_hilbert_target,
                 )
                 # Override log_mode in every encoder layer if needed
                 if log_mode == 'approx':
@@ -282,7 +291,7 @@ class Pipeline:
                 "depth_e": 8,
                 "depth_d": 4,
                 "mask_prob": 0.7,
-                "patch_size": 16,
+                "patch_size": patch_size,
                 "log_mode": log_mode,
                 "use_corr_masking": use_corr_masking,
                 "use_global_norm": use_global_norm,
@@ -296,6 +305,8 @@ class Pipeline:
                 "rope_learnable": rope_learnable,
                 "norm_pix_loss": norm_pix_loss,
                 "spectral_loss_weight": spectral_loss_weight,
+                "use_hilbert_target": use_hilbert_target,
+                "use_filter_bank": use_filter_bank,
             })
 
             callbacks = [TQDMProgressBar(refresh_rate=20), ckpt_callback]
@@ -348,7 +359,7 @@ class Pipeline:
             checkpoint_path=self.checkpoint_path,
             enc_dim=512,       # must match EncoderDecoder default
             depth_e=8,         # must match EncoderDecoder default
-            patch_size=16,     # must match EncoderDecoder default
+            patch_size=32,     # must match pretraining patch_size (Run 5)
             num_classes=self.config["num_classes"],
         )
         
@@ -367,7 +378,7 @@ class Pipeline:
                 checkpoint_path=self.checkpoint_path,
                 enc_dim=512,       # must match EncoderDecoder default
                 depth_e=8,
-                patch_size=16,
+                patch_size=32,
                 num_classes=self.config["num_classes"],
             )
     

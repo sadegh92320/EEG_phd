@@ -24,11 +24,12 @@ MODEL_PREPROCESS_CONFIG = {
     "riemann_adaptive":  {"norm": {"method": "global_mad"},  "sfreq": 128},
     "riemann_ema":       {"norm": {"method": "global_mad"},  "sfreq": 128},
     "riemann_seq":       {"norm": {"method": "global_mad"},  "sfreq": 128},
-    # Classic NN baselines: no normalization, keep native sfreq.
-    # STEEGFormer feeds raw µV data to EEGNet/Conformer/DeepConvNet/CTNet —
-    # their built-in BatchNorm layers handle the scale internally.
-    # The V→µV conversion (controlled by data_unit in YAML) still applies.
-    "classic_nn":   {"norm": {"method": "none"},                     "sfreq": None},
+    # Classic NN baselines: z-standardize but keep native sfreq.
+    # Model architecture (kernel sizes, pooling) is built for the dataset's
+    # native sampling rate, so we must NOT resample.  Z-standardize is needed
+    # because our h5 data is in µV (or Volts → µV converted), and per-channel
+    # unit-variance normalisation gives BatchNorm a stable starting point.
+    "classic_nn":   {"norm": {"method": "z_standardize"},            "sfreq": None},
     "default":      {"norm": {"method": "z_standardize"},            "sfreq": 256},
 }
 
