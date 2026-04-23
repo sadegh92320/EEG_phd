@@ -154,44 +154,23 @@ class Pipeline:
                      use_corr_masking=False, resume_ckpt=None, use_global_norm=False,
                      clamp_channels=False, value_bias_layers=0,
                      learn_mu_reference=True,
-                     use_luna_temporal=False, luna_num_slots=16,
-                     luna_start_layer=2, luna_spd_beta_init=0.0,
                      use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
                      rope_learnable=True,
                      mask_strategy='random', mask_prob=0.5, mask_block_size=4,
                      norm_pix_loss=False, spectral_loss_weight=0.0,
-                     use_brain_state_injection=False, brain_state_beta_init=0.05,
-                     use_mean_pool_temporal=False,
-                     use_spatial_only=False):
+                     # ── Filter-Bank C1 (Run 4 FB-C1) ──
+                     use_filter_bank=False, fb_num_bands=5,
+                     fb_sample_rate=128.0, fb_kernel_size=65,
+                     fb_band_edges=None, fb_learnable_cutoffs=False):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
-        Contributions:
+        Contribution:
             C1. Riemannian spatial attention bias (Padé [1,1] log map at identity)
                 Score bias: α_h · log(Σ) added to attention logits.
-            C2. Riemannian Luna temporal compression — Luna-style pack-unpack
-                bottleneck on temporal dimension (layers >= luna_start_layer).
-                SPD prototypes μ_q bias pack attention toward tokens from
-                similar covariance regimes, making compression geometry-aware.
                 Channel-invariant adaptive log map — global 144-channel reference
                 allows a single pretrained encoder to operate on any channel
                 layout via submatrix indexing.
-
-        Ablation table:
-            1. baseline (parallel attn, no Riemannian)    → log_mode='baseline'
-            2. approx (S-I)                               → log_mode='approx'
-            3. pade                                       → log_mode='pade'
-            4. pade + MAD normalization                   → + use_global_norm=True, clamp_channels=True
-            5. pade + MAD + mu centering (C1)             → + learn_mu_reference=True
-            6. C1 + EEG-RoPE (50% random)                → + use_rope=True (positional shortcut — fails downstream)
-            7. C1 + EEG-RoPE + block+chan masking          → + mask_strategy='block_corr', mask_prob=0.5
-               Block masking (temporal) + 1-chan masking (spatial). RoPE enables
-               temporal branch → corr masking now feasible (failed without RoPE).
-               norm_pix_loss=True removes amplitude bias, spectral_loss pushes
-               frequency features. Two-hop cross-branch flow via shared residual.
-            8. (negative) C1 + corr masking (no RoPE)     → too hard, temporal branch useless
-            9. (negative) C1 + EEG-RoPE (50% random)     → positional shortcut, downstream -10%
-            10.(negative) pade + MAD + Fréchet reference  → documented failure
 
         Args:
             pretrain:            if True, train from scratch; else load existing ckpt
@@ -201,17 +180,7 @@ class Pipeline:
             use_global_norm:     True → MAD-based global normalization
             clamp_channels:      True → clamp channels with variance > 10× median
             value_bias_layers:   number of early layers using β·(L@V) value mixing.
-                                 Default 0 (disabled — earlier experiments showed
-                                 no benefit, see Appendix X).
             learn_mu_reference:  if True, enable learnable tangent-space centering.
-            use_luna_temporal:   if True, enable C2 Luna temporal compression on
-                                 layers >= luna_start_layer. Replaces N×N temporal
-                                 self-attention with O(N·l) pack-process-unpack.
-            luna_num_slots:      l — number of compression slots (default 16).
-            luna_start_layer:    first layer to apply Luna (default 2; layers 0-1
-                                 keep full N×N for local temporal structure).
-            luna_spd_beta_init:  initial β for SPD distance weight in pack attention.
-                                 0 → starts as standard Luna, learns to use geometry.
         """
         assert log_mode in ('pade', 'approx', 'baseline'), \
             f"log_mode must be 'pade', 'approx', or 'baseline', got '{log_mode}'"
@@ -239,16 +208,11 @@ class Pipeline:
                 masking_str = "corr-masking" if use_corr_masking else "random-masking"
                 vb_str = f", value_bias_layers={value_bias_layers}"
                 mu_str = f", mu={'on' if learn_mu_reference else 'off'}"
-                luna_str = f", luna={'on' if use_luna_temporal else 'off'}"
-                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}{vb_str}{mu_str}{luna_str}")
+                print(f"[Ablation] Riemannian log_mode='{log_mode}', {masking_str}{vb_str}{mu_str}")
                 model = ApproxAdaptiveRiemannBert(
                     use_corr_masking=use_corr_masking,
                     value_bias_layers=value_bias_layers,
                     learn_mu_reference=learn_mu_reference,
-                    use_luna_temporal=use_luna_temporal,
-                    luna_num_slots=luna_num_slots,
-                    luna_start_layer=luna_start_layer,
-                    luna_spd_beta_init=luna_spd_beta_init,
                     use_rope=use_rope,
                     rope_freq_min=rope_freq_min,
                     rope_freq_max=rope_freq_max,
@@ -258,10 +222,13 @@ class Pipeline:
                     mask_block_size=mask_block_size,
                     norm_pix_loss=norm_pix_loss,
                     spectral_loss_weight=spectral_loss_weight,
-                    use_brain_state_injection=use_brain_state_injection,
-                    brain_state_beta_init=brain_state_beta_init,
-                    use_mean_pool_temporal=use_mean_pool_temporal,
-                    use_spatial_only=use_spatial_only,
+                    # Filter-Bank C1 (Run 4)
+                    use_filter_bank=use_filter_bank,
+                    fb_num_bands=fb_num_bands,
+                    fb_sample_rate=fb_sample_rate,
+                    fb_kernel_size=fb_kernel_size,
+                    fb_band_edges=fb_band_edges,
+                    fb_learnable_cutoffs=fb_learnable_cutoffs,
                 )
                 # Override log_mode in every encoder layer if needed
                 if log_mode == 'approx':
@@ -280,16 +247,8 @@ class Pipeline:
                     run_name += f"-vbias{value_bias_layers}"
                 if learn_mu_reference:
                     run_name += "-mu"
-                if use_luna_temporal:
-                    run_name += f"-luna{luna_num_slots}"
                 if use_rope:
                     run_name += "-ropeeg" if rope_learnable else "-rope"
-                if use_brain_state_injection:
-                    run_name += f"-bsi{brain_state_beta_init}"
-                if use_mean_pool_temporal:
-                    run_name += "-tpool"
-                if use_spatial_only:
-                    run_name += "-sonly"
                 if mask_strategy != 'random':
                     run_name += f"-{mask_strategy}"
                 if mask_prob != 0.5:
@@ -327,10 +286,6 @@ class Pipeline:
                 "clamp_channels": clamp_channels,
                 "value_bias_layers": value_bias_layers,
                 "learn_mu_reference": learn_mu_reference,
-                "use_luna_temporal": use_luna_temporal,
-                "luna_num_slots": luna_num_slots,
-                "luna_start_layer": luna_start_layer,
-                "luna_spd_beta_init": luna_spd_beta_init,
                 "mask_strategy": mask_strategy,
                 "mask_prob": mask_prob,
                 "mask_block_size": mask_block_size,
@@ -338,10 +293,6 @@ class Pipeline:
                 "rope_learnable": rope_learnable,
                 "norm_pix_loss": norm_pix_loss,
                 "spectral_loss_weight": spectral_loss_weight,
-                "use_brain_state_injection": use_brain_state_injection,
-                "brain_state_beta_init": brain_state_beta_init,
-                "use_mean_pool_temporal": use_mean_pool_temporal,
-                "use_spatial_only": use_spatial_only,
             })
 
             callbacks = [TQDMProgressBar(refresh_rate=20), ckpt_callback]

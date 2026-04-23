@@ -283,9 +283,10 @@ class ImportBCIComp2a(ImportDataDownstream):
 
         trial_label_pairs = []
 
-        # window [2s, 6s] after cue onset
-        start_offset = int(round(2.0 * sfreq))
-        end_offset = int(round(6.0 * sfreq))
+        # window [0s, 4s] after cue onset — captures full MI period
+        # (BCI-IV-2a: cue at t=2s, MI from t=2s to t=6s = 4s of MI starting at cue)
+        start_offset = int(round(0.0 * sfreq))
+        end_offset = int(round(4.0 * sfreq))
 
         label_idx = 0
         T = data.shape[1]

@@ -289,6 +289,46 @@ def _process_recording(folder_path):
     return segments
 
 
+def _downsample_majority(rows, max_ratio=5.0, seed=42):
+    """
+    Downsample the majority class (bckg) so it has at most `max_ratio` times
+    as many samples as the largest minority class.
+
+    This keeps the dataset realistic (bckg is still the biggest class) while
+    preventing 98%+ imbalance that makes balanced-accuracy metrics meaningless.
+
+    Example: if the largest minority class has 300 samples and max_ratio=5,
+    bckg is capped at 1500 samples.
+    """
+    from collections import defaultdict
+    rng = np.random.default_rng(seed)
+
+    by_label = defaultdict(list)
+    for row in rows:
+        by_label[row[1]].append(row)
+
+    bckg_label = LABEL_STR_TO_INT["bckg"]  # 5
+    minority_counts = [len(v) for k, v in by_label.items() if k != bckg_label and len(v) > 0]
+
+    if not minority_counts or bckg_label not in by_label:
+        return rows  # nothing to downsample
+
+    max_minority = max(minority_counts)
+    cap = int(max_ratio * max_minority)
+    bckg_rows = by_label[bckg_label]
+
+    if len(bckg_rows) > cap:
+        idx = rng.choice(len(bckg_rows), size=cap, replace=False)
+        by_label[bckg_label] = [bckg_rows[i] for i in sorted(idx)]
+        print(f"  Downsampled bckg: {len(bckg_rows)} → {cap} "
+              f"(cap = {max_ratio}× largest minority class = {max_minority})")
+
+    out = []
+    for label in sorted(by_label.keys()):
+        out.extend(by_label[label])
+    return out
+
+
 def _write_h5(rows, h5_path, split):
     """Write segments to HDF5."""
     if len(rows) == 0:
@@ -377,6 +417,14 @@ def import_tuev(
         for seg, label in segments:
             eval_rows.append((seg, label, part_offset + part_idx))
         print(f"  → {len(segments)} segments")
+
+    # ── Downsample bckg to reduce extreme class imbalance ──
+    # Cap bckg at 5× the largest minority class (keeps bckg dominant but usable)
+    print(f"\n{'='*60}")
+    print("Downsampling majority class (bckg)...")
+    print(f"{'='*60}")
+    train_rows = _downsample_majority(train_rows, max_ratio=5.0, seed=42)
+    eval_rows = _downsample_majority(eval_rows, max_ratio=5.0, seed=42)
 
     # ── Write HDF5 ──
     _write_h5(train_rows, output_dir / "train.h5", "train")

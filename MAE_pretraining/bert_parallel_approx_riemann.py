@@ -36,6 +36,7 @@ import os
 import torch.nn.init as init
 from MAE_pretraining.transformer_variants import (
     AdaptiveRiemannianParallelTransformer,
+    FilterBankBias,
 )
 
 
@@ -128,50 +129,53 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                  use_corr_masking=True,
                  value_bias_layers=4,
                  learn_mu_reference=True,
-                 use_luna_temporal=False, luna_num_slots=16,
-                 luna_start_layer=2, luna_spd_beta_init=0.0,
                  use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
                  rope_learnable=True,
                  spectral_loss_weight=0.0,
                  mask_strategy='random', mask_block_size=4,
-                 use_brain_state_injection=False, brain_state_beta_init=0.05,
-                 use_mean_pool_temporal=False,
-                 use_spatial_only=False):
+                 use_filter_bank=False, fb_num_bands=5,
+                 fb_sample_rate=128.0, fb_kernel_size=65,
+                 fb_band_edges=None, fb_learnable_cutoffs=False):
         super().__init__()
 
         self.config = config
         self.enc_dim = enc_dim
         self.num_channels = num_channels
         self.use_corr_masking = use_corr_masking
-        self.use_luna_temporal = use_luna_temporal
         self.use_rope = use_rope
-        self.use_brain_state_injection = use_brain_state_injection
-        self.use_mean_pool_temporal = use_mean_pool_temporal
-        self.use_spatial_only = use_spatial_only
+        self.use_filter_bank = use_filter_bank
+        self.fb_num_bands = fb_num_bands
+        self.patch_size = patch_size
 
         # Adaptive Riemannian parallel transformer layers
         # log_mode='pade' → Padé [1,1] approximant: log(S) ≈ 2(S-I)(I+S)^{-1}
         # C1: Riemannian spatial attention bias (score bias α_h · log(Σ))
-        # C2: Luna temporal compression on layers >= luna_start_layer
-        #     (skip early layers where local temporal structure matters most)
         self.encoder = nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
                 use_value_bias=(i < value_bias_layers),
                 learn_mu_reference=learn_mu_reference,
-                use_luna_temporal=(use_luna_temporal and i >= luna_start_layer),
-                luna_num_slots=luna_num_slots,
-                luna_spd_beta_init=luna_spd_beta_init,
                 use_rope=use_rope,
                 rope_freq_min=rope_freq_min,
                 rope_freq_max=rope_freq_max,
                 rope_learnable=rope_learnable,
-                use_brain_state_injection=use_brain_state_injection,
-                brain_state_beta_init=brain_state_beta_init,
-                use_mean_pool_temporal=use_mean_pool_temporal,
-                use_spatial_only=use_spatial_only,
+                use_filter_bank=use_filter_bank,
+                fb_num_bands=fb_num_bands,
             ) for i in range(depth_e)
         ])
+
+        # Encoder-level filter bank: raw-signal SincConv + mask-aware covariance.
+        # Instantiated once, outputs (B, K, C, C) reused across all layers.
+        if self.use_filter_bank:
+            self.filter_bank = FilterBankBias(
+                sample_rate=fb_sample_rate,
+                num_bands=fb_num_bands,
+                kernel_size=fb_kernel_size,
+                band_edges=fb_band_edges,
+                learnable_cutoffs=fb_learnable_cutoffs,
+            )
+        else:
+            self.filter_bank = None
 
         self.mask_prob = mask_prob
         self.mask_strategy = mask_strategy
@@ -511,6 +515,10 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         device = x.device
         channel_list = torch.tensor(channel_list, dtype=torch.long, device=device) if not isinstance(channel_list, torch.Tensor) else channel_list.to(device)
 
+        # Keep a reference to the raw signal for the filter bank BEFORE
+        # patching — FB runs on raw time-domain samples (128 Hz).
+        x_raw = x
+
         # ── Compute per-sample channel correlation from RAW EEG ──
         # Needed for correlation-aware masking or combined block+corr masking.
         # The correlation matrix is the same geometric object that
@@ -535,82 +543,69 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         chan_embedding = self.channel_embedding_e(chan_id)
         x += chan_embedding
 
-        # ── Spatial-only vs default additive-PE path ──
-        # Default path: add PE + chan_emb to ALL tokens BEFORE masking. The mask
-        #   substitution then wipes both for masked positions — they're replaced
-        #   by a bare mask_token. The model recovers position/channel info via
-        #   attention context from unmasked neighbours.
-        #
-        # Spatial-only path (Run 3): restructure so unmasked tokens stay clean
-        #   (content + chan_emb only, NO sinusoidal contamination of spatial Q/K)
-        #   and masked tokens carry explicit position + channel after substitution.
-        #   This fixes two problems at once:
-        #     (a) 79.3% sinusoidal token-magnitude dominance observed in the
-        #         temporal-attention diagnostic no longer applies — the only
-        #         tokens with PE are the ones that actually need it for target
-        #         disambiguation during reconstruction.
-        #     (b) Masked positions now carry chan_emb[c] + PE(t), so a
-        #         fully-masked time slot is no longer a set of identical
-        #         mask_tokens — spatial attention can distinguish channels.
-        if self.use_spatial_only:
-            # Mask FIRST (this wipes chan_emb on masked positions — we'll restore below).
-            if self.mask_strategy == 'block_corr':
-                x, mask = self.mask_block_corr(x, corr, C)
-            elif self.mask_strategy == 'block':
-                x, mask = self.mask_temporal_block(x, C)
-            elif self.use_corr_masking or self.mask_strategy == 'corr':
-                x, mask = self.mask_corr_channels(x, corr, C)
-            else:
-                x, mask = self.mask_bert(x)
-
-            # Re-add chan_emb AND add PE on masked positions only.
-            # Unmasked positions keep their original (content + chan_emb) — no PE.
+        # Default path: PE added to all tokens before masking.
+        # When RoPE is enabled, skip additive temporal PE — position is injected
+        # via rotation inside the temporal attention (no magnitude imbalance).
+        if not self.use_rope:
             seq_idx = torch.arange(0, N, device=device, dtype=torch.long)
             eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
             tp = self.temporal_embedding_e(eeg_seq_indices)
-            mask_f = mask.unsqueeze(-1).to(x.dtype)
-            x = x + (chan_embedding + tp) * mask_f
+            x += tp
 
-            # One-shot sanity print: PE magnitude vs mask_token magnitude on masked positions.
-            # If ratio < 0.2, PE is drowned out and masked tokens at different time steps
-            # become near-indistinguishable → kill run and scale tp.
-            if not getattr(self, '_pe_check_done', False):
-                with torch.no_grad():
-                    pe_norm = (tp * mask_f).norm(dim=-1).sum().item() / max(mask_f.sum().item(), 1.0)
-                    mt_norm = self.mask_token.norm().item()
-                    ratio = pe_norm / max(mt_norm, 1e-8)
-                    print(f"[PE/mask_token check] PE_norm={pe_norm:.4f}  mask_token_norm={mt_norm:.4f}  ratio={ratio:.3f}")
-                self._pe_check_done = True
+        # ── Masking ──
+        # Strategies: 'random' (BERT), 'block' (temporal blocks),
+        #             'corr' (correlation chains), 'block_corr' (combined)
+        if self.mask_strategy == 'block_corr':
+            x, mask = self.mask_block_corr(x, corr, C)
+        elif self.mask_strategy == 'block':
+            x, mask = self.mask_temporal_block(x, C)
+        elif self.use_corr_masking or self.mask_strategy == 'corr':
+            x, mask = self.mask_corr_channels(x, corr, C)
         else:
-            # Default path: PE added to all tokens before masking.
-            # When RoPE is enabled, skip additive temporal PE — position is injected
-            # via rotation inside the temporal attention (no magnitude imbalance).
-            if not self.use_rope:
-                seq_idx = torch.arange(0, N, device=device, dtype=torch.long)
-                eeg_seq_indices = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
-                tp = self.temporal_embedding_e(eeg_seq_indices)
-                x += tp
-
-            # ── Masking ──
-            # Strategies: 'random' (BERT), 'block' (temporal blocks),
-            #             'corr' (correlation chains), 'block_corr' (combined)
-            if self.mask_strategy == 'block_corr':
-                x, mask = self.mask_block_corr(x, corr, C)
-            elif self.mask_strategy == 'block':
-                x, mask = self.mask_temporal_block(x, C)
-            elif self.use_corr_masking or self.mask_strategy == 'corr':
-                x, mask = self.mask_corr_channels(x, corr, C)
-            else:
-                x, mask = self.mask_bert(x)
+            x, mask = self.mask_bert(x)
 
         # Extract channel indices for the adaptive Riemannian reference
         channel_idx = channel_list[0]  # (C,) global channel indices
+
+        # ── Filter-bank bias (Run 4 FB-C1) ──
+        # Build a (B, C, T) visibility mask from the token mask and compute
+        # the K per-band centered log-covariance tensors ONCE here; reuse
+        # across all encoder layers. Leakage-critical: the raw-signal samples
+        # corresponding to masked patches are zeroed before SincConv inside
+        # FilterBankBias.forward (mask-aware covariance, pairwise normalization).
+        fb_log_S = None
+        if self.filter_bank is not None:
+            with torch.no_grad():
+                # Token layout: (B, N*C) with order [t0_c0, t0_c1, …, t0_cC, t1_c0, …]
+                # → (B, N, C) → (B, C, N). Then upsample each patch to
+                # patch_size raw-time samples (uniform expansion).
+                token_mask_BNC = rearrange(mask, 'b (n c) -> b n c', c=C)
+                vis_BNC = (~token_mask_BNC).to(x_raw.dtype)                # (B, N, C)
+                vis_BCN = vis_BNC.permute(0, 2, 1).contiguous()            # (B, C, N)
+                # Expand each of the N patches to patch_size raw samples
+                # → (B, C, N*patch_size). Trim / pad to the true T length.
+                vis_BCT = vis_BCN.unsqueeze(-1).expand(
+                    B, C, N, self.patch_size
+                ).reshape(B, C, N * self.patch_size)
+                if vis_BCT.shape[-1] > T:
+                    vis_BCT = vis_BCT[..., :T]
+                elif vis_BCT.shape[-1] < T:
+                    # Pad the tail as visible (unmasked) — rare path when
+                    # patch_size doesn't divide T exactly.
+                    pad = torch.ones(
+                        B, C, T - vis_BCT.shape[-1],
+                        device=vis_BCT.device, dtype=vis_BCT.dtype,
+                    )
+                    vis_BCT = torch.cat([vis_BCT, pad], dim=-1)
+
+            fb_log_S = self.filter_bank(x_raw, vis_BCT, channel_idx)   # (B, K, C, C)
 
         # Pass through adaptive Riemannian transformer layers.
         # mask is passed so masked channels are zeroed before covariance
         # computation (prevents mask token from contaminating the geometry).
         for transformer in self.encoder:
-            x = transformer(x, C, channel_idx=channel_idx, mask=mask)
+            x = transformer(x, C, channel_idx=channel_idx, mask=mask,
+                            fb_log_S=fb_log_S)
 
         x = self.norm_enc(x)
         x = self.fc(x)
@@ -625,6 +620,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         channel_list = torch.tensor(channel_list, dtype=torch.long, device=device) \
             if not isinstance(channel_list, torch.Tensor) else channel_list.to(device)
 
+        x_raw = eeg
         x = self.patch(eeg)
         N = x.shape[1]
         L = N * C
@@ -635,17 +631,20 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         chan_id = channel_list.unsqueeze(1).repeat(1, N, 1).view(B, L)
         x = x + self.channel_embedding_e(chan_id)
 
-        # Spatial-only: no mask in this path → no positions get PE (matches
-        # pretraining semantics where PE is gated on mask_f). Unmasked tokens
-        # during both training and inference stay in (content + chan_emb) space.
-        if not self.use_rope and not self.use_spatial_only:
+        if not self.use_rope:
             seq_idx = torch.arange(N, device=device)
             eeg_seq = seq_idx.unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
             x = x + self.temporal_embedding_e(eeg_seq)
 
         channel_idx = channel_list[0]
+
+        # FB bias with all-visible mask (no masking during feature extraction).
+        fb_log_S = None
+        if self.filter_bank is not None:
+            fb_log_S = self.filter_bank(x_raw, None, channel_idx)  # (B, K, C, C)
+
         for layer in self.encoder:
-            x = layer(x, C, channel_idx=channel_idx)
+            x = layer(x, C, channel_idx=channel_idx, fb_log_S=fb_log_S)
 
         return self.norm_enc(x)
 
@@ -783,38 +782,6 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 self.log(f"mu_max_abs/layer_{i}", mu.detach().abs().max(),
                          on_step=False, on_epoch=True)
 
-            # C2: Luna temporal compression diagnostics
-            if hasattr(layer.attn, 'luna_temporal'):
-                luna = layer.attn.luna_temporal
-                # SPD distance weight β — should grow from 0 if geometry helps
-                self.log(f"luna_spd_beta/layer_{i}", luna.spd_beta.detach(),
-                         on_step=False, on_epoch=True)
-                # Prototype factor norms — track whether prototypes are specializing
-                # mu_proto_factors: (l, C_total, r) — compute ‖U_q‖_F per slot
-                U = luna.mu_proto_factors.detach()
-                proto_norms = U.reshape(luna.num_slots, -1).norm(dim=-1)
-                self.log(f"luna_proto_norm_mean/layer_{i}", proto_norms.mean(),
-                         on_step=False, on_epoch=True)
-                self.log(f"luna_proto_norm_std/layer_{i}", proto_norms.std(),
-                         on_step=False, on_epoch=True)
-
-            # ── C2 v2: brain-state injection diagnostics ──
-            # Kill condition: grad_brain_proj norm should be > 1e-4 by epoch 5.
-            # If it stays near zero, the cooperation pathway is dead on arrival
-            # (the projection isn't receiving useful gradient from temporal loss).
-            if hasattr(layer.attn, 'brain_state_injection'):
-                bsi = layer.attn.brain_state_injection
-                beta_vec = bsi.beta.detach()
-                self.log(f"brain_beta_mean/layer_{i}", beta_vec.mean(),
-                         on_step=False, on_epoch=True)
-                self.log(f"brain_beta_max_abs/layer_{i}", beta_vec.abs().max(),
-                         on_step=False, on_epoch=True)
-                # Per-head β so we can see whether all heads specialize or only some use it
-                for h_idx in range(bsi.num_heads):
-                    self.log(f"brain_beta/layer_{i}_h{h_idx}",
-                             beta_vec[h_idx],
-                             on_step=False, on_epoch=True)
-
             # ── RoPE frequency logging ──
             if hasattr(layer.attn, 'temporal_rope'):
                 rope = layer.attn.temporal_rope
@@ -831,28 +798,6 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                          on_step=False, on_epoch=True)
 
         return loss
-
-    def on_after_backward(self):
-        """Log gradient norms for C2 v2 brain_state pathway.
-
-        Runs after loss.backward() but before optimizer.step()/zero_grad,
-        so .grad is still populated. We only log once per step (on the last
-        accumulated batch Lightning already handles this via training_step
-        calling order). Cheap: a few norm() calls.
-        """
-        if not self.use_brain_state_injection:
-            return
-        for i, layer in enumerate(self.encoder):
-            if hasattr(layer.attn, 'brain_state_injection'):
-                bsi = layer.attn.brain_state_injection
-                if bsi.proj.weight.grad is not None:
-                    self.log(f"grad_brain_proj/layer_{i}",
-                             bsi.proj.weight.grad.detach().norm(),
-                             on_step=False, on_epoch=True)
-                if bsi.beta.grad is not None:
-                    self.log(f"grad_brain_beta/layer_{i}",
-                             bsi.beta.grad.detach().norm(),
-                             on_step=False, on_epoch=True)
 
     def validation_step(self, batch, batch_idx):
         data, channel_list = batch
@@ -902,8 +847,7 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         # (model learned temporal structure). High entropy = uniform
         # (temporal branch not learning). Track first and last layer.
         # Only compute on first validation batch per epoch (cheap enough).
-        # Skip when temporal branch is mean-pool: no attention weights to log.
-        if batch_idx == 0 and not self.use_mean_pool_temporal:
+        if batch_idx == 0:
             with torch.no_grad():
                 # Run a forward pass through encoder to capture attention
                 x_diag = self.patch(data)

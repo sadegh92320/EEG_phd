@@ -223,138 +223,6 @@ def pade_matrix_log(M, num_squarings=4, sqrt_iters=6, pade_order=6):
     return result.to(orig_dtype)
 
 
-class RotaryEmbedding(nn.Module):
-    """
-        Implementation of the Rotary embedding which attributes to each token
-        pair a relative rotation.
-    """
-    def __init__(self, model_dim,theta = 10000,is_learnable = False):
-        super().__init__()
-        assert model_dim % 2 == 0
-        self.is_learnable = is_learnable
-
-        #Define the frequency of the angle
-        self.freqs = nn.Parameter(
-            1. / (theta ** (torch.arange(0, model_dim, 2)[:(model_dim // 2)].float() / model_dim)),
-            requires_grad = is_learnable)
-
-    def create_frequency(self, kept_ids, device, dtype):
-
-        #Total number of patches
-        #Shape (num_patches)
-        B, N = kept_ids.shape
-        kept_ids = kept_ids.to(self.freqs.dtype).to(self.freqs.device)
-
-        #Do the outer product between the freqs and all the kept patch indices
-        freqs = kept_ids.reshape(B,N,1) * self.freqs
-        #Convert the angle to polar coordinate
-        polar = torch.polar(torch.ones_like(freqs), freqs)
-        return polar
-
-    def forward(self, x, id_kepts):
-        #B, num_head, num_patch, dim_head
-        B, H, N, D = x.shape
-        device = x.device
-        dtype = x.dtype
-        ndim = x.ndim
-        assert D == 2 * self.freqs.numel(), "RoPE model_dim must equal x last dim"
-
-        assert id_kepts.shape == (B, N)
-    
-        polar = self.create_frequency(kept_ids=id_kepts, device=device, dtype=dtype)
-
-        #Dimension B, 1, N, D
-        polar = polar.unsqueeze(1)
-
-        #Dimension B, num_head, N, D//2, 2
-        #Segment the last dimension in individual 2D plan
-        x2 = x.view(*x.shape[:-1], D//2, 2).contiguous()
-
-        #Convert the vector is polar form to complex number
-        x_complex = torch.view_as_complex(x2)
-
-        #Multiply the vector by the angle then transform back to real number with correct shape
-        x_rotate = x_complex * polar
-        x_real = torch.view_as_real(x_rotate)
-        x_real = x_real.reshape(*x.shape)
-        return x_real
-
-
-class MultiHeadAttention(nn.Module):
-    """Multi head attention module, takes the embedding dim and number of head."""
-    def __init__(self, embed_dim, num_heads = 3, dropout = 0.1, att_dropout = 0.1,is_causal = False, return_att = False, use_rotary = False, has_cls = False):
-        super().__init__()
-        assert embed_dim % num_heads == 0
-        self.h = num_heads
-        self.dim_head = embed_dim//num_heads
-        self.qkv = nn.Linear(embed_dim, 3*embed_dim)
-        self.fc = nn.Linear(embed_dim,embed_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.is_causal = is_causal
-        self.return_att = return_att
-        self.att_dropout = att_dropout
-        self.use_rotary = use_rotary
-
-        #Used as a flag to signal if the input is expected to have the class token
-        self.has_cls = has_cls
-
-        self.rotary = RotaryEmbedding(model_dim=embed_dim//num_heads)
-
-    def split_heads(self, X):
-        return X.view(X.size(0), X.size(1), 3, self.h, self.dim_head).permute(2, 0, 3, 1, 4)      
-
-    def forward(self, x, position = None):
-        #Compute Q, K and V and seperate segments per head
-        B, N, D = x.shape
-
-        #Extract the query key value vectors each with shape
-        # B, num_head, num_patches, dim_head
-        qkv = self.split_heads(self.qkv(x))
-        
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        #If Rotary embeddings are used then apply it in the attention mechanism
-        if self.use_rotary:
-            assert position is not None, "position required when use_rotary=True"
-            #shape is B, num_heads, num_patches, dim_head
-            if self.has_cls:
-                q, class_token_q = q[:,:,1:,:], q[:,:,:1,:]
-                k, class_token_k = k[:,:,1:,:], k[:,:,:1,:]
-                q = self.rotary(q, position)
-                k = self.rotary(k, position)
-                k = torch.concat([class_token_k, k], dim=2)
-                q = torch.concat([class_token_q, q], dim=2)
-            else:
-                q = self.rotary(q, position)
-                k = self.rotary(k, position)
-
-        #Compute the attention score
-        if self.return_att:
-            score = (q@k.transpose(2,3))/(self.dim_head**0.5)
-
-            #If causal we mask all date happening in the future
-            if self.is_causal:
-                T = score.size(-1)
-                device = score.device
-                mask = torch.triu(torch.ones(T,T, dtype=torch.bool, device=device), diagonal=1)
-                score = score.masked_fill(mask, float('-inf'))
-                
-            #Compute the attnetion matrix
-            score = score.softmax(dim=-1)
-            
-            #Apply attention to V
-            attn = F.dropout(score, p=self.att_dropout, training=self.training)
-            out = attn@v
-        else:
-            #Compute the attention score using pytorch built in function
-            out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, dropout_p=self.att_dropout if self.training else 0, is_causal=self.is_causal)
-            score = None
-        out = out.transpose(1,2)
-        out = out.reshape(out.size(0), out.size(1), self.h*self.dim_head)
-        out = self.fc(out)
-        return self.dropout(out), score
-
 class MultiHeadAttentionViT(nn.Module):
     """Multi head attention module, takes the embedding dim and number of head."""
     def __init__(self, embed_dim, num_heads = 3, proj_drop = 0.1, att_dropout = 0.1, qkv_bias = True):
@@ -390,48 +258,6 @@ class MultiHeadAttentionViT(nn.Module):
         out = self.fc(out)
         out = self.proj_drop(out)
         return out
-
-
-class MultiHeadCrossAttention(nn.Module):
-    """Multi head attention module, takes the embedding dim and number of head."""
-    def __init__(self, embed_dim, num_heads = 3, proj_drop = 0.1, att_dropout = 0.1, qkv_bias = True):
-        super().__init__()
-        assert embed_dim % num_heads == 0
-        self.h = num_heads
-        self.dim_head = embed_dim//num_heads
-        self.k = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
-        self.q = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
-        self.v = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
-        self.fc = nn.Linear(embed_dim,embed_dim)
-        self.att_dropout = att_dropout
-        self.proj_drop = nn.Dropout(proj_drop)
-
-
-    def split_heads(self, X):
-        return X.view(X.size(0), X.size(1), self.h, self.dim_head).permute(0, 2, 1, 3)      
-
-    def forward(self, key, query, mask_pad = None):
-        #Compute Q, K and V and seperate segments per head
-
-        #Extract the query key value vectors each with shape
-        # B, num_head, num_patches, dim_head
-        k = self.k(key)
-        v = self.v(key)
-        q = self.q(query)
-        k = self.split_heads(k)
-        v = self.split_heads(v)
-        q = self.split_heads(q)
-
-        #Compute the attention score
-        out = torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, attn_mask=mask_pad, dropout_p=self.att_dropout if self.training else 0, is_causal=False)
-
-        out = out.transpose(1,2)
-        out = out.reshape(out.size(0), out.size(1), self.h*self.dim_head)
-        out = self.fc(out)
-        out = self.proj_drop(out)
-        return out
-    
 
 
 class DropPath(nn.Module):
@@ -497,64 +323,6 @@ class TransformerLayerViT(nn.Module):
 
         return x
     
-class CrossTransformerLayer(nn.Module):
-    def __init__(self, embed_dim, nhead, mlp_ratio = 4, qkv_bias = True,drop = 0, att_drop = 0, 
-                 drop_path = 0, act = nn.GELU, norm = nn.LayerNorm):
-        super().__init__()
-        self.attn = MultiHeadCrossAttention(embed_dim=embed_dim, num_heads=nhead, proj_drop=drop,
-                                               att_dropout=att_drop, qkv_bias=qkv_bias)
-        self.drop_path = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
-        self.drop_path2 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
-        self.norm1 = norm(embed_dim)
-        self.norm2 = norm(embed_dim)
-        hidden_size = int(embed_dim * mlp_ratio)
-        self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
-
-    def forward(self, query, key, mask_pad = None):
-        x = query + self.drop_path(self.attn(self.norm1(key), self.norm1(query), mask_pad))
-        x = x + self.drop_path2(self.mlp(self.norm2(x)))
-
-        return x
-
-
-
-
-class TransformerLayer(nn.Module):
-    """Define one transformer layer"""
-    def __init__(self, embed_dim, nhead = 3, dim_feedforward=2048, dropout=0.1, activation = "gelu", keep_prob = 1, use_rotary = False, has_cls = False):
-        super().__init__()
-        self.self_attn = MultiHeadAttention(embed_dim=embed_dim, num_heads=nhead, dropout=dropout, use_rotary=use_rotary, has_cls = has_cls)
-        self.linear1 = nn.Linear(embed_dim, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, embed_dim)
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        activations = {"gelu": nn.GELU(), "relu": nn.ReLU()}
-        self.activation = activations[activation]
-        self.drop_path = DropPath(keep_prob=keep_prob) if keep_prob < 1 else nn.Identity()
-
-    def forward(self, src, keep):
-        #Compute the multihead attention
-        z = self.norm1(src)
-        attn, _ = self.self_attn(z, position = keep)
-
-        #Apply residual connection and layer normalization
-        Z = src + self.drop_path(attn)
-
-        #Apply normalization
-        ff = self.norm2(Z)
-
-        #MLP layer
-        ff = self.dropout(self.linear2(self.dropout(self.activation(self.linear1(ff)))))
-
-        return (Z + self.drop_path(ff))
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange
-
 class TimeAttention(nn.Module):
     def __init__(self, embed_dim, num_heads=3, dropout=0.1, att_dropout=0.1, is_causal=False):
         super().__init__()
@@ -597,89 +365,6 @@ class TimeAttention(nn.Module):
         x = rearrange(x, "b n c d -> b (n c) d")
 
         return self.dropout(x)
-
-
-class SpaceAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads=3, dropout=0.1, att_dropout=0.1):
-        super().__init__()
-        assert embed_dim % num_heads == 0
-        self.h = num_heads
-        self.dim_head = embed_dim // num_heads
-        self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
-        self.fc = nn.Linear(embed_dim, embed_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.att_dropout = att_dropout
-
-    def split_heads(self, x):
-        return x.view(x.size(0), x.size(1), 3, self.h, self.dim_head).permute(2, 0, 3, 1, 4)
-
-    def forward(self, x, num_chan):
-        B, L, D = x.shape
-        assert L % num_chan == 0
-        N = L // num_chan
-
-        # (B, L, D) -> (B, N, C, D) -> (B*N, C, D)
-        x = rearrange(x, "b (n c) d -> b n c d", c=num_chan)
-        x = rearrange(x, "b n c d -> (b n) c d")
-
-        qkv = self.split_heads(self.qkv(x))
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        score = (q @ k.transpose(-2, -1)) / (self.dim_head ** 0.5)
-        score = score.softmax(dim=-1)
-        attn = F.dropout(score, p=self.att_dropout, training=self.training)
-
-        out = attn @ v
-        out = out.transpose(1, 2).reshape(out.size(0), out.size(2), self.h * self.dim_head)
-        out = self.fc(out)
-
-        # (B*N, C, D) -> (B, N, C, D) -> (B, L, D)
-        out = rearrange(out, "(b n) c d -> b n c d", b=B, n=N)
-        out = rearrange(out, "b n c d -> b (n c) d")
-
-        return self.dropout(out)
-
-
-
-class CrissCrossTransformer(nn.Module):
-    def __init__(self, embed_dim, nhead, num_chan, mlp_ratio=4, drop=0.0, att_drop=0.0,
-                 drop_path=0.0, act=nn.GELU, norm=nn.LayerNorm):
-        super().__init__()
-        self.num_chan = num_chan
-
-        self.attn_time = TimeAttention(
-            embed_dim=embed_dim,
-            num_heads=nhead,
-            dropout=drop,
-            att_dropout=att_drop
-        )
-        self.attn_space = SpaceAttention(
-            embed_dim=embed_dim,
-            num_heads=nhead,
-            dropout=drop,
-            att_dropout=att_drop
-        )
-
-        self.drop_path1 = nn.Identity()
-        self.drop_path2 = nn.Identity()
-        self.drop_path3 = nn.Identity()
-
-        self.norm1 = norm(embed_dim)
-        self.norm2 = norm(embed_dim)
-        self.norm3 = norm(embed_dim)
-
-        hidden_size = int(embed_dim * mlp_ratio)
-        self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
-
-    def forward(self, x):
-        x = x + self.drop_path1(self.attn_time(self.norm1(x), self.num_chan))
-        x = x + self.drop_path2(self.attn_space(self.norm2(x), self.num_chan))
-        x = x + self.drop_path3(self.mlp(self.norm3(x)))
-        return x
-
-    
-def dist_spd(spd1, spd2):
-    pass
 
 
 # =============================================================================
@@ -926,199 +611,6 @@ class RiemannianCrissCrossTransformer(nn.Module):
     
 
 
-class RiemannianSpaceTransformer(nn.Module):
-    
-    def __init__(self, embed_dim, nhead, mlp_ratio=4, drop=0.0, att_drop=0.0,
-                 drop_path=0.0, act=nn.GELU, norm=nn.LayerNorm, spd_eps=1e-5):
-        super().__init__()
-       
-        # Spatial attention with Riemannian bias — this is where the manifold
-        # structure of channel covariances gets injected
-        self.attn_space = RiemannianSpaceAttention(
-            embed_dim=embed_dim,
-            num_heads=nhead,
-            dropout=drop,
-            att_dropout=att_drop,
-            eps=spd_eps
-        )
-
-        self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
-        self.drop_path2 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
-        
-        self.norm1 = norm(embed_dim)
-        self.norm2 = norm(embed_dim)
-       
-
-        hidden_size = int(embed_dim * mlp_ratio)
-        self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
-
-    def forward(self, x, num_chan):
-        
-        x = x + self.drop_path1(self.attn_space(self.norm1(x), num_chan))
-        x = x + self.drop_path2(self.mlp(self.norm2(x)))
-        return x
-    
-class RiemannianTimeTransformer(nn.Module):
-    
-    def __init__(self, embed_dim, nhead, mlp_ratio=4, drop=0.0, att_drop=0.0,
-                 drop_path=0.0, act=nn.GELU, norm=nn.LayerNorm, spd_eps=1e-5):
-        super().__init__()
-       
-
-        # Temporal attention stays Euclidean — temporal dynamics within a single
-        # channel are sequential, not covariance-structured
-        self.attn_time = TimeAttention(
-            embed_dim=embed_dim,
-            num_heads=nhead,
-            dropout=drop,
-            att_dropout=att_drop
-        )
-
-      
-
-        self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
-        self.drop_path2 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
-       
-
-        self.norm1 = norm(embed_dim)
-        self.norm2 = norm(embed_dim)
-       
-
-        hidden_size = int(embed_dim * mlp_ratio)
-        self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
-
-    def forward(self, x, num_chan):
-        x = x + self.drop_path1(self.attn_time(self.norm1(x), num_chan))
-        x = x + self.drop_path2(self.mlp(self.norm2(x)))
-        return x
-
-
-class RiemannianParallelAttention(nn.Module):
-    """
-    CBraMod-style parallel spatial-temporal attention with Riemannian bias.
-
-    A single QKV projection is shared. Heads are split in two:
-      - First half: temporal attention (B*C, N, D_half) — Euclidean
-      - Second half: spatial attention (B*N, C, D_half) — Riemannian-biased
-
-    Outputs are concatenated back to full dimension and projected.
-    """
-    def __init__(self, embed_dim, num_heads=8, dropout=0.1, att_dropout=0.1, spd_eps=1e-5):
-        super().__init__()
-        assert num_heads % 2 == 0, "num_heads must be even for parallel split"
-        assert embed_dim % num_heads == 0
-
-        self.num_heads = num_heads
-        self.heads_per_branch = num_heads // 2
-        self.dim_head = embed_dim // num_heads
-        self.embed_dim = embed_dim
-        self.half_dim = self.heads_per_branch * self.dim_head  # D // 2
-
-        # Shared QKV projection
-        self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
-        # Output projection
-        self.fc = nn.Linear(embed_dim, embed_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.att_dropout = att_dropout
-
-        # Riemannian bias for spatial heads only
-        self.riemannian_bias = RiemannianAttentionBias(num_heads=self.heads_per_branch, eps=spd_eps)
-
-    def forward(self, x, num_chan):
-        B, L, D = x.shape
-        assert L % num_chan == 0
-        N = L // num_chan
-        H = self.num_heads
-        H2 = self.heads_per_branch
-        d = self.dim_head
-
-        # Shared QKV: (B, L, D) -> (B, L, 3*D)
-        qkv = self.qkv(x).reshape(B, L, 3, H, d).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, H, L, d)
-
-        # Split heads: first H2 for temporal, last H2 for spatial
-        q_t, q_s = q[:, :H2], q[:, H2:]  # (B, H2, L, d)
-        k_t, k_s = k[:, :H2], k[:, H2:]
-        v_t, v_s = v[:, :H2], v[:, H2:]
-
-        # ── Temporal attention (Euclidean) ──
-        # Reshape: (B, H2, N*C, d) -> (B, H2, N, C, d) -> (B*C, H2, N, d)
-        q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
-        k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
-        v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=num_chan)
-
-        out_t = F.scaled_dot_product_attention(
-            q_t, k_t, v_t,
-            dropout_p=self.att_dropout if self.training else 0.0,
-        )  # (B*C, H2, N, d)
-        # Back to (B, H2, N*C, d)
-        out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=num_chan)
-
-        # ── Spatial attention (Riemannian-biased) ──
-        # Reshape: (B, H2, N*C, d) -> (B*N, H2, C, d)
-        q_s = rearrange(q_s, 'b h (n c) d -> (b n) h c d', c=num_chan)
-        k_s = rearrange(k_s, 'b h (n c) d -> (b n) h c d', c=num_chan)
-        v_s = rearrange(v_s, 'b h (n c) d -> (b n) h c d', c=num_chan)
-
-        # Compute Riemannian bias from the input embeddings at each time step
-        x_space = rearrange(x, 'b (n c) d -> (b n) c d', c=num_chan)
-        riem_bias = self.riemannian_bias(x_space)  # (B*N, H2, C, C)
-
-        # Manual spatial attention with Riemannian bias — float32 for stability
-        with torch.amp.autocast('cuda', enabled=False), \
-             torch.amp.autocast('cpu', enabled=False):
-            score = (q_s.float() @ k_s.float().transpose(-2, -1)) / (d ** 0.5)
-            score = score + riem_bias.float()
-            score = score.softmax(dim=-1)
-        score = F.dropout(score, p=self.att_dropout, training=self.training)
-        out_s = score.to(v_s.dtype) @ v_s  # (B*N, H2, C, d)
-
-        # Back to (B, H2, N*C, d)
-        out_s = rearrange(out_s, '(b n) h c d -> b h (n c) d', b=B, n=N)
-
-        # ── Concatenate heads and project ──
-        out = torch.cat([out_t, out_s], dim=1)  # (B, H, L, d)
-        out = rearrange(out, 'b h l d -> b l (h d)')
-        out = self.fc(out)
-        return self.dropout(out)
-
-
-class RiemannianParallelCrissCrossTransformer(nn.Module):
-    """
-    CBraMod-style transformer layer: parallel head-split spatial-temporal attention
-    with Riemannian bias on the spatial heads.
-
-    Unlike sequential (time→space) or separate (two encoder stacks), this fuses
-    spatial and temporal information at every layer through shared MLP processing
-    after parallel head-split attention.
-    """
-    def __init__(self, embed_dim, nhead=8, mlp_ratio=4, drop=0.0, att_drop=0.0,
-                 drop_path=0.0, act=nn.GELU, norm=nn.LayerNorm, spd_eps=1e-5):
-        super().__init__()
-
-        self.attn = RiemannianParallelAttention(
-            embed_dim=embed_dim,
-            num_heads=nhead,
-            dropout=drop,
-            att_dropout=att_drop,
-            spd_eps=spd_eps,
-        )
-
-        self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
-        self.drop_path2 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
-
-        self.norm1 = norm(embed_dim)
-        self.norm2 = norm(embed_dim)
-
-        hidden_size = int(embed_dim * mlp_ratio)
-        self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
-
-    def forward(self, x, num_chan):
-        x = x + self.drop_path1(self.attn(self.norm1(x), num_chan))
-        x = x + self.drop_path2(self.mlp(self.norm2(x)))
-        return x
-
-
 # =============================================================================
 # Improved Riemannian Attention: Adaptive Reference + Residual Stream Bias
 # =============================================================================
@@ -1332,368 +824,327 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         return bias, L
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# C2: Riemannian Luna Temporal Compression
+# ═════════════════════════════════════════════════════════════════════════════
+# FilterBankBias — Run 4 FB-C1
+# ═════════════════════════════════════════════════════════════════════════════
 #
-# Luna-style pack-unpack bottleneck restricted to the TEMPORAL dimension.
-# l learnable auxiliary tokens compress N temporal tokens via cross-attention,
-# process them with cheap l×l self-attention, then decompress back to N.
+# Inject FBCSP-style band-specific spatial priors into the Riemannian attention
+# bias. Classical EEG analysis (Ang et al. 2008 FBCSP, Barachant et al. 2012
+# MDRM) separates signal into K physiological bands and computes one covariance
+# matrix per band — we bring that prior into the transformer as a learnable
+# additive bias on top of the adaptive per-layer C1 bias.
 #
-# The novelty: SPD-biased pack attention. Each auxiliary token carries a
-# learnable SPD prototype μ_q on the channel covariance manifold. During
-# packing, tokens whose spatial covariance S_t is close to μ_q (in Frobenius
-# distance on the tangent space) get higher attention scores. This makes the
-# compression geometry-aware: slots specialize in tokens from distinct
-# covariance regimes (brain states), rather than compressing arbitrarily.
+# Design (all constraints from the pressure test are enforced here):
+#   (1) SincConv on RAW signal, once at the encoder level. Not per-layer:
+#       raw-frequency semantics degrade past the first few transformer layers.
+#   (2) MASK-AWARE covariance. During pretraining, the raw-signal samples
+#       corresponding to masked patches are zeroed BEFORE SincConv. Each pair
+#       (i, j) is normalized by the number of time samples where BOTH channels
+#       are visible — prevents masked content from leaking into S_k.
+#   (3) Ridge regularization λI on S_k before Padé log-map; guarantees SPD
+#       even with heavy masking and high channel counts.
+#   (4) SincConv cutoffs FROZEN at init by default. Learnable cutoffs have
+#       a collapse mode (bands drift together) that wastes capacity.
+#   (5) β gates — the per-head per-band scalars that multiply the FB bias —
+#       are declared in the attention module (not here). They init to 0 so
+#       a fresh --use_filter_bank run on an old C1+C3 checkpoint matches the
+#       checkpoint's behavior bit-for-bit at epoch 0.
 #
-# The SPD distance reuses L (the log-map output from C1's Riemannian bias),
-# so there is zero extra eigendecomposition cost — only l Frobenius distances
-# per token, which is negligible.
-#
-# Reference: Ma et al., "Luna: Linear Unified Nested Attention", NeurIPS 2021.
-# ─────────────────────────────────────────────────────────────────────────────
+# Output: per-band (log(S_k) − μ_k), shape (B, K, C, C). Reused across all
+# transformer layers via an `fb_log_S` kwarg threaded through forward().
+# ═════════════════════════════════════════════════════════════════════════════
 
-class RiemannianLunaTemporalCompression(nn.Module):
+
+class SincConv1d(nn.Module):
     """
-    Geometry-guided temporal token compression via Luna-style pack-unpack.
+    Parametric bandpass SincConv layer.
 
-    Replaces standard N×N temporal self-attention with:
-        1. Pack:   l queries cross-attend to N tokens  → O(l·N)
-        2. Process: self-attention among l tokens       → O(l²)
-        3. Unpack: N queries cross-attend to l tokens   → O(N·l)
-
-    Total: O(N·l) instead of O(N²).
-
-    SPD bias in pack step: score(q,t) = Q_q·K_t/√d − β·‖L_t − μ_q‖_F
-    where L_t = log(S_t) is the tangent-space covariance (reused from C1),
-    and μ_q is a learnable per-slot prototype in global channel space.
-
-    Memory-efficient design:
-        - Reuses q_t/k_t/v_t from shared QKV projection (no redundant pack/unpack
-          projections). Only the slot query (pack) and slot self-attention need
-          dedicated projections.
-        - SPD prototypes use low-rank factorization: μ_q = U_q U_q^T where
-          U_q ∈ ℝ^{C_total × r}. Reduces params from l·C²_total to l·C_total·r.
+    Each band is a windowed sinc bandpass: h(t) = 2f_hi sinc(2f_hi t)
+                                                - 2f_lo sinc(2f_lo t),
+    multiplied by a Hamming window. Parameters: (f_lo, f_hi) per band — with
+    `learnable=False` they are registered as buffers (frozen at init) and
+    applied via a standard depthwise conv1d.
 
     Args:
-        embed_dim:       Total embedding dimension
-        num_temporal_heads: Number of temporal heads (typically 4)
-        num_slots:       l — number of auxiliary compression tokens
-        total_channels:  Size of global channel space (144)
-        att_dropout:     Attention dropout probability
-        spd_beta_init:   Initial value for β (SPD distance weight). 0 → starts
-                         as standard Luna, learns to use geometry.
-        proto_rank:      Rank of low-rank prototype factorization (default 8).
+        sample_rate: Hz of the input signal.
+        num_bands:   K bands in the filter bank.
+        kernel_size: FIR taps. Must be odd. Longer → sharper transitions but
+                     heavier boundary decay at low frequencies. Default 65
+                     taps ≈ 0.5 s at 128 Hz — adequate for α/β/γ, marginal
+                     for δ (0.5-4 Hz). Use 129 if δ fidelity matters.
+        band_edges:  list of (f_lo, f_hi) in Hz. Length must equal num_bands.
+                     Default: classical EEG bands (δ, θ, α, β, γ).
+        learnable:   If True, cutoffs trained with the rest of the model. If
+                     False (default), cutoffs are frozen buffers.
+        min_band_hz: floor for (f_hi - f_lo) when learnable — prevents
+                     collapse to zero-bandwidth.
     """
+    DEFAULT_BANDS = [(0.5, 4.0), (4.0, 8.0), (8.0, 13.0), (13.0, 30.0), (30.0, 50.0)]
 
-    def __init__(self, embed_dim, num_temporal_heads=4, num_slots=16,
-                 total_channels=TOTAL_GLOBAL_CHANNELS,
-                 att_dropout=0.1, spd_beta_init=0.0, proto_rank=8):
+    def __init__(self, sample_rate, num_bands=5, kernel_size=65,
+                 band_edges=None, learnable=False, min_band_hz=1.0):
         super().__init__()
-        self.num_heads = num_temporal_heads
-        self.num_slots = num_slots
-        self.dim_head = embed_dim // (num_temporal_heads * 2)  # half-dim since parallel split
+        assert kernel_size % 2 == 1, f"kernel_size must be odd, got {kernel_size}"
+        if band_edges is None:
+            band_edges = self.DEFAULT_BANDS
+        assert len(band_edges) == num_bands, \
+            f"band_edges length {len(band_edges)} != num_bands {num_bands}"
+
+        self.sample_rate = float(sample_rate)
+        self.num_bands = num_bands
+        self.kernel_size = kernel_size
+        self.learnable = learnable
+        self.min_band_hz = float(min_band_hz)
+
+        lo = torch.tensor([e[0] for e in band_edges], dtype=torch.float32)
+        hi = torch.tensor([e[1] for e in band_edges], dtype=torch.float32)
+        # Parameterize as (f_lo, band_width): keeps hi > lo by construction.
+        band_hz = hi - lo
+
+        if learnable:
+            self.f_lo = nn.Parameter(lo)
+            self.band_hz = nn.Parameter(band_hz)
+        else:
+            self.register_buffer('f_lo', lo)
+            self.register_buffer('band_hz', band_hz)
+
+        # Hamming window and symmetric time axis, registered as buffers.
+        n = (kernel_size - 1) // 2
+        # Symmetric time axis in SAMPLES, excluding 0 (center handled via limit).
+        t = torch.arange(-n, n + 1, dtype=torch.float32)
+        self.register_buffer('t_axis', t)
+        window = 0.54 - 0.46 * torch.cos(
+            2.0 * math.pi * torch.arange(kernel_size, dtype=torch.float32)
+            / (kernel_size - 1)
+        )
+        self.register_buffer('window', window)
+
+    def _build_filters(self):
+        """Build the K bandpass filters from current (f_lo, band_hz)."""
+        # Clamp to physically valid range: 0 < f_lo < f_hi < Nyquist.
+        f_lo = self.f_lo.clamp(min=0.0, max=self.sample_rate / 2.0 - self.min_band_hz)
+        band = self.band_hz.clamp(min=self.min_band_hz,
+                                  max=self.sample_rate / 2.0)
+        f_hi = (f_lo + band).clamp(max=self.sample_rate / 2.0)
+
+        # Normalize by sample rate: cycles per sample.
+        f_lo_norm = (f_lo / self.sample_rate).view(-1, 1)  # (K, 1)
+        f_hi_norm = (f_hi / self.sample_rate).view(-1, 1)  # (K, 1)
+        t = self.t_axis.view(1, -1)                        # (1, L)
+
+        # Ideal bandpass FIR: h(t) = 2 f_hi sinc(2 f_hi t) − 2 f_lo sinc(2 f_lo t).
+        # At t=0 the sinc limit is 1, so h(0) = 2 (f_hi − f_lo). Handle that
+        # by replacing NaN / large values at the center with the analytic limit.
+        two_pi_hi_t = 2 * math.pi * f_hi_norm * t
+        two_pi_lo_t = 2 * math.pi * f_lo_norm * t
+
+        # Safe division: where t==0, directly substitute the limit later.
+        eps = 1e-12
+        # sinc(2f t) = sin(2π f t) / (π t), using t in samples → replace π t with
+        # the normalized formula via (1/t).
+        # Here t is in samples — use the standard form with π:
+        sinc_hi = torch.where(
+            t.abs() < 1e-9,
+            2.0 * f_hi_norm.expand_as(t) * torch.ones_like(t),
+            torch.sin(two_pi_hi_t) / (math.pi * t + eps),
+        )
+        sinc_lo = torch.where(
+            t.abs() < 1e-9,
+            2.0 * f_lo_norm.expand_as(t) * torch.ones_like(t),
+            torch.sin(two_pi_lo_t) / (math.pi * t + eps),
+        )
+        filt = sinc_hi - sinc_lo                               # (K, L)
+        filt = filt * self.window.unsqueeze(0)                 # Hamming window
+        # Energy-normalize each band → each filter has unit L2 norm so the
+        # covariance of a unit-variance white signal is comparable across bands.
+        filt = filt / (filt.norm(dim=-1, keepdim=True) + 1e-8)
+        return filt                                            # (K, L)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, C, T) raw signal.
+        Returns:
+            y: (B, K, C, T) band-filtered signal per band.
+        """
+        B, C, T = x.shape
+        K = self.num_bands
+        filt = self._build_filters()                           # (K, L)
+        # Depthwise conv: treat the (B*C) axis as the channel dimension,
+        # apply each band filter → (B*C, K, T).
+        x_flat = x.reshape(B * C, 1, T)
+        # Use groups=1 so each band is applied to the full signal independently.
+        # Padding = (L-1)//2 keeps output length = T.
+        pad = (self.kernel_size - 1) // 2
+        weight = filt.unsqueeze(1)                             # (K, 1, L)
+        y = F.conv1d(x_flat, weight, padding=pad)              # (B*C, K, T)
+        y = y.reshape(B, C, K, T).permute(0, 2, 1, 3).contiguous()
+        return y                                               # (B, K, C, T)
+
+
+class FilterBankBias(nn.Module):
+    """
+    Filter-bank C1 bias — shared across all transformer layers.
+
+    Given a raw EEG trial and a per-channel per-sample visibility mask, produces
+    K centered log-covariance matrices (one per band) that serve as static
+    spatial attention biases at every encoder layer. Each layer's attention
+    then weights these K biases with its own learnable β_{k,h} scalars.
+
+    Constraints enforced:
+      • Mask-aware: zeros masked samples BEFORE SincConv, then divides the
+        covariance accumulator by the per-pair unmasked count. Prevents
+        information about masked patches from leaking into S_k.
+      • Ridge λI for SPD safety.
+      • Padé [1,1] log map, same as C1.
+      • Learnable per-band tangent center μ_k, stored in global 144×144 space.
+
+    Args:
+        sample_rate:        Hz of the raw signal.
+        num_bands:          K.
+        kernel_size:        SincConv FIR taps (odd).
+        band_edges:         list of (f_lo, f_hi) in Hz, length K.
+        learnable_cutoffs:  freeze cutoffs at init (default) or train them.
+        total_channels:     size of the global channel space (μ_k lives here).
+        eps_ridge:          ridge λ factor; λ = eps_ridge · tr(S_k)/C.
+        learn_mu:           attach learnable per-band μ_k (default True).
+    """
+    def __init__(self, sample_rate, num_bands=5, kernel_size=65,
+                 band_edges=None, learnable_cutoffs=False,
+                 total_channels=TOTAL_GLOBAL_CHANNELS,
+                 eps_ridge=1e-4, learn_mu=True):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.num_bands = num_bands
         self.total_channels = total_channels
-        self.proto_rank = proto_rank
+        self.eps_ridge = eps_ridge
 
-        d = self.dim_head
-        half_dim = num_temporal_heads * d  # dimension of temporal branch
-
-        # ── Learnable auxiliary tokens (the "slots") ──
-        # Initialized small so pack attention starts near-uniform
-        self.slots = nn.Parameter(torch.randn(1, num_slots, half_dim) * 0.02)
-
-        # ── Pack: only need a Q projection for slots ──
-        # K and V come directly from the shared QKV's k_t and v_t
-        self.pack_q = nn.Linear(half_dim, half_dim, bias=False)
-
-        # ── Self-attention among packed slots: projection-free ──
-        # The packed tokens already carry rich representations from the pack
-        # cross-attention. Using them directly as Q/K/V for self-attention
-        # saves ~1.2M params across 6 layers with negligible expressivity loss
-        # (the 16 slots are low-dimensional enough that additional projections
-        # add more parameters than information).
-
-        # ── Unpack: no extra projections needed ──
-        # Q = original q_t, K/V = processed slots (already transformed by self-attn)
-
-        # ── SPD prototypes: low-rank factorization ──
-        # μ_q = U_q @ U_q^T  where U_q ∈ ℝ^{total_channels × proto_rank}
-        # Stores (num_slots, total_channels, proto_rank) instead of (num_slots, C², C²).
-        # Initialized to zero → all slots start equidistant from all tokens.
-        self.mu_proto_factors = nn.Parameter(
-            torch.zeros(num_slots, total_channels, proto_rank)
+        self.sinc = SincConv1d(
+            sample_rate=sample_rate,
+            num_bands=num_bands,
+            kernel_size=kernel_size,
+            band_edges=band_edges,
+            learnable=learnable_cutoffs,
         )
 
-        # ── Learnable SPD distance weight ──
-        self.spd_beta = nn.Parameter(torch.tensor(float(spd_beta_init)))
+        # Per-band tangent-space centers in global channel space.
+        # Shape: (K, total_channels, total_channels). Init 0 → no centering
+        # at the start, matches current μ init.
+        if learn_mu:
+            self.mu_log_bank = nn.Parameter(
+                torch.zeros(num_bands, total_channels, total_channels)
+            )
+        else:
+            self.register_parameter('mu_log_bank', None)
 
-        self.att_dropout = att_dropout
-        self.scale = d ** -0.5
-
-    @property
-    def mu_prototypes(self):
-        """Reconstruct full prototypes from low-rank factors (for logging)."""
-        # (l, C_total, r) @ (l, r, C_total) → (l, C_total, C_total)
-        return self.mu_proto_factors @ self.mu_proto_factors.transpose(-2, -1)
-
-    def _compute_spd_distances(self, L_per_sample, channel_idx):
+    def forward(self, x_raw, vis_mask, channel_idx):
         """
-        Compute Frobenius distance between each token's tangent vector L_t
-        and each slot's low-rank prototype μ_q = U_q U_q^T.
-
-        Operates at SAMPLE level (B, N), not (B*C, N) — all channels at the
-        same timestep share the same covariance, so distances are identical
-        across channels. The caller broadcasts to B*C after this.
-
         Args:
-            L_per_sample: (B, N, C_ch, C_ch) log-map output per temporal token.
-            channel_idx: (C_ch,) global channel indices
-
+            x_raw:       (B, C, T) raw signal after channel/trial normalization.
+            vis_mask:    (B, C, T) float in {0,1} — 1 = visible sample. Can be
+                         None → treated as all-visible (downstream / no mask).
+            channel_idx: (C,) long — global channel indices.
         Returns:
-            distances: (B, num_slots, N) — ‖L_t − μ_q‖_F for each slot-token pair
+            fb_log_S: (B, K, C, C) float — per-band centered log-covariance.
+                      Reused by every transformer layer's FB bias.
         """
-        BC, N, C_ch, _ = L_per_sample.shape  # BC is actually B here (sample-level)
-        l = self.num_slots
-        r = self.proto_rank
+        B, C, T = x_raw.shape
+        K = self.num_bands
+        device = x_raw.device
 
-        # Extract submatrix of each prototype factor for this dataset's channels
-        # (l, total_ch, r) → (l, C_ch, r)
-        U_sub = self.mu_proto_factors[:, channel_idx]  # (l, C_ch, r)
+        if vis_mask is None:
+            vis_mask = torch.ones(B, C, T, device=device, dtype=x_raw.dtype)
+        else:
+            vis_mask = vis_mask.to(dtype=x_raw.dtype)
 
-        # ── Normalize L to unit Frobenius norm (per token) ──
-        # The Padé log-map can produce large tangent vectors when the residual
-        # stream grows. Squaring these in the distance computation causes inf,
-        # and inf - inf = NaN. Normalizing makes distances scale-invariant:
-        # only the *direction* in tangent space matters for routing, not magnitude.
-        L_flat = L_per_sample.reshape(BC, N, -1)  # (B, N, C_ch²)
-        L_norm = L_flat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        L_flat = L_flat / L_norm
+        # ── Mask the raw signal BEFORE SincConv (leakage fix) ──
+        # SincConv's receptive field bleeds across mask boundaries, but zeroed
+        # masked samples cannot propagate their original content — only a
+        # decayed mix of visible neighbors. No content leak. A mild spectral
+        # artifact near boundaries remains (acceptable; see design doc).
+        x_masked = x_raw * vis_mask                             # (B, C, T)
 
-        # ── Prototype cross-term via flattened dot product ──
-        # UU^T = U @ U^T → (l, C_ch, C_ch) → flatten to (l, C_ch²).
-        # cross = L_flat · mu_flat^T gives vec(L)^T vec(μ) per slot-token pair.
-        mu_sub = torch.bmm(U_sub, U_sub.transpose(-2, -1))  # (l, C_ch, C_ch)
-        mu_flat = mu_sub.reshape(l, -1)  # (l, C_ch²)
-        # Normalize prototypes to match L_flat's unit-norm space
-        mu_norm = mu_flat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        mu_flat = mu_flat / mu_norm
+        # ── SincConv decomposition ──
+        y = self.sinc(x_masked)                                 # (B, K, C, T)
 
-        # cross = L_flat @ mu_flat^T → (BC, N, l)
-        # Use einsum to avoid expanding mu_flat to (BC, ...)
-        cross = torch.einsum('bni,li->bnl', L_flat, mu_flat)  # (BC, N, l)
+        # ── Re-apply visibility mask on the band-filtered output ──
+        # SincConv's receptive field smears visibility: a "valid" sample in
+        # the middle of a masked block gets a (small) non-zero value from
+        # neighboring visible context. Zero those out again so the covariance
+        # accumulator sums only over truly-visible time samples.
+        y = y * vis_mask.unsqueeze(1)                           # (B, K, C, T)
 
-        # ‖L - μ‖²_F = ‖L‖² + ‖μ‖² - 2·cross
-        # After unit normalization: ‖L‖²=1, ‖μ‖²=1, so dist² = 2 - 2·cross.
-        # Bounded in [0, 4] — no overflow possible.
-        dist_sq = (2.0 - 2.0 * cross).clamp(min=0)
-
-        # (BC, N, l) → (BC, l, N)
-        distances = dist_sq.sqrt().permute(0, 2, 1)
-        return distances
-
-    def forward(self, q_t, k_t, v_t, L_n=None, channel_idx=None, C=None):
-        """
-        Luna-style temporal attention with SPD-biased packing.
-
-        Reuses q_t/k_t/v_t from the shared QKV projection — no redundant
-        pack/unpack projections. Only the slot queries and slot self-attention
-        have dedicated parameters.
-
-        Args:
-            q_t: (B*C, H_t, N, d) temporal queries (already QKV-projected)
-            k_t: (B*C, H_t, N, d) temporal keys
-            v_t: (B*C, H_t, N, d) temporal values
-            L_n: (B*N, C_ch, C_ch) tangent vectors from C1's Riemannian bias.
-                 Reused to avoid recomputation. None → no SPD bias.
-            channel_idx: (C_ch,) global channel indices.
-            C:   Number of channels (needed to reshape L_n).
-
-        Returns:
-            out: (B*C, H_t, N, d) temporal attention output
-        """
-        BC, H, N, d = q_t.shape
-        l = self.num_slots
-
-        # ── All Luna attention ops must run in fp32 ──
-        # AMP can cast manual matmuls to fp16, where max=65504.
-        # pq @ k_t^T or packed @ packed^T can exceed that → inf → NaN cascade
-        # into the residual stream → S = x @ x^T becomes NaN.
-        # F.scaled_dot_product_attention handles this internally, but Luna's
-        # manual attention path does not. Force fp32 for all three steps.
+        # ── Mask-aware covariance per band ──
+        # S_k[b, i, j] = Σ_t y_k[b, i, t] y_k[b, j, t] / N_pairs[b, i, j]
+        # where N_pairs = Σ_t vis[b, i, t] vis[b, j, t].
         with torch.amp.autocast('cuda', enabled=False), \
              torch.amp.autocast('cpu', enabled=False):
+            y_f32 = y.float()                                   # (B, K, C, T)
+            # Cross-channel accumulator per band.
+            # einsum: (B, K, C, T) × (B, K, C, T) → (B, K, C, C)
+            cov_sum = torch.einsum('bkit,bkjt->bkij', y_f32, y_f32)
 
-            q_t = q_t.float()
-            k_t = k_t.float()
-            v_t = v_t.float()
+            vis_f32 = vis_mask.float()                          # (B, C, T)
+            # Pairwise visible count: same across K bands.
+            n_pairs = torch.einsum('bit,bjt->bij', vis_f32, vis_f32)  # (B, C, C)
+            n_pairs = n_pairs.clamp_min(1.0).unsqueeze(1)       # (B, 1, C, C)
 
-            # ── Pack: slots attend to input tokens ──
-            # Slot queries get their own projection; K and V reuse shared QKV output
-            slots = self.slots.expand(BC, -1, -1)  # (BC, l, H*d)
-            pq = self.pack_q(slots.float())  # (BC, l, H*d)
-            pq = rearrange(pq, 'bc l (h d) -> bc h l d', h=H)  # (BC, H, l, d)
+            S = cov_sum / n_pairs                               # (B, K, C, C)
 
-            # Pack attention: (BC, H, l, N)
-            pack_score = (pq @ k_t.transpose(-2, -1)) * self.scale
+            # Ridge for SPD safety: λ = eps_ridge · tr(S)/C (scale-invariant).
+            diag_trace = S.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True)  # (B, K, 1)
+            lam = self.eps_ridge * diag_trace.clamp_min(1e-6)   # (B, K, 1)
+            eye = torch.eye(C, device=S.device, dtype=S.dtype).view(1, 1, C, C)
+            S = S + lam.unsqueeze(-1) * eye
 
-            # ── SPD bias on pack attention ──
-            if L_n is not None and channel_idx is not None and C is not None:
-                B = BC // C
-                # L_n is (B*N, C_ch, C_ch) — one covariance per (batch, timestep).
-                # All C channels at timestep n share the SAME covariance, so we
-                # compute distances at (B, N) level and broadcast to (B*C) — saves
-                # a factor of C in both compute and memory.
-                # Detach L_n: SPD distances guide attention routing but we don't
-                # need gradients flowing back through the covariance computation
-                # (C1's Riemannian bias already trains L_n). Saves ~15-20% backward time.
-                L_per_sample = L_n.detach().reshape(B, N, *L_n.shape[1:])  # (B, N, C_ch, C_ch)
+            # Padé [1,1] log-map, batched across (B, K): log(S) ≈ 2(S-I)(I+S)^{-1}
+            # Collapse (B, K) to a single batch axis for torch.linalg.solve.
+            S_flat = S.reshape(B * K, C, C).contiguous()
+            I_flat = eye.expand(B * K, -1, -1, -1).reshape(B * K, C, C).contiguous()
+            X = S_flat - I_flat
+            logS_flat = torch.linalg.solve(I_flat + S_flat, 2.0 * X)
+            logS = logS_flat.reshape(B, K, C, C)
 
-                # SPD distances at sample level: (B, l, N)
-                spd_dist_b = self._compute_spd_distances(L_per_sample, channel_idx)
+            # NaN/Inf guard: fall back to first-order (S - I) per band.
+            bad = torch.isnan(logS).any(dim=(-1, -2)) | torch.isinf(logS).any(dim=(-1, -2))
+            if bad.any():
+                fallback = (S - eye)
+                logS = torch.where(bad.unsqueeze(-1).unsqueeze(-1), fallback, logS)
 
-                # Broadcast to all channels: (B, l, N) → (B*C, l, N)
-                # Use repeat_interleave so each sample's distances are repeated C
-                # times contiguously (matching the (b c) layout of BC dimension).
-                # This allocates only (B*C, l, N) — no intermediate 4D tensor.
-                spd_dist = spd_dist_b.repeat_interleave(C, dim=0)  # (B*C, l, N)
+        # ── Subtract per-band learnable center μ_k, symmetrized ──
+        if self.mu_log_bank is not None:
+            # Index μ_k along the channel dims: (K, total, total) → (K, C, C).
+            mu_k = self.mu_log_bank[:, channel_idx][:, :, channel_idx]  # (K, C, C)
+            mu_k = 0.5 * (mu_k + mu_k.transpose(-2, -1))
+            logS = logS - mu_k.unsqueeze(0)                     # broadcast over B
 
-                # Subtract β · distance (higher distance → lower score)
-                # pack_score is (BC, H, l, N), spd_dist is (BC, l, N) → unsqueeze for heads
-                pack_score = pack_score - self.spd_beta * spd_dist.unsqueeze(1)
-
-            pack_attn = pack_score.softmax(dim=-1)
-            pack_attn = F.dropout(pack_attn, p=self.att_dropout, training=self.training)
-
-            # Packed representation: (BC, H, l, d)
-            packed = pack_attn @ v_t
-
-            # ── Process: self-attention among packed slots (projection-free) ──
-            # packed is already (BC, H, l, d) — use directly as Q, K, V
-            self_score = (packed @ packed.transpose(-2, -1)) * self.scale
-            self_attn = self_score.softmax(dim=-1)
-            self_attn = F.dropout(self_attn, p=self.att_dropout, training=self.training)
-            processed = self_attn @ packed  # (BC, H, l, d)
-
-            # ── Unpack: input tokens attend to processed slots ──
-            # Q = original q_t, K/V = processed slots (no extra projections)
-            unpack_score = (q_t @ processed.transpose(-2, -1)) * self.scale  # (BC, H, N, l)
-            unpack_attn = unpack_score.softmax(dim=-1)
-            unpack_attn = F.dropout(unpack_attn, p=self.att_dropout, training=self.training)
-            out = unpack_attn @ processed  # (BC, H, N, d)
-
-        return out
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# C2 v2 — Geometric Brain-State Injection into Temporal Values
-# ─────────────────────────────────────────────────────────────────────────────
-# Explicit spatial→temporal branch cooperation. The branch-isolation diagnostic
-# showed that C1's combined separability (0.189 at epoch 40) grows almost
-# entirely through branch COOPERATION: spatial_only and temporal_only barely
-# change past epoch 15, but their combined representation does. This module
-# turns that emergent phenomenon into an architectural prior.
-#
-# Per timestep n:
-#   brain_state = mean_c(L_n @ x_space)       # geometry-mixed channel pool  (B*N, D)
-#   brain_emb   = Linear(D → d)(brain_state)  # project to head dim           (B*N, d)
-#   v_t[:,h,n,:] += β_h · brain_emb            # per-head gain injected into V_t
-#
-# Design choices that differentiate from the failed Luna-C2:
-#   - β init 0.05 (non-zero) AND live gradient path through x_space → the
-#     optimizer can move β from step 0, not after symmetry breaks by chance.
-#   - L_n is detached but x_space is NOT — C1 owns covariance training, C2
-#     shapes spatial features via temporal loss signal.
-#   - Per-head β — heads specialize; unused heads can shrink β → 0.
-#   - No new attention mechanism — temporal self-attention/RoPE untouched.
-# ─────────────────────────────────────────────────────────────────────────────
-
-class BrainStateInjection(nn.Module):
-    """
-    C2 v2 — Geometric brain-state injection into temporal values.
-
-    Args:
-        embed_dim:          Residual stream dimension D.
-        num_temporal_heads: Number of temporal heads H_t.
-        beta_init:          Initial per-head β (default 0.05).
-        proj_init_std:      std for Linear(D→d) weight init (default 0.01) —
-                            keeps initial injection magnitude ~1e-3 · ‖v‖,
-                            small enough not to disrupt C1 at epoch 0.
-    """
-
-    def __init__(self, embed_dim, num_temporal_heads, beta_init=0.05,
-                 proj_init_std=0.01):
-        super().__init__()
-        self.num_heads = num_temporal_heads
-        # Parallel half-split: temporal branch = half of embed_dim across H_t heads
-        self.dim_head = embed_dim // (2 * num_temporal_heads)
-
-        self.proj = nn.Linear(embed_dim, self.dim_head, bias=False)
-        nn.init.normal_(self.proj.weight, std=proj_init_std)
-
-        self.beta = nn.Parameter(torch.full((num_temporal_heads,), float(beta_init)))
-
-    def forward(self, L_n, x_space, v_t, B, C):
-        """
-        Args:
-            L_n:     (B*N, C, C)    tangent vectors from C1 — caller passes .detach()
-            x_space: (B*N, C, D)    spatial-reshaped residual stream (masked ch zeroed)
-            v_t:     (B*C, H, N, d) temporal values in parallel-split layout
-            B:       batch size
-            C:       number of channels
-
-        Returns:
-            v_t: (B*C, H, N, d) — augmented with β_h · brain_emb
-        """
-        BN, _, _ = x_space.shape
-        N = BN // B
-        H = self.num_heads
-        d = self.dim_head
-
-        # Geometry-mix channels: L_n @ x_space → (B*N, C, D)
-        # Dtype: promote L_n to x_space dtype so mixed precision is consistent.
-        mixed = torch.bmm(L_n.to(x_space.dtype), x_space)
-
-        # Channel pool: (B*N, D)
-        brain_state = mixed.mean(dim=1)
-
-        # Project to head dim: (B*N, d)
-        brain_emb = self.proj(brain_state)
-
-        # Reshape for broadcast into v_t (B*C, H, N, d)
-        # brain_emb: (B, 1, 1, N, d) × β_h: (1, 1, H, 1, 1) → (B, C, H, N, d) via broadcast
-        brain_emb = brain_emb.view(B, 1, 1, N, d)
-        v_t_shaped = rearrange(v_t, '(b c) h n d -> b c h n d', c=C)
-        beta_h = self.beta.view(1, 1, H, 1, 1).to(v_t_shaped.dtype)
-        v_t_shaped = v_t_shaped + beta_h * brain_emb.to(v_t_shaped.dtype)
-        return rearrange(v_t_shaped, 'b c h n d -> (b c) h n d')
+        return logS.to(x_raw.dtype)                             # (B, K, C, C)
 
 
 class AdaptiveRiemannianParallelAttention(nn.Module):
     """
     Parallel spatial-temporal attention with Riemannian spatial bias (C1).
 
-    4 temporal heads + 4 spatial heads, shared QKV.
-    Spatial heads get additive Riemannian bias: score += α_h · log(S)
-    Temporal heads are standard (no bias).
+    H/2 temporal heads + H/2 spatial heads, shared QKV.
+    Spatial heads get additive Riemannian bias: score += α_h · log(S).
+    Temporal heads are standard (optional EEG-RoPE on Q_t/K_t).
 
-    Optional C2 v2: brain-state injection into temporal values
-    (use_brain_state_injection=True).
+    Optional fine-tune extras:
+      use_branch_gate=True  → per-layer learnable scalars scaling each
+                              branch's output before the final concat+fc.
+                              Init 1.0 → identical to ungated at epoch 0;
+                              trains per-task spatial/temporal mixing.
     """
     def __init__(self, embed_dim, num_heads=8, total_channels=TOTAL_GLOBAL_CHANNELS,
                  dropout=0.1, att_dropout=0.1, spd_eps=1e-5,
                  log_mode='eigh', use_approx=False,
                  use_frechet=False, frechet_R_inv_sqrt=None,
-                 use_temporal_cov=False,
                  use_value_bias=True,
                  learn_mu_reference=True,
-                 use_luna_temporal=False, luna_num_slots=16,
-                 luna_spd_beta_init=0.0,
                  use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
                  rope_learnable=True,
-                 use_brain_state_injection=False, brain_state_beta_init=0.05,
-                 use_mean_pool_temporal=False,
-                 use_spatial_only=False):
+                 use_branch_gate=False,
+                 use_filter_bank=False, fb_num_bands=5):
         super().__init__()
         assert num_heads % 2 == 0, "num_heads must be even for parallel split"
         assert embed_dim % num_heads == 0
@@ -1702,58 +1153,31 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.heads_per_branch = num_heads // 2
         self.dim_head = embed_dim // num_heads
         self.embed_dim = embed_dim
-        self.half_dim = self.heads_per_branch * self.dim_head
         self.use_value_bias = use_value_bias
-        self.use_luna_temporal = use_luna_temporal
-        self.use_rope = use_rope
-        self.use_brain_state_injection = use_brain_state_injection
-        self.use_mean_pool_temporal = use_mean_pool_temporal
-        self.use_spatial_only = use_spatial_only
 
-        # Run 3: spatial-only — remove temporal branch entirely.
-        # All heads go to spatial. QKV stays at 3*D but every dim feeds
-        # spatial attention. No temporal path at all — no Q_t, K_t, V_t,
-        # no RoPE, no Luna, no BSI, no mean-pool fusion.
-        if use_spatial_only:
-            assert not use_mean_pool_temporal, \
-                "use_spatial_only is exclusive with use_mean_pool_temporal " \
-                "(both kill the temporal branch; pick one)"
-            assert not use_rope, \
-                "use_spatial_only is exclusive with use_rope " \
-                "(RoPE rotates temporal Q/K which no longer exist)"
-            assert not use_luna_temporal, \
-                "use_spatial_only is exclusive with use_luna_temporal " \
-                "(Luna is a temporal compression; the branch is gone)"
-            assert not use_brain_state_injection, \
-                "use_spatial_only is exclusive with use_brain_state_injection " \
-                "(BSI augments V_t which does not exist in spatial-only)"
-            # Override: all H heads go to spatial (not H/2).
-            self.heads_per_branch = num_heads
-            self.half_dim = self.heads_per_branch * self.dim_head  # = embed_dim
-            self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
-        # Run 2-clean: temporal branch uses mean-pool, not attention.
-        # → Q_t and K_t are unused. Shrink QKV projection to save params.
-        # Also disable temporal-attention-specific features (RoPE, Luna, BSI)
-        # because they would operate on a now-unused pathway.
-        elif use_mean_pool_temporal:
-            assert not use_rope, \
-                "use_mean_pool_temporal=True is incompatible with use_rope " \
-                "(RoPE rotates Q_t/K_t which are no longer computed)"
-            assert not use_luna_temporal, \
-                "use_mean_pool_temporal=True is incompatible with use_luna_temporal " \
-                "(Luna replaces temporal SDPA; mean-pool already replaces it)"
-            assert not use_brain_state_injection, \
-                "use_mean_pool_temporal=True is incompatible with " \
-                "use_brain_state_injection (BSI augments V_t before temporal SDPA; " \
-                "mean-pool of an augmented V_t is equivalent to mean-pool of V_t " \
-                "plus a per-channel DC shift, which is absorbed into LayerNorm)"
-            # QKV output = Q_s (half_dim) + K_s (half_dim) + V (full embed_dim)
-            # = 2 * embed_dim total (vs 3 * embed_dim in baseline).
-            # Saves D² params per layer.
-            self.qkv = nn.Linear(embed_dim, 2 * embed_dim)
-        else:
-            # Shared QKV projection
-            self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
+        # Filter-bank bias (Run 4 FB-C1): per-layer (H_spatial × K) scalars that
+        # weight the static raw-signal band biases precomputed at the encoder
+        # level. β init = 0 → model matches pure C1+C3 at epoch 0 when loading
+        # from a checkpoint that doesn't have FB.
+        self.use_filter_bank = use_filter_bank
+        self.fb_num_bands = fb_num_bands
+        if self.use_filter_bank:
+            # Shape: (H_spatial, K). Each spatial head gets K band weights.
+            self.fb_beta = nn.Parameter(torch.zeros(self.heads_per_branch, fb_num_bands))
+        self.use_rope = use_rope
+
+        # Branch gate: per-layer learnable scalars that scale each branch's
+        # output before the final concat+projection. At init both = 1.0 so
+        # behavior is identical to ungated model. During fine-tune the gates
+        # learn per-task mixing — expected pattern is spatial-heavy on
+        # narrow-band tasks (MI), balanced on broader-spectrum tasks (emotion).
+        self.use_branch_gate = use_branch_gate
+        if self.use_branch_gate:
+            self.branch_gate_s = nn.Parameter(torch.ones(1))
+            self.branch_gate_t = nn.Parameter(torch.ones(1))
+
+        # Shared QKV projection
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
         # Output projection
         self.fc = nn.Linear(embed_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
@@ -1782,17 +1206,6 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             learn_mu_reference=learn_mu_reference,
         )
 
-        # C2: Luna-style temporal compression with SPD-biased packing
-        if use_luna_temporal:
-            self.luna_temporal = RiemannianLunaTemporalCompression(
-                embed_dim=embed_dim,
-                num_temporal_heads=self.heads_per_branch,
-                num_slots=luna_num_slots,
-                total_channels=total_channels,
-                att_dropout=att_dropout,
-                spd_beta_init=luna_spd_beta_init,
-            )
-
         # Geometric value mixing: V' = V + β_h · (L @ V)
         # Injects covariance structure into attention values — complementary
         # to the score bias (which controls routing, not feature mixing).
@@ -1800,24 +1213,18 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         if use_value_bias:
             self.value_beta = nn.Parameter(torch.zeros(self.heads_per_branch))
 
-        # C2 v2: brain-state injection into temporal values.
-        # Built separately from Luna — complementary, not alternative.
-        if use_brain_state_injection:
-            self.brain_state_injection = BrainStateInjection(
-                embed_dim=embed_dim,
-                num_temporal_heads=self.heads_per_branch,
-                beta_init=brain_state_beta_init,
-            )
-
     def forward(self, x_norm, num_chan, residual=None, channel_idx=None,
-                mask=None):
+                mask=None, fb_log_S=None):
         """
         Args:
-            x_norm: (B, L, D) normalized input (post-LayerNorm)
+            x_norm:   (B, L, D) normalized input (post-LayerNorm)
             num_chan: number of EEG channels C in this batch
             residual: (B, L, D) raw residual stream (pre-LayerNorm)
             channel_idx: (C,) long tensor — global channel indices
-            mask: (B, L) boolean — True = masked token (pretraining only)
+            mask:     (B, L) boolean — True = masked token (pretraining only)
+            fb_log_S: (B, K, C, C) float — per-band centered log(S_k) from
+                      the encoder-level FilterBankBias. Reused across all
+                      layers. Ignored unless use_filter_bank=True.
         Returns:
             out: (B, L, D) attention output
         """
@@ -1843,96 +1250,46 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             x_space, channel_idx, mask_space=mask_space,
         )
 
+        # ── Filter-bank bias (Run 4 FB-C1) ──
+        # β_{h,k} · (log(S_k) − μ_k) summed over K bands, added to the
+        # existing α·log(S) + C3 bias. Broadcast the static (B, K, C, C)
+        # bias across the N temporal positions to match (B*N, H_s, C, C).
+        if self.use_filter_bank and fb_log_S is not None:
+            # einsum: β (H_s, K) × fb (B, K, C, C) → (B, H_s, C, C)
+            fb_bias_BHCC = torch.einsum('hk,bkij->bhij', self.fb_beta, fb_log_S)
+            # Broadcast over N temporal positions → (B*N, H_s, C, C).
+            # We expand to (B, N, H_s, C, C) then collapse to match riem_bias.
+            fb_bias_expand = fb_bias_BHCC.unsqueeze(1).expand(B, N, H2, C, C)
+            fb_bias_flat = fb_bias_expand.reshape(B * N, H2, C, C)
+            riem_bias = riem_bias + fb_bias_flat.to(riem_bias.dtype)
+
         # ── Shared QKV ──
-        if self.use_spatial_only:
-            # Run 3: all H heads go to spatial. QKV = [Q_s | K_s | V_s], each D.
-            # No temporal branch means no Q_t/K_t/V_t exist at all.
-            qkv = self.qkv(x_norm).reshape(B, L, 3, H, d).permute(2, 0, 3, 1, 4)
-            q_s, k_s, v_s = qkv[0], qkv[1], qkv[2]
-        elif self.use_mean_pool_temporal:
-            # Run 2-clean: QKV = [Q_s | K_s | V_all].
-            # Shape: (B, L, 2*D). Split sizes: half_dim, half_dim, embed_dim.
-            qkv = self.qkv(x_norm)
-            hd = self.half_dim
-            q_s = qkv[..., :hd].reshape(B, L, H2, d).permute(0, 2, 1, 3)
-            k_s = qkv[..., hd:2 * hd].reshape(B, L, H2, d).permute(0, 2, 1, 3)
-            v  = qkv[..., 2 * hd:].reshape(B, L, H,  d).permute(0, 2, 1, 3)
-            v_t, v_s = v[:, :H2], v[:, H2:]
-            # Q_t and K_t do not exist — temporal branch never uses them.
-        else:
-            qkv = self.qkv(x_norm).reshape(B, L, 3, H, d).permute(2, 0, 3, 1, 4)
-            q, k, v = qkv[0], qkv[1], qkv[2]
+        qkv = self.qkv(x_norm).reshape(B, L, 3, H, d).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
-            q_t, q_s = q[:, :H2], q[:, H2:]
-            k_t, k_s = k[:, :H2], k[:, H2:]
-            v_t, v_s = v[:, :H2], v[:, H2:]
+        q_t, q_s = q[:, :H2], q[:, H2:]
+        k_t, k_s = k[:, :H2], k[:, H2:]
+        v_t, v_s = v[:, :H2], v[:, H2:]
 
-        # ── Temporal branch ──
-        if self.use_spatial_only:
-            # Run 3: no temporal branch. Skip entirely.
-            pass
-        elif self.use_mean_pool_temporal:
-            # Mean-pool across time, per (batch, channel, head).
-            # Layout: v_t is (B, H_t, L=N*C, d). Group N along time axis:
-            #   → (B*C, H_t, N, d), pool over N, broadcast back.
-            #
-            # Mask-aware pooling: when a patch (b, c, t) is masked, its V entry
-            # is still the mask-token's V (a learned constant). Including it in
-            # the mean would leak "how many patches are masked" through the
-            # magnitude of the pooled vector. Exclude masked positions.
-            v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=C)
-            if mask is not None:
-                mask_t = rearrange(mask, 'b (n c) -> (b c) n', c=C)  # True=masked
-                valid = (~mask_t).to(v_t.dtype).unsqueeze(1).unsqueeze(-1)  # (B*C,1,N,1)
-                v_t_sum = (v_t * valid).sum(dim=2, keepdim=True)
-                denom = valid.sum(dim=2, keepdim=True).clamp_min(1.0)
-                v_t_pool = v_t_sum / denom
-            else:
-                v_t_pool = v_t.mean(dim=2, keepdim=True)
-            out_t = v_t_pool.expand_as(v_t)
-            out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=C)
-        else:
-            # ── Temporal attention (baseline) ──
-            q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=C)
-            k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=C)
-            v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=C)
+        # ── Temporal attention branch ──
+        q_t = rearrange(q_t, 'b h (n c) d -> (b c) h n d', c=C)
+        k_t = rearrange(k_t, 'b h (n c) d -> (b c) h n d', c=C)
+        v_t = rearrange(v_t, 'b h (n c) d -> (b c) h n d', c=C)
 
-            # C2 v2: geometric brain-state injection into temporal values.
-            # Applied BEFORE RoPE (RoPE only rotates Q/K, V is untouched anyway).
-            # L_n is detached — C1 owns covariance training, C2 consumes its output.
-            # x_space keeps its gradient path — spatial features get a temporal-loss
-            # signal that encourages them to be useful for cross-branch cooperation.
-            if self.use_brain_state_injection:
-                v_t = self.brain_state_injection(
-                    L_n=L_n.detach(),
-                    x_space=x_space,
-                    v_t=v_t,
-                    B=B,
-                    C=C,
-                )
+        # EEG-RoPE: inject relative temporal position via rotation.
+        # Applied BEFORE attention so temporal scores reflect relative offsets.
+        # RoPE rotates ALL positions (including masked tokens) — the model
+        # needs position info for reconstruction. Shortcut prevention comes
+        # from the masking STRATEGY, not from modifying RoPE.
+        if self.use_rope:
+            q_t, k_t = self.temporal_rope(q_t, k_t)
 
-            # EEG-RoPE: inject relative temporal position via rotation
-            # Applied BEFORE attention (standard or Luna) so both paths benefit.
-            # RoPE rotates ALL positions (including masked tokens) — the model
-            # needs position info for reconstruction. Shortcut prevention comes
-            # from the masking STRATEGY (block masking), not from modifying RoPE.
-            if self.use_rope:
-                q_t, k_t = self.temporal_rope(q_t, k_t)
-
-            if self.use_luna_temporal:
-                # C2: Luna pack-process-unpack with SPD-biased packing
-                # L_n from C1's Riemannian bias is reused — zero extra cost
-                out_t = self.luna_temporal(
-                    q_t, k_t, v_t,
-                    L_n=L_n, channel_idx=channel_idx, C=C,
-                )
-            else:
-                # Standard N×N temporal self-attention
-                out_t = F.scaled_dot_product_attention(
-                    q_t, k_t, v_t,
-                    dropout_p=self.att_dropout if self.training else 0.0,
-                )
-            out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=C)
+        # Standard N×N temporal self-attention
+        out_t = F.scaled_dot_product_attention(
+            q_t, k_t, v_t,
+            dropout_p=self.att_dropout if self.training else 0.0,
+        )
+        out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=C)
 
         # ── Spatial attention (Riemannian-biased) ──
         q_s = rearrange(q_s, 'b h (n c) d -> (b n) h c d', c=C)
@@ -1968,14 +1325,34 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
 
         out_s = rearrange(out_s, '(b n) h c d -> b h (n c) d', b=B, n=N)
 
+        # ── Branch gate (optional): scale each branch before concat ──
+        # Multiplicatively scales out_s and out_t before the final projection.
+        # Mathematically equivalent to scaling the corresponding column blocks
+        # of self.fc, so the learned gates directly answer "how much does each
+        # branch contribute to this layer's output." Gated behind
+        # use_branch_gate; init 1.0 keeps behavior identical to ungated model.
+        #
+        # LINEAR-PROBE AUTOGRAD GUARD: when the encoder is frozen (linear probe
+        # with only the gate trainable), the gate's backward only needs the
+        # *values* of out_s / out_t — not their autograd graphs. Tracing the
+        # graph back through frozen encoder ops (torch.linalg.solve in the Padé
+        # log, SDPA backward, advanced indexing on mu_log) hits known MPS
+        # bugs where kernels return uninitialized memory. Detach when the
+        # encoder's QKV weight is frozen — mathematically identical in linear
+        # probe (no grad flows there anyway), sidesteps the MPS crash, and
+        # leaves full fine-tune untouched (qkv.weight.requires_grad=True →
+        # no detach, normal gradient flow).
+        if self.use_branch_gate:
+            if not self.qkv.weight.requires_grad:
+                out_s = out_s.detach()
+                out_t = out_t.detach()
+            out_s = out_s * self.branch_gate_s
+            out_t = out_t * self.branch_gate_t
+
         # ── Output projection ──
-        if self.use_spatial_only:
-            # Run 3: no temporal branch, spatial output covers all H heads.
-            out = rearrange(out_s, 'b h l d -> b l (h d)')
-        else:
-            # Concatenate temporal + spatial heads, then project.
-            out = torch.cat([out_t, out_s], dim=1)
-            out = rearrange(out, 'b h l d -> b l (h d)')
+        # Concatenate temporal + spatial heads, then project.
+        out = torch.cat([out_t, out_s], dim=1)
+        out = rearrange(out, 'b h l d -> b l (h d)')
         out = self.fc(out)
         return self.dropout(out)
 
@@ -2008,16 +1385,12 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
                  mlp_ratio=4, drop=0.0, att_drop=0.0, drop_path=0.0, act=nn.GELU,
                  norm=nn.LayerNorm, spd_eps=1e-5, log_mode='eigh', use_approx=False,
                  use_frechet=False, frechet_R_inv_sqrt=None,
-                 use_temporal_cov=False,
                  use_value_bias=True,
                  learn_mu_reference=True,
-                 use_luna_temporal=False, luna_num_slots=16,
-                 luna_spd_beta_init=0.0,
                  use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
                  rope_learnable=True,
-                 use_brain_state_injection=False, brain_state_beta_init=0.05,
-                 use_mean_pool_temporal=False,
-                 use_spatial_only=False):
+                 use_branch_gate=False,
+                 use_filter_bank=False, fb_num_bands=5):
         super().__init__()
 
         self.attn = AdaptiveRiemannianParallelAttention(
@@ -2031,20 +1404,15 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
             use_approx=use_approx,
             use_frechet=use_frechet,
             frechet_R_inv_sqrt=frechet_R_inv_sqrt,
-            use_temporal_cov=use_temporal_cov,
             use_value_bias=use_value_bias,
             learn_mu_reference=learn_mu_reference,
-            use_luna_temporal=use_luna_temporal,
-            luna_num_slots=luna_num_slots,
-            luna_spd_beta_init=luna_spd_beta_init,
             use_rope=use_rope,
             rope_freq_min=rope_freq_min,
             rope_freq_max=rope_freq_max,
             rope_learnable=rope_learnable,
-            use_brain_state_injection=use_brain_state_injection,
-            brain_state_beta_init=brain_state_beta_init,
-            use_mean_pool_temporal=use_mean_pool_temporal,
-            use_spatial_only=use_spatial_only,
+            use_branch_gate=use_branch_gate,
+            use_filter_bank=use_filter_bank,
+            fb_num_bands=fb_num_bands,
         )
 
         self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
@@ -2056,18 +1424,21 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
         hidden_size = int(embed_dim * mlp_ratio)
         self.mlp = MLP(in_features=embed_dim, hidden_size=hidden_size, act=act, drop=drop)
 
-    def forward(self, x, num_chan, channel_idx=None, mask=None):
+    def forward(self, x, num_chan, channel_idx=None, mask=None, fb_log_S=None):
         """
         Args:
             x: (B, L, D) input tensor where L = N * num_chan
             num_chan: number of channels C in this batch
             channel_idx: (C,) long tensor — global channel indices
-            mask: (B, L) boolean — True = masked token (pretraining only).
+            mask:     (B, L) boolean — True = masked token (pretraining only).
+            fb_log_S: (B, K, C, C) — per-band centered log(S_k) from the
+                      encoder-level FilterBankBias. Threaded through from
+                      the pretraining / downstream forward. None = FB disabled.
         """
         # Pass normalized input for QKV, raw residual for Riemannian bias.
         x = x + self.drop_path1(
             self.attn(self.norm1(x), num_chan, residual=x,
-                      channel_idx=channel_idx, mask=mask)
+                      channel_idx=channel_idx, mask=mask, fb_log_S=fb_log_S)
         )
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
         return x

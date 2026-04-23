@@ -198,18 +198,23 @@ def build_riemann_loss(num_classes, checkpoint_path, num_channels, data_length, 
 
 def build_riemann_transformer_para(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
     """Adaptive Riemannian parallel transformer (Padé log map + geometric cross-channel mixing)."""
-    # Pass through Luna, RoPE, and Run 2/3 temporal-branch flags from kwargs if present
+    # Pass through RoPE and fine-tune flags from kwargs if present
     extra_kwargs = {}
-    for key in ('use_luna_temporal', 'luna_num_slots', 'luna_start_layer', 'luna_spd_beta_init',
-                'use_rope', 'rope_freq_min', 'rope_freq_max', 'rope_learnable',
-                'use_mean_pool_temporal', 'use_spatial_only', 'value_bias_layers',
-                'learn_mu_reference'):
+    for key in ('use_rope', 'rope_freq_min', 'rope_freq_max', 'rope_learnable',
+                'value_bias_layers', 'learn_mu_reference', 'use_branch_gate',
+                # Filter-bank (Run 4 FB-C1) flags
+                'use_filter_bank', 'fb_num_bands', 'fb_sample_rate',
+                'fb_kernel_size', 'fb_band_edges', 'fb_learnable_cutoffs'):
         if key in kwargs:
             extra_kwargs[key] = kwargs[key]
     model = DownstreamRiemannTransformerPara(
         num_classes=num_classes, checkpoint_path=checkpoint_path,
         **extra_kwargs,
     )
+    # Flag FB β/μ_k to stay trainable at linear-probe if explicitly requested
+    # (probing FB onto an old non-FB checkpoint).
+    if kwargs.get('fb_linear_probe_trainable', False):
+        model._fb_linear_probe_trainable = True
     return model
 
 def build_riemann_transformer_seq(num_classes, checkpoint_path, num_channels, data_length, **kwargs):
@@ -1210,8 +1215,75 @@ def main():
         "--no_rope_learnable", action="store_true", default=False,
         help="Use standard RoPE with fixed geometric frequencies (ablation).",
     )
+    parser.add_argument(
+        "--use_branch_gate", action="store_true", default=False,
+        help="Enable per-layer learnable branch gate (scales spatial and temporal "
+             "outputs before the final projection). Fine-tune-only; init=1.0 so "
+             "loading a non-gate pretrained ckpt preserves baseline behavior. "
+             "Use to measure per-task spatial/temporal mixing — learned gates "
+             "are accessible via model.get_branch_gates().",
+    )
+
+    # ── Filter-Bank C1 (Run 4 FB-C1) ──
+    parser.add_argument(
+        "--use_filter_bank", action="store_true", default=False,
+        help="Enable FB-C1: learnable filter-bank extension of Riemannian spatial "
+             "bias. SincConv bandpass filters applied ONCE on raw signal at encoder "
+             "entry; K per-band covariances reused across all layers with per-layer "
+             "learnable β_{k,h,l} head weights (init=0 → bit-exact match with "
+             "non-FB ckpt). Mask-aware (zero masked samples before SincConv, "
+             "normalize by pairwise N_unmasked) + ridge λI for SPD safety.",
+    )
+    parser.add_argument(
+        "--fb_num_bands", type=int, default=5,
+        help="Number of filter bands (default: 5 → δ/θ/α/β/γ).",
+    )
+    parser.add_argument(
+        "--fb_kernel_size", type=int, default=65,
+        help="SincConv FIR kernel length in samples (default: 65 @ 128 Hz ≈ 0.5 s).",
+    )
+    parser.add_argument(
+        "--fb_sample_rate", type=float, default=128.0,
+        help="Sample rate for SincConv cutoff normalization (default: 128.0).",
+    )
+    parser.add_argument(
+        "--fb_band_init", type=str,
+        default="0.5-4,4-8,8-13,13-30,30-50",
+        help="Comma-separated 'low-high' band edges in Hz "
+             "(default: '0.5-4,4-8,8-13,13-30,30-50' → δ/θ/α/β/γ).",
+    )
+    parser.add_argument(
+        "--fb_learnable_cutoffs", action="store_true", default=False,
+        help="Allow SincConv cutoff frequencies to be learned. Default: frozen "
+             "at standard EEG bands (prevents band collapse / FB→identity).",
+    )
+    parser.add_argument(
+        "--fb_linear_probe_trainable", action="store_true", default=False,
+        help="In linear-probe mode, unfreeze FB parameters (β_{k,h,l} + learnable μ_k) "
+             "so they can be probed onto a non-FB pretrained checkpoint without "
+             "retraining the full encoder.",
+    )
 
     args = parser.parse_args()
+
+    # ── Parse fb_band_init string into list of (low, high) tuples ──
+    fb_band_edges = None
+    if args.use_filter_bank:
+        try:
+            fb_band_edges = []
+            for pair in args.fb_band_init.split(","):
+                lo_str, hi_str = pair.strip().split("-")
+                fb_band_edges.append((float(lo_str), float(hi_str)))
+            if len(fb_band_edges) != args.fb_num_bands:
+                raise ValueError(
+                    f"--fb_band_init parsed {len(fb_band_edges)} bands but "
+                    f"--fb_num_bands={args.fb_num_bands}. Must match."
+                )
+        except Exception as e:
+            raise ValueError(
+                f"Failed to parse --fb_band_init='{args.fb_band_init}'. "
+                f"Expected format: 'lo1-hi1,lo2-hi2,...'. Error: {e}"
+            )
 
     # ── Seed ──
     seed_everything(args.seed)
@@ -1256,7 +1328,7 @@ def main():
     # ── Build model ──
     rope_learnable = not args.no_rope_learnable
     builder = MODEL_BUILDERS[args.model]
-    model = builder(
+    builder_kwargs = dict(
         num_classes=ds_cfg["num_classes"],
         checkpoint_path=args.checkpoint,
         num_channels=ds_cfg["num_channels"],
@@ -1268,7 +1340,21 @@ def main():
         merge_k=args.merge_k,
         use_rope=args.use_rope,
         rope_learnable=rope_learnable,
+        use_branch_gate=args.use_branch_gate,
     )
+    # Filter-Bank (Run 4 FB-C1): pass through only if explicitly enabled so
+    # builders for non-FB models (e.g. BIOT, LaBraM) don't choke on stray kwargs.
+    if args.use_filter_bank:
+        builder_kwargs.update(
+            use_filter_bank=True,
+            fb_num_bands=args.fb_num_bands,
+            fb_sample_rate=args.fb_sample_rate,
+            fb_kernel_size=args.fb_kernel_size,
+            fb_band_edges=fb_band_edges,
+            fb_learnable_cutoffs=args.fb_learnable_cutoffs,
+            fb_linear_probe_trainable=args.fb_linear_probe_trainable,
+        )
+    model = builder(**builder_kwargs)
 
     print(f"\n{'='*60}")
     print(f"  Model:    {args.model}")

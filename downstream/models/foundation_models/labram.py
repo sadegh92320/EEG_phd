@@ -424,7 +424,7 @@ class NeuralTransformer(nn.Module):
             x[:, 1:, :] += time_embed
 
         x = self.pos_drop(x)
-        
+
         for blk in self.blocks:
             x = blk(x, rel_pos_bias=None)
         

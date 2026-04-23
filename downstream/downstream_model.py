@@ -11,8 +11,8 @@ from torch_geometric.data import Data
 from MAE_pretraining.transformer_variants import (
     TransformerLayerViT,
     RiemannianCrissCrossTransformer,
-    RiemannianParallelCrissCrossTransformer,
     AdaptiveRiemannianParallelTransformer,
+    FilterBankBias,
 )
 
 
@@ -632,29 +632,30 @@ class DownstreamRiemannTransformerPara(Downstream):
         kwargs.pop("use_riemannian_metric", None)
         kwargs.pop("merge_k", None)
         kwargs.pop("use_frechet", None)
-        kwargs.pop("use_temporal_cov", None)
         # Value bias config — store before super().__init__
         # so _build_encoder can use it
         self._value_bias_layers = kwargs.pop("value_bias_layers", 4)
         # C3: learnable tangent-space centering (replaces prior residual-stream experiments)
         self._learn_mu_reference = kwargs.pop("learn_mu_reference", True)
-        # C2: Luna temporal compression
-        self._use_luna_temporal = kwargs.pop("use_luna_temporal", False)
-        self._luna_num_slots = kwargs.pop("luna_num_slots", 16)
-        self._luna_start_layer = kwargs.pop("luna_start_layer", 2)
-        self._luna_spd_beta_init = kwargs.pop("luna_spd_beta_init", 0.0)
         # EEG-RoPE temporal position encoding
         self._use_rope = kwargs.pop("use_rope", False)
         self._rope_freq_min = kwargs.pop("rope_freq_min", 0.5)
         self._rope_freq_max = kwargs.pop("rope_freq_max", 50.0)
         self._rope_learnable = kwargs.pop("rope_learnable", True)
-        # Run 2: replace temporal SDPA with mean-pool over time (V-pool mixer).
-        # Q_t / K_t projections are dropped — QKV shrinks from D→3D to D→2D.
-        self._use_mean_pool_temporal = kwargs.pop("use_mean_pool_temporal", False)
-        # Run 3: spatial-only. Remove the temporal branch entirely and gate
-        # the additive temporal PE behind the mask (which is empty at fine-tune
-        # time → no PE added at all, matching pretraining unmasked-token dist).
-        self._use_spatial_only = kwargs.pop("use_spatial_only", False)
+        # Branch gate: per-layer learnable scalars scaling each branch's
+        # contribution before final projection. Fine-tune-only addition —
+        # gates init at 1.0 so loading pretrained weights preserves behavior.
+        self._use_branch_gate = kwargs.pop("use_branch_gate", False)
+        # Filter-bank C1 (Run 4): FBCSP-style per-band static spatial biases
+        # summed into each layer's Riemannian bias with learnable β_{k,h,l}.
+        # β init = 0 → matches pure C1+C3 bit-exactly at epoch 0 when loading
+        # an old non-FB checkpoint with --use_filter_bank.
+        self._use_filter_bank = kwargs.pop("use_filter_bank", False)
+        self._fb_num_bands = kwargs.pop("fb_num_bands", 5)
+        self._fb_sample_rate = kwargs.pop("fb_sample_rate", 128.0)
+        self._fb_kernel_size = kwargs.pop("fb_kernel_size", 65)
+        self._fb_band_edges = kwargs.pop("fb_band_edges", None)
+        self._fb_learnable_cutoffs = kwargs.pop("fb_learnable_cutoffs", False)
         if aggregation == "class":
             raise ValueError(
                 "DownstreamRiemannTransformerPara does not use a [CLS] token. "
@@ -662,45 +663,126 @@ class DownstreamRiemannTransformerPara(Downstream):
             )
         super().__init__(*args, aggregation=aggregation, **kwargs)
 
+        # Instantiate encoder-level filter bank AFTER super().__init__ so we
+        # only build it if enabled — keeps backward compat for non-FB runs.
+        if self._use_filter_bank:
+            self.filter_bank = FilterBankBias(
+                sample_rate=self._fb_sample_rate,
+                num_bands=self._fb_num_bands,
+                kernel_size=self._fb_kernel_size,
+                band_edges=self._fb_band_edges,
+                learnable_cutoffs=self._fb_learnable_cutoffs,
+            )
+        else:
+            self.filter_bank = None
+
+    def _freeze_encoder(self):
+        """Freeze pretrained encoder, but keep branch-gate scalars trainable.
+
+        The branch gate is a fine-tune-only addition: it initializes at 1.0
+        (multiplicative identity) and is meant to learn per-task
+        spatial/temporal mixing. The base class freezes all of self.encoder,
+        which would pin the gates at 1.0 forever — making use_branch_gate=True
+        produce bit-for-bit identical outputs to use_branch_gate=False.
+        Re-enable the gate parameters here after the base freeze.
+
+        FB (filter-bank) parameters are treated the same way as the branch
+        gate ONLY when `_fb_linear_probe_trainable` is set — i.e., when the
+        user is probing FB on top of a non-FB pretrained checkpoint. In the
+        normal pipeline (FB trained during pretraining), FB params should
+        freeze with the rest of the encoder at linear-probe time.
+        """
+        super()._freeze_encoder()
+        if getattr(self, '_use_branch_gate', False):
+            n_unfrozen = 0
+            for block in self.encoder:
+                attn = block.attn
+                if getattr(attn, 'use_branch_gate', False):
+                    attn.branch_gate_s.requires_grad = True
+                    attn.branch_gate_t.requires_grad = True
+                    n_unfrozen += 2
+            print(f"  [branch gate] Unfrozen {n_unfrozen} gate scalars "
+                  f"({n_unfrozen // 2} layers × 2) — encoder otherwise frozen")
+
+        # FB params: keep trainable in linear-probe ONLY if explicitly flagged.
+        # Default (pretrained-FB ckpt) = frozen with rest of encoder.
+        if (getattr(self, '_use_filter_bank', False)
+                and getattr(self, '_fb_linear_probe_trainable', False)):
+            n_unfrozen = 0
+            for block in self.encoder:
+                attn = block.attn
+                if getattr(attn, 'use_filter_bank', False):
+                    attn.fb_beta.requires_grad = True
+                    n_unfrozen += attn.fb_beta.numel()
+            if self.filter_bank is not None:
+                # SincConv cutoffs frozen by default at the bias level already;
+                # mu_log_bank should train if FB is being probed onto an old ckpt.
+                if self.filter_bank.mu_log_bank is not None:
+                    self.filter_bank.mu_log_bank.requires_grad = True
+                    n_unfrozen += self.filter_bank.mu_log_bank.numel()
+                if self.filter_bank.sinc.learnable:
+                    self.filter_bank.sinc.f_lo.requires_grad = True
+                    self.filter_bank.sinc.band_hz.requires_grad = True
+            print(f"  [filter bank] Unfrozen {n_unfrozen} FB params "
+                  f"(fb_beta per layer + mu_log_bank) — encoder otherwise frozen")
+
     def _build_encoder(self, enc_dim, depth_e):
         value_bias_layers = getattr(self, '_value_bias_layers', 4)
         learn_mu_reference = getattr(self, '_learn_mu_reference', True)
-        use_luna = getattr(self, '_use_luna_temporal', False)
-        luna_slots = getattr(self, '_luna_num_slots', 16)
-        luna_start = getattr(self, '_luna_start_layer', 2)
-        luna_beta = getattr(self, '_luna_spd_beta_init', 0.0)
         use_rope = getattr(self, '_use_rope', False)
         rope_freq_min = getattr(self, '_rope_freq_min', 0.5)
         rope_freq_max = getattr(self, '_rope_freq_max', 50.0)
         rope_learnable = getattr(self, '_rope_learnable', True)
-        use_mean_pool_temporal = getattr(self, '_use_mean_pool_temporal', False)
-        use_spatial_only = getattr(self, '_use_spatial_only', False)
+        use_branch_gate = getattr(self, '_use_branch_gate', False)
+        use_filter_bank = getattr(self, '_use_filter_bank', False)
+        fb_num_bands = getattr(self, '_fb_num_bands', 5)
         return nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
                 use_value_bias=(i < value_bias_layers),
                 learn_mu_reference=learn_mu_reference,
-                use_luna_temporal=(use_luna and i >= luna_start),
-                luna_num_slots=luna_slots,
-                luna_spd_beta_init=luna_beta,
                 use_rope=use_rope,
                 rope_freq_min=rope_freq_min,
                 rope_freq_max=rope_freq_max,
                 rope_learnable=rope_learnable,
-                use_mean_pool_temporal=use_mean_pool_temporal,
-                use_spatial_only=use_spatial_only,
+                use_branch_gate=use_branch_gate,
+                use_filter_bank=use_filter_bank,
+                fb_num_bands=fb_num_bands,
             ) for i in range(depth_e)
         ])
 
-    def _run_encoder(self, x, C, channel_idx=None):
+    def _run_encoder(self, x, C, channel_idx=None, fb_log_S=None):
         """Adaptive Riemannian parallel transformer. No mask during downstream."""
         for transformer in self.encoder:
-            x = transformer(x, num_chan=C, channel_idx=channel_idx)
+            x = transformer(x, num_chan=C, channel_idx=channel_idx,
+                            fb_log_S=fb_log_S)
         return x
+
+    def get_branch_gates(self):
+        """Return per-layer (gate_s, gate_t) tuples. Empty list if gate disabled.
+
+        Use after fine-tune to inspect which branch the model preferred on the
+        current downstream dataset. Expected pattern: gate_s > gate_t on
+        narrow-band tasks (MI-style), balanced on broader-spectrum tasks.
+        """
+        if not getattr(self, '_use_branch_gate', False):
+            return []
+        gates = []
+        for block in self.encoder:
+            attn = block.attn
+            if getattr(attn, 'use_branch_gate', False):
+                gs = attn.branch_gate_s.detach().float().item()
+                gt = attn.branch_gate_t.detach().float().item()
+                gates.append((gs, gt))
+        return gates
 
     def forward(self, x, channel_list):
         B, C, T = x.shape
         device = x.device
+
+        # Keep raw signal for the filter bank BEFORE patching. At downstream
+        # there is no masking → the FB visibility mask is all-ones.
+        x_raw = x
 
         # Patch embed
         x = self.patch(x)
@@ -714,16 +796,9 @@ class DownstreamRiemannTransformerPara(Downstream):
             channel_list = channel_list.unsqueeze(0).expand(B, -1)
         x = x + self._get_channel_embedding(channel_list, N, B, L)
 
-        # Temporal embedding
-        # Skipped when:
-        #  - RoPE is enabled (position injected by rotation inside temporal attn)
-        #  - Spatial-only: at fine-tune time there's no masking, so the
-        #    mask-gated PE of pretraining adds zero — we match that here by
-        #    adding no PE at all. Keeps pretrain/fine-tune input distributions
-        #    aligned so the spatial block sees the same (content + chan_emb)
-        #    space in both regimes.
-        skip_pe = getattr(self, '_use_rope', False) or getattr(self, '_use_spatial_only', False)
-        if not skip_pe:
+        # Temporal embedding — skipped when RoPE is enabled (position injected
+        # by rotation inside the temporal attention).
+        if not getattr(self, '_use_rope', False):
             seq_idx = torch.arange(0, N, device=device).unsqueeze(0).unsqueeze(-1).repeat(B, 1, C).view(B, L)
             x = x + self.temporal_embedding(seq_idx)
 
@@ -735,8 +810,42 @@ class DownstreamRiemannTransformerPara(Downstream):
         # Within a batch all samples share the same channel set (same dataset)
         channel_idx = channel_list[0]  # (C,) global channel indices
 
+        # ── Defensive guard ──
+        # channel_idx is used to index mu_log (global channel space, size=TOTAL_GLOBAL_CHANNELS)
+        # Bad dtype / shape / out-of-range values cause async CUDA failures that
+        # surface at the next .item() sync with a garbage index — almost
+        # impossible to diagnose. Catch them here, in Python, with context.
+        if channel_idx.dtype not in (torch.int64, torch.int32, torch.long):
+            raise RuntimeError(
+                f"channel_idx must be integer dtype for embedding indexing; "
+                f"got dtype={channel_idx.dtype}. "
+                f"Check the dataloader — channel_list should be long, not float."
+            )
+        if channel_idx.dim() != 1 or channel_idx.shape[0] != C:
+            raise RuntimeError(
+                f"channel_idx should be shape (C,) with C={C}; "
+                f"got shape={tuple(channel_idx.shape)}."
+            )
+        # Global channel space is 144 (TOTAL_GLOBAL_CHANNELS in transformer_variants.py).
+        # Re-check here rather than import — layering-safe.
+        _ci_min = int(channel_idx.min().item())
+        _ci_max = int(channel_idx.max().item())
+        if _ci_min < 0 or _ci_max >= 144:
+            raise RuntimeError(
+                f"channel_idx out of range for global channel space (0..143): "
+                f"min={_ci_min}, max={_ci_max}. "
+                f"Check channel_info.yaml / dataloader global-id mapping."
+            )
+
+        # ── Filter-bank bias (Run 4 FB-C1) ──
+        # At downstream there's no masking → pass vis_mask=None (treated as
+        # all-visible by FilterBankBias). Computed once, reused across layers.
+        fb_log_S = None
+        if getattr(self, 'filter_bank', None) is not None:
+            fb_log_S = self.filter_bank(x_raw, None, channel_idx)  # (B, K, C, C)
+
         # Encoder (no class token — sequence is exactly N*C)
-        x = self._run_encoder(x, C, channel_idx=channel_idx)
+        x = self._run_encoder(x, C, channel_idx=channel_idx, fb_log_S=fb_log_S)
         x = self.norm_enc(x)
 
         # Head: dispatch based on head_choice

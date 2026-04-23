@@ -183,13 +183,16 @@ def build_eegnet(num_classes, num_channels, data_length, sampling_rate, **kwargs
     from downstream.models.deep_learning_model.eeg_net import EEGNet
 
     model = EEGNet(
-        no_spatial_filters=2,
+        no_spatial_filters=4,
         no_channels=num_channels,
         no_temporal_filters=8,
-        temporal_length_1=sampling_rate // 2,   # half of fs — captures 2Hz+ temporal features
-        temporal_length_2=sampling_rate // 8,   # scaled proportionally
+        temporal_length_1=sampling_rate // 2,   # half of fs
+        temporal_length_2=max(16, int(sampling_rate / 128) * 16),  # STEEGFormer: int(fs/128)*16
         window_length=data_length,
         num_class=num_classes,
+        drop_out_ratio=0.50,
+        pooling2=sampling_rate // 32,            # STEEGFormer: int(fs/32)
+        pooling3=8,
     )
     return model
 
@@ -466,11 +469,15 @@ def main():
         "task_type": ds_cfg.get("task_type", "classification"),
     }
 
-    # ── Data loader (no per-model normalization for DL baselines) ──
+    # ── Data loader ──
+    # Classic NN baselines receive raw µV data (no normalization, no resampling).
+    # Their built-in BatchNorm handles the scale — matching STEEGFormer's pipeline.
     loader = DownstreamDataLoader(
         data_path=ds_cfg["data_path"],
         config=ds_cfg["config_yaml"],
         custom_dataset_class=Downstream_Dataset,
+        norm_mode="classic_nn",
+        base_sfreq=ds_cfg["sampling_rate"],
         pre_split=ds_cfg.get("pre_split", False),
     )
 
