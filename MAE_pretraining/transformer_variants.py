@@ -1092,11 +1092,18 @@ class FilterBankBias(nn.Module):
 
             S = cov_sum / n_pairs                               # (B, K, C, C)
 
-            # Ridge for SPD safety: λ = eps_ridge · tr(S)/C (scale-invariant).
+            # ── Trace-normalize S to unit mean-diag per band ──
+            # Padé [1,1] approximates log(S) accurately only when eigenvalues
+            # of S lie near 1. Raw-signal band covariances can span orders of
+            # magnitude across trials/channels, which pushes Padé far off the
+            # true log and lets β amplify the error into Inf during training.
+            # Rescaling by tr(S)/C anchors S near I regardless of signal scale.
             diag_trace = S.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True)  # (B, K, 1)
-            lam = self.eps_ridge * diag_trace.clamp_min(1e-6)   # (B, K, 1)
+            S = S / diag_trace.clamp_min(1e-6).unsqueeze(-1)    # (B, K, C, C), mean diag = 1
             eye = torch.eye(C, device=S.device, dtype=S.dtype).view(1, 1, C, C)
-            S = S + lam.unsqueeze(-1) * eye
+
+            # Ridge for SPD safety (absolute now, not relative — S is unit-trace).
+            S = S + self.eps_ridge * eye
 
             # Padé [1,1] log-map, batched across (B, K): log(S) ≈ 2(S-I)(I+S)^{-1}
             # Collapse (B, K) to a single batch axis for torch.linalg.solve.
@@ -1111,6 +1118,12 @@ class FilterBankBias(nn.Module):
             if bad.any():
                 fallback = (S - eye)
                 logS = torch.where(bad.unsqueeze(-1).unsqueeze(-1), fallback, logS)
+
+            # ── Defensive magnitude cap ──
+            # Padé log of a unit-trace matrix is bounded by ~±2 analytically;
+            # clamp to ±5 as a generous safety net so β cannot turn a single
+            # outlier band into an attention-destroying Inf during fp16 cast.
+            logS = logS.clamp(-5.0, 5.0)
 
         # ── Subtract per-band learnable center μ_k, symmetrized ──
         if self.mu_log_bank is not None:
