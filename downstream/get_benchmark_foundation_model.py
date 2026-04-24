@@ -204,7 +204,9 @@ def build_riemann_transformer_para(num_classes, checkpoint_path, num_channels, d
                 'value_bias_layers', 'learn_mu_reference', 'use_branch_gate',
                 # Filter-bank (Run 4 FB-C1) flags
                 'use_filter_bank', 'fb_num_bands', 'fb_sample_rate',
-                'fb_kernel_size', 'fb_band_edges', 'fb_learnable_cutoffs'):
+                'fb_kernel_size', 'fb_band_edges', 'fb_learnable_cutoffs',
+                # Run 5: patch_size must match pretraining (32 for Hilbert run)
+                'patch_size'):
         if key in kwargs:
             extra_kwargs[key] = kwargs[key]
     model = DownstreamRiemannTransformerPara(
@@ -1223,6 +1225,11 @@ def main():
              "Use to measure per-task spatial/temporal mixing — learned gates "
              "are accessible via model.get_branch_gates().",
     )
+    parser.add_argument(
+        "--patch_size", type=int, default=16,
+        help="Patch size for token construction (must match pretraining patch_size). "
+             "Run 2/4 used 16; Run 5 (Hilbert + longer patches) uses 32.",
+    )
 
     # ── Filter-Bank C1 (Run 4 FB-C1) ──
     parser.add_argument(
@@ -1341,6 +1348,7 @@ def main():
         use_rope=args.use_rope,
         rope_learnable=rope_learnable,
         use_branch_gate=args.use_branch_gate,
+        patch_size=args.patch_size,
     )
     # Filter-Bank (Run 4 FB-C1): pass through only if explicitly enabled so
     # builders for non-FB models (e.g. BIOT, LaBraM) don't choke on stray kwargs.
