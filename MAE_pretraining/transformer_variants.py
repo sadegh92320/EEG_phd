@@ -1487,15 +1487,19 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             )
             # temp_bias shape: (B*C, num_heads, N, N) — additive attention bias
 
-            # Use SDPA with additive attn_mask (Flash Attention compatible).
-            # Cast bias to q_t's dtype for the SDPA kernel; the Padé output is
-            # fp32 internally but the bias addition tolerates fp16 cast at
-            # this scale (no numerical issues at the small log-map magnitudes).
-            out_t = F.scaled_dot_product_attention(
-                q_t, k_t, v_t,
-                attn_mask=temp_bias.to(q_t.dtype),
-                dropout_p=self.att_dropout if self.training else 0.0,
-            )
+            # Manual N×N temporal attention with additive bias.
+            # SDPA with float attn_mask disables Flash Attention and falls back
+            # to slower memory-efficient/math backends. Manual attention is
+            # actually faster here despite same FLOPs, because well-written
+            # matmul + softmax avoids the SDPA dispatch overhead.
+            with torch.amp.autocast('cuda', enabled=False), \
+                 torch.amp.autocast('cpu', enabled=False), \
+                 torch.amp.autocast('mps', enabled=False):
+                score_t = (q_t.float() @ k_t.float().transpose(-2, -1)) / (d ** 0.5)
+                score_t = score_t + temp_bias.float()
+                score_t = score_t.softmax(dim=-1)
+            score_t = F.dropout(score_t, p=self.att_dropout, training=self.training)
+            out_t = score_t.to(v_t.dtype) @ v_t
         else:
             # Standard N×N temporal self-attention (no temporal bias)
             out_t = F.scaled_dot_product_attention(
@@ -1529,17 +1533,17 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             v_geo = L_exp @ v_for_geo                  # (B*N, H2, C, d)
             v_s = v_s + beta_h * v_geo
 
-        # Use SDPA with additive attn_mask for the Riemannian bias.
-        # Flash Attention compatible — much faster than manual attention.
-        # The Padé output is fp32 internally; we cast to q_s.dtype for the
-        # SDPA kernel. At typical bias magnitudes (head_scales init=0,
-        # log(Σ) bounded), fp16 cast does not introduce numerically
-        # significant errors.
-        out_s = F.scaled_dot_product_attention(
-            q_s, k_s, v_s,
-            attn_mask=riem_bias.to(q_s.dtype),
-            dropout_p=self.att_dropout if self.training else 0.0,
-        )
+        # Manual attention with Riemannian bias.
+        # SDPA with float attn_mask falls back from Flash Attention to slower
+        # backends (memory-efficient or math), making it slower than well-
+        # optimized manual matmul + softmax. Manual is the right choice here.
+        with torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False):
+            score = (q_s.float() @ k_s.float().transpose(-2, -1)) / (d ** 0.5)
+            score = score + riem_bias.float()
+            score = score.softmax(dim=-1)
+        score = F.dropout(score, p=self.att_dropout, training=self.training)
+        out_s = score.to(v_s.dtype) @ v_s
 
         out_s = rearrange(out_s, '(b n) h c d -> b h (n c) d', b=B, n=N)
 

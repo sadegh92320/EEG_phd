@@ -197,6 +197,19 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         # Adaptive Riemannian parallel transformer layers
         # log_mode='pade' → Padé [1,1] approximant: log(S) ≈ 2(S-I)(I+S)^{-1}
         # C1: Riemannian spatial attention bias (score bias α_h · log(Σ))
+        #
+        # Layer-wise bias schedule (compute / signal trade-off):
+        #  - Temporal bias only on the FIRST HALF of layers (i < depth_e // 2).
+        #    Temporal Σ adds a Padé log-map per (B*C) sample of size N×N which
+        #    is the dominant added cost; restricting to early layers ~halves the
+        #    extra cost while keeping the inductive bias where the signal is
+        #    most "raw" (later layers are mixed enough that the bias contributes
+        #    little — same intuition as ALiBi/RoPE only-on-low-layers studies).
+        #  - Spatial bias DISABLED on the LAST layer (i == depth_e - 1):
+        #    empirically the head-scales of the last layer collapse toward 0 and
+        #    its μ_log barely moves — the layer is doing pure value mixing for
+        #    reconstruction, not spatial structuring. Skipping its log-map saves
+        #    one C×C eigh-equivalent per batch with no expected cost to features.
         self.encoder = nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
@@ -209,8 +222,10 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 use_filter_bank=use_filter_bank,
                 fb_num_bands=fb_num_bands,
                 fb_beta_init=fb_beta_init,
-                disable_bias=disable_bias,
-                use_temporal_bias=use_temporal_bias,
+                # Disable spatial bias on the last layer (μ effectively unused there).
+                disable_bias=(disable_bias or (i == depth_e - 1)),
+                # Temporal bias only on the first half of layers.
+                use_temporal_bias=(use_temporal_bias and i < depth_e // 2),
                 max_temporal_patches=max_temporal_patches,
             ) for i in range(depth_e)
         ])
