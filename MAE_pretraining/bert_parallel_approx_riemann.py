@@ -224,8 +224,11 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 fb_beta_init=fb_beta_init,
                 # Disable spatial bias on the last layer (μ effectively unused there).
                 disable_bias=(disable_bias or (i == depth_e - 1)),
-                # Temporal bias only on the first half of layers.
-                use_temporal_bias=(use_temporal_bias and i < depth_e // 2),
+                # Temporal bias on all layers — bf16 made the cost negligible
+                # (~1-2 min/epoch for layers 4-7). Empirically determine which
+                # layers actually use it via temporal_head_scale_mean/layer_i:
+                # layers where head_scales stay near 0 after epoch 10 → prune.
+                use_temporal_bias=use_temporal_bias,
                 max_temporal_patches=max_temporal_patches,
             ) for i in range(depth_e)
         ])
