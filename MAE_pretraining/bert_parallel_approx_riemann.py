@@ -170,7 +170,9 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                  fb_sample_rate=128.0, fb_kernel_size=65,
                  fb_band_edges=None, fb_learnable_cutoffs=False,
                  fb_beta_init=0.0, fb_l1_weight=0.0,
-                 use_hilbert_target=False):
+                 use_hilbert_target=False,
+                 disable_bias=False,
+                 use_temporal_bias=False, max_temporal_patches=128):
         super().__init__()
 
         self.config = config
@@ -207,6 +209,9 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                 use_filter_bank=use_filter_bank,
                 fb_num_bands=fb_num_bands,
                 fb_beta_init=fb_beta_init,
+                disable_bias=disable_bias,
+                use_temporal_bias=use_temporal_bias,
+                max_temporal_patches=max_temporal_patches,
             ) for i in range(depth_e)
         ])
 
@@ -890,6 +895,23 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
                          on_step=False, on_epoch=True)
                 self.log(f"mu_max_abs/layer_{i}", mu.detach().abs().max(),
                          on_step=False, on_epoch=True)
+
+            # Run 6: temporal Riemannian bias diagnostics.
+            # head_scales_temporal grows if the model finds Σ_temporal useful.
+            # mu_temporal_norm grows toward log-Euclidean Fréchet mean of
+            # patch-sequence autocorrelation across the data distribution.
+            if hasattr(layer.attn, 'temporal_riemannian_bias') and layer.attn.temporal_riemannian_bias is not None:
+                t_scales = layer.attn.temporal_riemannian_bias.head_scales.detach()
+                self.log(f"temporal_head_scale_mean/layer_{i}", t_scales.mean(),
+                         on_step=False, on_epoch=True)
+                self.log(f"temporal_head_scale_std/layer_{i}", t_scales.std(),
+                         on_step=False, on_epoch=True)
+                t_mu = layer.attn.temporal_riemannian_bias.mu_log
+                if t_mu is not None:
+                    self.log(f"temporal_mu_frobenius/layer_{i}", t_mu.detach().norm(),
+                             on_step=False, on_epoch=True)
+                    self.log(f"temporal_mu_max_abs/layer_{i}", t_mu.detach().abs().max(),
+                             on_step=False, on_epoch=True)
 
             # ── RoPE frequency logging ──
             if hasattr(layer.attn, 'temporal_rope'):

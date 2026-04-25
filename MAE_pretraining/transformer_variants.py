@@ -738,10 +738,15 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
     def __init__(self, num_heads, total_channels=TOTAL_GLOBAL_CHANNELS,
                  eps=1e-5, log_mode='eigh', use_approx=False,
                  use_frechet=False, frechet_R_inv_sqrt=None,
-                 learn_mu_reference=True):
+                 learn_mu_reference=True, disable_bias=False):
         super().__init__()
         self.num_heads = num_heads
         self.eps = eps
+        # When disable_bias=True, skip the covariance + Padé path entirely
+        # and return zeros. This is the real "baseline" ablation — no
+        # Riemannian compute cost on GPU (or on MPS CPU-fallback path).
+        # Used for fair efficiency comparisons and fast baseline runs.
+        self.disable_bias = disable_bias
         self.adaptive_log = AdaptiveLogMap(
             total_channels=total_channels, eps=eps,
             log_mode=log_mode, use_approx=use_approx,
@@ -783,6 +788,18 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         """
         BN, C, D = x.shape
 
+        # ── Fast baseline path: skip all Riemannian computation ──
+        # When disable_bias is True, return zero bias without computing the
+        # covariance matrix or the Padé log-map. This is the true "no-C1"
+        # ablation — no compute cost, no CPU fallback on MPS, no wall-time tax.
+        # Returns zeros of expected shape so downstream code doesn't break.
+        if self.disable_bias:
+            zero_bias = torch.zeros(
+                BN, self.num_heads, C, C, device=x.device, dtype=x.dtype
+            )
+            zero_L = torch.zeros(BN, C, C, device=x.device, dtype=x.dtype)
+            return zero_bias, zero_L
+
         # Step 1: Compute sample covariance → SPD matrix
         # MUST be float32 — the residual stream x can have large values after
         # many layers, and x @ x^T overflows fp16 (max 65504) → inf → NaN.
@@ -820,6 +837,133 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         # Step 3: Per-head scaling on the (possibly centered) tangent
         scales = self.head_scales.view(1, self.num_heads, 1, 1)
         bias = L.unsqueeze(1) * scales
+
+        return bias, L
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TemporalRiemannianAttentionBias — Run 6 (frequency-aware via Wiener-Khinchin)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Symmetric counterpart to AdaptiveRiemannianAttentionBias on the temporal axis.
+# For each channel, computes Σ_temporal = X X^T / D where X is the patch-sequence
+# embeddings (N, D). By Wiener-Khinchin theorem, this autocorrelation matrix
+# encodes the same information as the power spectrum: the off-diagonal banding
+# patterns reveal which periodicities (frequencies) are present.
+#
+# Used as additive bias on temporal attention scores, mirroring how spatial
+# Σ is used on spatial attention. Layer-adaptive (computed from residual
+# stream at each layer) — does not depend on raw signal, no FFT, no bands.
+#
+# Shape conventions:
+#   Input: (B*C, N, D) per-channel patch-sequence embeddings
+#   Σ_temporal: (B*C, N, N) symmetric SPD
+#   Output bias: (B*C, num_heads, N, N) — added to temporal attention scores
+#
+# Variable N across datasets handled via μ_temporal of shape (max_patches, max_patches),
+# indexed at [:N, :N] at runtime.
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class TemporalRiemannianAttentionBias(nn.Module):
+    """
+    Riemannian attention bias on the temporal axis.
+
+    Symmetric to AdaptiveRiemannianAttentionBias but operates on patch-sequence
+    embeddings per channel. Captures periodic temporal structure (frequency
+    information via Wiener-Khinchin) as an additive bias on temporal attention.
+
+    Args:
+        num_heads: Number of temporal attention heads
+        max_patches: Maximum N (patch count). μ_temporal sized for this.
+                     Indexed at [:N, :N] for variable-N inputs.
+        eps: Ridge regularization for SPD safety
+        learn_mu_reference: Use learnable μ_temporal tangent-space reference
+        disable_bias: When True, return zeros without computing covariance/Padé
+                      (for fast baseline ablation, no compute cost).
+    """
+    def __init__(self, num_heads, max_patches=128, eps=1e-5,
+                 learn_mu_reference=True, disable_bias=False):
+        super().__init__()
+        self.num_heads = num_heads
+        self.eps = eps
+        self.max_patches = max_patches
+        self.disable_bias = disable_bias
+
+        # Per-head learnable scaling. Init at 0 so model starts identical to
+        # no-temporal-bias baseline; learns to use the bias if helpful.
+        self.head_scales = nn.Parameter(torch.zeros(num_heads))
+
+        # Learnable tangent-space reference μ_temporal. Stored as max_patches ×
+        # max_patches matrix; runtime indexes the [:N, :N] submatrix.
+        # Init at 0 → neutral start (Padé expansion at identity).
+        if learn_mu_reference:
+            self.mu_log = nn.Parameter(torch.zeros(max_patches, max_patches))
+        else:
+            self.register_parameter('mu_log', None)
+
+    def forward(self, x_temporal, mask_temporal=None):
+        """
+        Args:
+            x_temporal: (B*C, N, D) per-channel patch-sequence embeddings.
+                        Masked patches' rows should be zeroed by caller.
+            mask_temporal: (B*C, N) boolean — True = masked patch.
+                           When provided, masked rows/cols of S overwritten
+                           with identity (clean zero bias on masked positions).
+        Returns:
+            bias: (B*C, num_heads, N, N) attention bias per head
+            L: (B*C, N, N) tangent vector (log(S) − μ_temporal_sub)
+        """
+        BC, N, D = x_temporal.shape
+
+        # Fast baseline path: skip Riemannian compute entirely
+        if self.disable_bias:
+            zero_bias = torch.zeros(
+                BC, self.num_heads, N, N,
+                device=x_temporal.device, dtype=x_temporal.dtype,
+            )
+            zero_L = torch.zeros(
+                BC, N, N, device=x_temporal.device, dtype=x_temporal.dtype,
+            )
+            return zero_bias, zero_L
+
+        # Step 1: compute Σ_temporal in fp32 (linalg.solve has no fp16 kernel)
+        with torch.amp.autocast('cuda', enabled=False), \
+             torch.amp.autocast('cpu', enabled=False), \
+             torch.amp.autocast('mps', enabled=False):
+            x_f32 = x_temporal.float()
+            S = torch.bmm(x_f32, x_f32.transpose(-2, -1)) / D  # (B*C, N, N)
+            eye = torch.eye(N, device=S.device, dtype=S.dtype).unsqueeze(0)
+            S = S + self.eps * eye
+
+            # Mask handling: overwrite masked rows/cols with identity, so log(S)
+            # is zero on masked positions (no Padé garbage on fake-zero entries).
+            if mask_temporal is not None:
+                mf = mask_temporal.float()
+                m_any = (mf.unsqueeze(-1) + mf.unsqueeze(-2)).clamp_(max=1.0)
+                S = S * (1.0 - m_any) + eye * m_any
+
+            # Step 2: Padé [1,1] log-map: log(S) ≈ 2(S − I)(I + S)^{-1}
+            # via torch.linalg.solve to avoid explicit matrix inverse.
+            Y = eye + S                                    # (B*C, N, N)
+            X_num = 2.0 * (S - eye)                        # (B*C, N, N)
+            L = torch.linalg.solve(Y, X_num)               # (B*C, N, N)
+            # Symmetrize for numerical safety (tangent vectors should be sym)
+            L = 0.5 * (L + L.transpose(-2, -1))
+
+        # Step 3: subtract learnable μ_temporal[:N, :N] submatrix, symmetrized
+        if self.mu_log is not None:
+            assert N <= self.max_patches, (
+                f"N={N} exceeds max_patches={self.max_patches}. "
+                f"Increase max_temporal_patches in TemporalRiemannianAttentionBias."
+            )
+            mu_sub = self.mu_log[:N, :N]
+            mu_sub = 0.5 * (mu_sub + mu_sub.transpose(-2, -1))
+            L = L - mu_sub.unsqueeze(0)                    # broadcast over B*C
+
+        # Step 4: per-head scaling
+        scales = self.head_scales.view(1, self.num_heads, 1, 1)
+        bias = L.unsqueeze(1) * scales                     # (B*C, num_heads, N, N)
 
         return bias, L
 
@@ -1158,7 +1302,9 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
                  use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
                  rope_learnable=True,
                  use_branch_gate=False,
-                 use_filter_bank=False, fb_num_bands=5, fb_beta_init=0.0):
+                 use_filter_bank=False, fb_num_bands=5, fb_beta_init=0.0,
+                 disable_bias=False,
+                 use_temporal_bias=False, max_temporal_patches=128):
         super().__init__()
         assert num_heads % 2 == 0, "num_heads must be even for parallel split"
         assert embed_dim % num_heads == 0
@@ -1168,6 +1314,14 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         self.dim_head = embed_dim // num_heads
         self.embed_dim = embed_dim
         self.use_value_bias = use_value_bias
+        # Baseline ablation flag: when True, skip Riemannian bias computation
+        # entirely. Propagated to AdaptiveRiemannianAttentionBias below.
+        self.disable_bias = disable_bias
+        # Temporal Riemannian bias (Run 6): adds Σ_temporal bias on temporal
+        # attention, mirroring spatial Σ. Captures frequency content via
+        # Wiener-Khinchin (autocorrelation = inverse FFT of power spectrum).
+        # Layer-adaptive — computed from residual stream at each layer.
+        self.use_temporal_bias = use_temporal_bias
 
         # Filter-bank bias (Run 4 FB-C1): per-layer (H_spatial × K) scalars that
         # weight the static raw-signal band biases precomputed at the encoder
@@ -1223,7 +1377,20 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             use_frechet=use_frechet,
             frechet_R_inv_sqrt=frechet_R_inv_sqrt,
             learn_mu_reference=learn_mu_reference,
+            disable_bias=disable_bias,
         )
+
+        # Temporal Riemannian bias for temporal heads (Run 6)
+        if self.use_temporal_bias:
+            self.temporal_riemannian_bias = TemporalRiemannianAttentionBias(
+                num_heads=self.heads_per_branch,
+                max_patches=max_temporal_patches,
+                eps=spd_eps,
+                learn_mu_reference=learn_mu_reference,
+                disable_bias=disable_bias,
+            )
+        else:
+            self.temporal_riemannian_bias = None
 
         # Geometric value mixing: V' = V + β_h · (L @ V)
         # Injects covariance structure into attention values — complementary
@@ -1303,11 +1470,40 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
         if self.use_rope:
             q_t, k_t = self.temporal_rope(q_t, k_t)
 
-        # Standard N×N temporal self-attention
-        out_t = F.scaled_dot_product_attention(
-            q_t, k_t, v_t,
-            dropout_p=self.att_dropout if self.training else 0.0,
-        )
+        # ── Temporal Riemannian bias (Run 6) ──
+        # Compute Σ_temporal per channel from patch-sequence embeddings.
+        # By Wiener-Khinchin, this autocorrelation matrix encodes frequency
+        # content (off-diagonal banding patterns reveal periodicities).
+        if self.use_temporal_bias:
+            # Per-channel patch-sequence embeddings: (B*C, N, D)
+            x_temporal = rearrange(bias_source, 'b (n c) d -> (b c) n d', c=C)
+            mask_temporal = None
+            if mask is not None:
+                mask_temporal = rearrange(mask, 'b (n c) -> (b c) n', c=C)
+                x_temporal = x_temporal * (~mask_temporal).unsqueeze(-1).float()
+
+            temp_bias, _temp_L = self.temporal_riemannian_bias(
+                x_temporal, mask_temporal=mask_temporal,
+            )
+            # temp_bias shape: (B*C, num_heads, N, N)
+
+            # Manual N×N temporal attention with additive bias (mirrors spatial
+            # bias-attention pattern; SDPA doesn't expose a clean per-head bias hook).
+            with torch.amp.autocast('cuda', enabled=False), \
+                 torch.amp.autocast('cpu', enabled=False), \
+                 torch.amp.autocast('mps', enabled=False):
+                score_t = (q_t.float() @ k_t.float().transpose(-2, -1)) / (d ** 0.5)
+                score_t = score_t + temp_bias.float()
+                score_t = score_t.softmax(dim=-1)
+            score_t = F.dropout(score_t, p=self.att_dropout, training=self.training)
+            out_t = score_t.to(v_t.dtype) @ v_t
+        else:
+            # Standard N×N temporal self-attention (no temporal bias)
+            out_t = F.scaled_dot_product_attention(
+                q_t, k_t, v_t,
+                dropout_p=self.att_dropout if self.training else 0.0,
+            )
+
         out_t = rearrange(out_t, '(b c) h n d -> b h (n c) d', b=B, c=C)
 
         # ── Spatial attention (Riemannian-biased) ──
@@ -1409,7 +1605,9 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
                  use_rope=False, rope_freq_min=0.5, rope_freq_max=50.0,
                  rope_learnable=True,
                  use_branch_gate=False,
-                 use_filter_bank=False, fb_num_bands=5, fb_beta_init=0.0):
+                 use_filter_bank=False, fb_num_bands=5, fb_beta_init=0.0,
+                 disable_bias=False,
+                 use_temporal_bias=False, max_temporal_patches=128):
         super().__init__()
 
         self.attn = AdaptiveRiemannianParallelAttention(
@@ -1433,6 +1631,9 @@ class AdaptiveRiemannianParallelTransformer(nn.Module):
             use_filter_bank=use_filter_bank,
             fb_num_bands=fb_num_bands,
             fb_beta_init=fb_beta_init,
+            disable_bias=disable_bias,
+            use_temporal_bias=use_temporal_bias,
+            max_temporal_patches=max_temporal_patches,
         )
 
         self.drop_path1 = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()

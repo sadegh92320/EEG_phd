@@ -168,7 +168,13 @@ class Pipeline:
                      # and provides more per-patch frequency context. Combined
                      # with Hilbert analytic-signal target, this forces phase-
                      # aware representation learning under standard MAE loss.
-                     patch_size=32, use_hilbert_target=True):
+                     patch_size=32, use_hilbert_target=True,
+                     # ── Temporal Riemannian bias (Run 6) ──
+                     # Σ_temporal on temporal heads, mirror of spatial Σ.
+                     # By Wiener-Khinchin, autocorrelation matrix encodes
+                     # frequency information. Layer-adaptive, real-valued,
+                     # captures periodic structure without explicit FFT/bands.
+                     use_temporal_bias=False, max_temporal_patches=128):
         """
         Pretrain the MAE and return the checkpoint path for downstream loading.
 
@@ -202,15 +208,18 @@ class Pipeline:
             # The baseline freezes head_scales=0 so Riemannian bias has
             # zero contribution — same architecture, same param count.
             if log_mode == 'baseline':
-                print("[Ablation] Parallel attention with Riemannian bias disabled")
+                print("[Ablation] Parallel attention with Riemannian bias DISABLED "
+                      "(no covariance / Padé compute — fast baseline)")
                 model = ApproxAdaptiveRiemannBert(
                     use_corr_masking=use_corr_masking,
                     value_bias_layers=0,         # no value bias for clean baseline
                     learn_mu_reference=False,    # no centering either for clean baseline
+                    disable_bias=True,           # short-circuit covariance + Padé
+                    patch_size=patch_size,       # honor patch_size for Run 5-style config
+                    use_hilbert_target=use_hilbert_target,
                 )
-                for layer in model.encoder:
-                    layer.attn.riemannian_bias.head_scales.requires_grad = False
-                    layer.attn.riemannian_bias.head_scales.zero_()
+                # head_scales stay at their init (zero) — no need to freeze
+                # because the bias path is already disabled upstream.
             else:
                 masking_str = "corr-masking" if use_corr_masking else "random-masking"
                 vb_str = f", value_bias_layers={value_bias_layers}"
@@ -241,6 +250,9 @@ class Pipeline:
                     # Run 5: larger patches + Hilbert target
                     patch_size=patch_size,
                     use_hilbert_target=use_hilbert_target,
+                    # Run 6: temporal Riemannian bias
+                    use_temporal_bias=use_temporal_bias,
+                    max_temporal_patches=max_temporal_patches,
                 )
                 # Override log_mode in every encoder layer if needed
                 if log_mode == 'approx':

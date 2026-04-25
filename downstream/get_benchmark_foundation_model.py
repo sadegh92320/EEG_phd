@@ -209,6 +209,13 @@ def build_riemann_transformer_para(num_classes, checkpoint_path, num_channels, d
                 'patch_size'):
         if key in kwargs:
             extra_kwargs[key] = kwargs[key]
+    # When --log_mode baseline is passed, disable the Riemannian bias
+    # computation entirely (not just zero it out). This gives real wall-time
+    # speedup for the baseline ablation — no covariance, no Padé, no CPU
+    # fallback on MPS. Essential for fast ablation runs on big datasets
+    # (sleep, TUEV) where each epoch is expensive.
+    if kwargs.get('log_mode') == 'baseline':
+        extra_kwargs['disable_bias'] = True
     model = DownstreamRiemannTransformerPara(
         num_classes=num_classes, checkpoint_path=checkpoint_path,
         **extra_kwargs,

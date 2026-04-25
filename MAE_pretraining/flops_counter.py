@@ -69,6 +69,40 @@ class FLOPsCounter:
         self.flops += flops
         self.layer_flops["GELU"] += flops
 
+    def _conv1d_hook(self, module, input, output):
+        """Conv1d: 2 * in_ch * out_ch * kernel * out_length * batch
+        Used by BIOT (large-kernel 1D convolutions in tokenizer)."""
+        out_x = output
+        in_ch = module.in_channels
+        out_ch = module.out_channels
+        k = module.kernel_size[0]
+        out_length = out_x.shape[-1]
+        batch = out_x.shape[:-2].numel() if out_x.dim() > 2 else 1
+        flops = 2 * in_ch * out_ch * k * out_length * batch
+        self.flops += flops
+        self.layer_flops["Conv1d"] += flops
+
+    def _conv2d_hook(self, module, input, output):
+        """Conv2d: 2 * in_ch * out_ch * kH * kW * out_H * out_W * batch
+        Used by some baselines (e.g., LaBraM patch embed)."""
+        out_x = output
+        in_ch = module.in_channels
+        out_ch = module.out_channels
+        kH, kW = module.kernel_size
+        out_H, out_W = out_x.shape[-2], out_x.shape[-1]
+        batch = out_x.shape[0]
+        flops = 2 * in_ch * out_ch * kH * kW * out_H * out_W * batch
+        self.flops += flops
+        self.layer_flops["Conv2d"] += flops
+
+    def _activation_hook(self, module, input, output):
+        """Generic activation (ReLU, ELU, SiLU, Tanh): ~2-4 ops per element."""
+        x = input[0]
+        # Conservative: 4 ops per element for non-linear (ELU/Tanh higher than ReLU)
+        flops = 4 * x.numel()
+        self.flops += flops
+        self.layer_flops[module.__class__.__name__] += flops
+
     def register_hooks(self, model):
         """Register forward hooks on all relevant layers"""
         for name, module in model.named_modules():
@@ -86,6 +120,15 @@ class FLOPsCounter:
                 self.hooks.append(h)
             elif isinstance(module, nn.GELU):
                 h = module.register_forward_hook(self._gelu_hook)
+                self.hooks.append(h)
+            elif isinstance(module, nn.Conv1d):
+                h = module.register_forward_hook(self._conv1d_hook)
+                self.hooks.append(h)
+            elif isinstance(module, nn.Conv2d):
+                h = module.register_forward_hook(self._conv2d_hook)
+                self.hooks.append(h)
+            elif isinstance(module, (nn.ReLU, nn.ELU, nn.SiLU, nn.Tanh, nn.LeakyReLU)):
+                h = module.register_forward_hook(self._activation_hook)
                 self.hooks.append(h)
 
     def remove_hooks(self):
@@ -170,6 +213,135 @@ def _add_matmul_flops_hook(counter):
     return original_matmul
 
 
+def _add_linalg_solve_hook(counter):
+    """
+    Monkey-patch torch.linalg.solve to count Padé log-map FLOPs.
+    solve(A, B) where A is (..., N, N) and B is (..., N, K):
+        LU decomposition: ~(2/3) * N^3
+        Forward/back substitution: 2 * N^2 * K
+    Approximate total: (2/3) * batch * N^3 + 2 * batch * N^2 * K
+    """
+    original_solve = torch.linalg.solve
+
+    def patched_solve(A, B):
+        batch_dims = A.shape[:-2].numel() if A.dim() > 2 else 1
+        N = A.shape[-1]
+        K = B.shape[-1] if B.dim() > 1 else 1
+        # LU: 2/3 N^3, solve: 2 N^2 K, count both
+        flops = batch_dims * (int(2 * N**3 / 3) + 2 * N**2 * K)
+        counter.flops += flops
+        counter.layer_flops["LinalgSolve(Pade)"] += flops
+        return original_solve(A, B)
+
+    torch.linalg.solve = patched_solve
+    return original_solve
+
+
+def _add_linalg_eigh_hook(counter):
+    """
+    Monkey-patch torch.linalg.eigh for eigendecomposition (used in eigh log mode
+    and safe_eigh wrapper). Cost: ~9 * N^3 for symmetric eigendecomposition.
+    """
+    original_eigh = torch.linalg.eigh
+
+    def patched_eigh(A, UPLO='L'):
+        batch_dims = A.shape[:-2].numel() if A.dim() > 2 else 1
+        N = A.shape[-1]
+        # Symmetric eigh: tridiagonalization + QR iteration ~ 9N^3
+        flops = batch_dims * 9 * N**3
+        counter.flops += flops
+        counter.layer_flops["LinalgEigh"] += flops
+        return original_eigh(A, UPLO=UPLO)
+
+    torch.linalg.eigh = patched_eigh
+    return original_eigh
+
+
+def _add_fft_hooks(counter):
+    """
+    Monkey-patch FFT operations (used in Hilbert transform, FB SincConv, CSD if added).
+    rFFT cost: ~5 * N log2(N) per signal of length N
+    """
+    original_fft = torch.fft.fft
+    original_ifft = torch.fft.ifft
+    original_rfft = torch.fft.rfft
+    original_irfft = torch.fft.irfft
+
+    def _fft_count(x, dim_arg, name):
+        # Apply FFT along last dim by default; check actual dim
+        if dim_arg is None:
+            dim_arg = -1
+        N = x.shape[dim_arg]
+        # Number of FFTs = product of other dims
+        other_dims_size = x.numel() // N
+        flops = int(5 * N * np.log2(max(N, 2))) * other_dims_size
+        counter.flops += flops
+        counter.layer_flops[name] += flops
+
+    def patched_fft(input, n=None, dim=-1, norm=None):
+        _fft_count(input, dim, "FFT")
+        return original_fft(input, n=n, dim=dim, norm=norm)
+
+    def patched_ifft(input, n=None, dim=-1, norm=None):
+        _fft_count(input, dim, "IFFT")
+        return original_ifft(input, n=n, dim=dim, norm=norm)
+
+    def patched_rfft(input, n=None, dim=-1, norm=None):
+        _fft_count(input, dim, "rFFT")
+        return original_rfft(input, n=n, dim=dim, norm=norm)
+
+    def patched_irfft(input, n=None, dim=-1, norm=None):
+        _fft_count(input, dim, "irFFT")
+        return original_irfft(input, n=n, dim=dim, norm=norm)
+
+    torch.fft.fft = patched_fft
+    torch.fft.ifft = patched_ifft
+    torch.fft.rfft = patched_rfft
+    torch.fft.irfft = patched_irfft
+
+    return original_fft, original_ifft, original_rfft, original_irfft
+
+
+def _add_einsum_hook(counter):
+    """
+    Monkey-patch torch.einsum to count contraction FLOPs.
+    Approximate cost via opt_einsum if available; otherwise estimate from shapes.
+    """
+    original_einsum = torch.einsum
+
+    def patched_einsum(equation, *operands):
+        # Approximate: 2 * product of all dim sizes in the contraction
+        # Conservative estimate using output shape × contracted dim sizes
+        try:
+            # Get all unique dims and their sizes
+            input_specs, output_spec = equation.split("->") if "->" in equation else (equation, "")
+            input_specs = input_specs.split(",")
+            dim_sizes = {}
+            for spec, op in zip(input_specs, operands):
+                for ax, dim_name in enumerate(spec):
+                    if dim_name not in dim_sizes:
+                        dim_sizes[dim_name] = op.shape[ax]
+            # Output dims
+            out_dims = output_spec if output_spec else ''.join(set(''.join(input_specs)))
+            # Contracted dims: appear in input but not output
+            input_chars = set(''.join(input_specs))
+            output_chars = set(out_dims)
+            contracted = input_chars - output_chars
+            # FLOPs: 2 × product of all dims involved
+            from functools import reduce
+            from operator import mul
+            all_dims_product = reduce(mul, [dim_sizes[d] for d in input_chars], 1)
+            flops = 2 * all_dims_product
+            counter.flops += flops
+            counter.layer_flops["Einsum"] += flops
+        except Exception:
+            pass  # fail silently if equation parsing fails
+        return original_einsum(equation, *operands)
+
+    torch.einsum = patched_einsum
+    return original_einsum
+
+
 @torch.no_grad()
 def count_flops(model, num_channels=32, seq_length=500, batch_size=2,
                 patch_size=16, device="cpu", verbose=True):
@@ -216,6 +388,11 @@ def count_flops(model, num_channels=32, seq_length=500, batch_size=2,
     original_sdpa = _add_attention_flops_hook(counter, model)
     original_bmm = _add_bmm_flops_hook(counter, model)
     original_matmul = _add_matmul_flops_hook(counter)
+    # Padé / eigh / FFT / einsum patches for Riemannian + complex paths
+    original_solve = _add_linalg_solve_hook(counter)
+    original_eigh = _add_linalg_eigh_hook(counter)
+    original_fft, original_ifft, original_rfft, original_irfft = _add_fft_hooks(counter)
+    original_einsum = _add_einsum_hook(counter)
 
     # Forward pass
     try:
@@ -227,6 +404,13 @@ def count_flops(model, num_channels=32, seq_length=500, batch_size=2,
         F.scaled_dot_product_attention = original_sdpa
         torch.bmm = original_bmm
         torch.matmul = original_matmul
+        torch.linalg.solve = original_solve
+        torch.linalg.eigh = original_eigh
+        torch.fft.fft = original_fft
+        torch.fft.ifft = original_ifft
+        torch.fft.rfft = original_rfft
+        torch.fft.irfft = original_irfft
+        torch.einsum = original_einsum
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())

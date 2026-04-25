@@ -656,6 +656,11 @@ class DownstreamRiemannTransformerPara(Downstream):
         self._fb_kernel_size = kwargs.pop("fb_kernel_size", 65)
         self._fb_band_edges = kwargs.pop("fb_band_edges", None)
         self._fb_learnable_cutoffs = kwargs.pop("fb_learnable_cutoffs", False)
+        # Baseline ablation: disable Riemannian bias computation entirely.
+        # When True, AdaptiveRiemannianAttentionBias.forward returns zeros
+        # WITHOUT computing covariance or Padé log-map → real wall-time
+        # speedup, especially on MPS (no CPU fallback for linalg.solve).
+        self._disable_bias = kwargs.pop("disable_bias", False)
         if aggregation == "class":
             raise ValueError(
                 "DownstreamRiemannTransformerPara does not use a [CLS] token. "
@@ -736,6 +741,7 @@ class DownstreamRiemannTransformerPara(Downstream):
         use_branch_gate = getattr(self, '_use_branch_gate', False)
         use_filter_bank = getattr(self, '_use_filter_bank', False)
         fb_num_bands = getattr(self, '_fb_num_bands', 5)
+        disable_bias = getattr(self, '_disable_bias', False)
         return nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
@@ -748,6 +754,7 @@ class DownstreamRiemannTransformerPara(Downstream):
                 use_branch_gate=use_branch_gate,
                 use_filter_bank=use_filter_bank,
                 fb_num_bands=fb_num_bands,
+                disable_bias=disable_bias,
             ) for i in range(depth_e)
         ])
 
