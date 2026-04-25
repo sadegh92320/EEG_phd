@@ -1488,16 +1488,21 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
             # temp_bias shape: (B*C, num_heads, N, N) — additive attention bias
 
             # Manual N×N temporal attention with additive bias.
-            # SDPA with float attn_mask disables Flash Attention and falls back
-            # to slower memory-efficient/math backends. Manual attention is
-            # actually faster here despite same FLOPs, because well-written
-            # matmul + softmax avoids the SDPA dispatch overhead.
+            # SDPA with float attn_mask falls back from Flash Attention to
+            # slower memory-efficient/math backends, so we go manual.
+            #
+            # CRITICAL: keep q@k in autocast dtype (fp16/bf16) — wrapping the
+            # whole block in autocast(enabled=False) was forcing fp32 matmul
+            # on (B*C, H, N, N), the dominant cost (~5x heavier than spatial
+            # because N=48 vs C≈22). Only the softmax goes to fp32 for
+            # numerical stability; the bias is downcast to score dtype before
+            # adding (head_scales init at 0 → bias bounded → fp16-safe).
+            score_t = (q_t @ k_t.transpose(-2, -1)) / (d ** 0.5)
+            score_t = score_t + temp_bias.to(score_t.dtype)
             with torch.amp.autocast('cuda', enabled=False), \
                  torch.amp.autocast('cpu', enabled=False), \
                  torch.amp.autocast('mps', enabled=False):
-                score_t = (q_t.float() @ k_t.float().transpose(-2, -1)) / (d ** 0.5)
-                score_t = score_t + temp_bias.float()
-                score_t = score_t.softmax(dim=-1)
+                score_t = score_t.float().softmax(dim=-1)
             score_t = F.dropout(score_t, p=self.att_dropout, training=self.training)
             out_t = score_t.to(v_t.dtype) @ v_t
         else:
@@ -1535,13 +1540,14 @@ class AdaptiveRiemannianParallelAttention(nn.Module):
 
         # Manual attention with Riemannian bias.
         # SDPA with float attn_mask falls back from Flash Attention to slower
-        # backends (memory-efficient or math), making it slower than well-
-        # optimized manual matmul + softmax. Manual is the right choice here.
+        # backends, so we go manual. Same dtype discipline as temporal:
+        # q@k stays in autocast dtype (fp16/bf16), only softmax goes to fp32.
+        # The bias is bounded by head_scales (init 0) so fp16 add is safe.
+        score = (q_s @ k_s.transpose(-2, -1)) / (d ** 0.5)
+        score = score + riem_bias.to(score.dtype)
         with torch.amp.autocast('cuda', enabled=False), \
              torch.amp.autocast('cpu', enabled=False):
-            score = (q_s.float() @ k_s.float().transpose(-2, -1)) / (d ** 0.5)
-            score = score + riem_bias.float()
-            score = score.softmax(dim=-1)
+            score = score.float().softmax(dim=-1)
         score = F.dropout(score, p=self.att_dropout, training=self.training)
         out_s = score.to(v_s.dtype) @ v_s
 

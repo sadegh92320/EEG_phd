@@ -323,12 +323,20 @@ class Pipeline:
 
             callbacks = [TQDMProgressBar(refresh_rate=20), ckpt_callback]
 
+            # bf16 on Ampere+ (A100, L4, RTX 30/40xx, H100) — no scaler, no
+            # overflow risk on Riemannian biases, no skipped optimizer.step()
+            # warnings. Falls back to fp16 on T4/V100 (no bf16 tensor cores).
+            precision = (
+                "bf16-mixed"
+                if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+                else "16-mixed"
+            )
             trainer = Trainer(
                 callbacks=callbacks,
                 log_every_n_steps=5,
                 logger=wandb_logger,
                 max_epochs=40,
-                precision="16-mixed",
+                precision=precision,
                 gradient_clip_val=1.0,
             )
 

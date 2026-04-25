@@ -775,8 +775,10 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
         # Only applied when explicitly enabled; operates on the raw-signal
         # prediction component (pred_for_diagnostics) for consistency.
         if self.spectral_loss_weight > 0:
-            pred_spec = torch.fft.rfft(pred_for_diagnostics, dim=-1).abs()
-            tgt_spec  = torch.fft.rfft(target, dim=-1).abs()
+            # Cast to float32 — fp16 FFT triggers ComplexHalf experimental path
+            # and many ops (.abs() on complex32) hit unstable kernels.
+            pred_spec = torch.fft.rfft(pred_for_diagnostics.float(), dim=-1).abs()
+            tgt_spec  = torch.fft.rfft(target.float(), dim=-1).abs()
             spec_loss_per_patch = (
                 (torch.log1p(pred_spec) - torch.log1p(tgt_spec)) ** 2
             ).mean(dim=-1)
@@ -992,8 +994,9 @@ class ApproxAdaptiveRiemannBert(pl.LightningModule):
             target_flat = (target_flat - mean) / (var + 1.e-6)**.5
 
         with torch.no_grad():
-            pred_fft = torch.fft.rfft(pred, dim=-1).abs()    # (B, L, P//2+1)
-            tgt_fft = torch.fft.rfft(target_flat, dim=-1).abs()
+            # Cast to fp32 — fp16 FFT triggers ComplexHalf experimental kernels.
+            pred_fft = torch.fft.rfft(pred.float(), dim=-1).abs()    # (B, L, P//2+1)
+            tgt_fft = torch.fft.rfft(target_flat.float(), dim=-1).abs()
             spec_mse = (pred_fft - tgt_fft) ** 2              # (B, L, P//2+1)
 
             # Split: bins 0-1 = 0-16Hz (low), bins 2+ = 16-64Hz (high)
