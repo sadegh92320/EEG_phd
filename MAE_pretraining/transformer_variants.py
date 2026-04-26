@@ -841,6 +841,59 @@ class AdaptiveRiemannianAttentionBias(nn.Module):
         return bias, L
 
 
+def _maybe_extrapolate_mu_toeplitz(mu_log, target_N, threshold=1e-5):
+    """
+    Return a (target_N, target_N) μ matrix from a learned (max_patches, max_patches)
+    μ_log, extrapolating via Toeplitz structure when target_N exceeds the trained
+    region.
+
+    Detection of trained region:
+      We use the first row of μ_log as the lag function c[k] = μ_log[0, k].
+      The trained region is the prefix where |c[k]| > threshold; beyond it,
+      μ values stayed at their zero init because pretraining never indexed them.
+
+    Extrapolation:
+      For k < trained_N: c[k] = μ_log[0, k]  (learned).
+      For k ≥ trained_N: c[k] = c[trained_N - 1]  (constant tail —
+        the autocorrelation profile has plateaued; safer than zero, which
+        would put a discontinuity at the boundary).
+      μ_out[i, j] = c[|i - j|]  (Toeplitz, respects WSS prior).
+
+    When the trained region is empty (μ_log all zeros — e.g. learn_mu_reference=True
+    but pretraining was very short) or target_N ≤ trained_N, this falls back to
+    standard sub-block indexing.
+    """
+    M = mu_log.shape[0]
+    # If target fits within max_patches and the trained region likely covers it,
+    # use the sub-block directly (no need to extrapolate).
+    if target_N <= M:
+        # Fast path: standard indexing covers it.
+        return mu_log[:target_N, :target_N]
+
+    # Detect trained region from the first row's non-zero prefix.
+    abs_first_row = mu_log[0].abs()
+    if abs_first_row.max() < threshold:
+        # μ entirely untrained → fall back to zero pad
+        out = torch.zeros(
+            target_N, target_N, device=mu_log.device, dtype=mu_log.dtype,
+        )
+        out[:M, :M] = mu_log
+        return out
+
+    nonzero = (abs_first_row > threshold).nonzero(as_tuple=False).squeeze(-1)
+    trained_N = int(nonzero.max().item()) + 1
+
+    # Build the lag function c[k] for k = 0 .. target_N - 1
+    c = torch.empty(target_N, device=mu_log.device, dtype=mu_log.dtype)
+    c[:trained_N] = mu_log[0, :trained_N]
+    c[trained_N:] = c[trained_N - 1]  # constant tail
+
+    # Construct Toeplitz matrix from the lag function
+    idx = torch.arange(target_N, device=mu_log.device)
+    lag = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()  # (N, N) of |i-j|
+    return c[lag]
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # TemporalRiemannianAttentionBias — Run 6 (frequency-aware via Wiener-Khinchin)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -952,20 +1005,18 @@ class TemporalRiemannianAttentionBias(nn.Module):
             L = 0.5 * (L + L.transpose(-2, -1))
 
         # Step 3: subtract learnable μ_temporal[:N, :N] submatrix, symmetrized.
-        # When N exceeds max_patches (downstream tasks with longer windows than
-        # anything seen at pretraining — e.g. Sleep at 30s = 240 patches vs
-        # pretraining at 6s = 48 patches), we pad the learned μ with zeros.
-        # This is mathematically equivalent to having pretrained with
-        # max_temporal_patches=N: those out-of-range entries would have stayed
-        # at their zero init since they were never indexed during training.
+        # Two regimes:
+        #   (a) N ≤ trained region: standard sub-block indexing.
+        #   (b) N > trained region (downstream with longer windows than seen
+        #       at pretraining — e.g. Sleep at 30s = 240 patches vs 6s = 48):
+        #       extrapolate via Toeplitz structure. The wide-sense stationarity
+        #       assumption underlying Wiener-Khinchin says μ[i, j] = c(|i-j|);
+        #       the first row of μ_learned IS that lag function. We extract it,
+        #       hold the tail constant beyond the trained range, and rebuild
+        #       a full Toeplitz μ. This respects the WSS prior the model was
+        #       trying to learn but couldn't extrapolate to unseen lags.
         if self.mu_log is not None:
-            if N <= self.max_patches:
-                mu_sub = self.mu_log[:N, :N]
-            else:
-                mu_sub = torch.zeros(
-                    N, N, device=self.mu_log.device, dtype=self.mu_log.dtype,
-                )
-                mu_sub[:self.max_patches, :self.max_patches] = self.mu_log
+            mu_sub = _maybe_extrapolate_mu_toeplitz(self.mu_log, N)
             mu_sub = 0.5 * (mu_sub + mu_sub.transpose(-2, -1))
             L = L - mu_sub.unsqueeze(0)                    # broadcast over B*C
 
