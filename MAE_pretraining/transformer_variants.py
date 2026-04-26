@@ -951,13 +951,21 @@ class TemporalRiemannianAttentionBias(nn.Module):
             # Symmetrize for numerical safety (tangent vectors should be sym)
             L = 0.5 * (L + L.transpose(-2, -1))
 
-        # Step 3: subtract learnable μ_temporal[:N, :N] submatrix, symmetrized
+        # Step 3: subtract learnable μ_temporal[:N, :N] submatrix, symmetrized.
+        # When N exceeds max_patches (downstream tasks with longer windows than
+        # anything seen at pretraining — e.g. Sleep at 30s = 240 patches vs
+        # pretraining at 6s = 48 patches), we pad the learned μ with zeros.
+        # This is mathematically equivalent to having pretrained with
+        # max_temporal_patches=N: those out-of-range entries would have stayed
+        # at their zero init since they were never indexed during training.
         if self.mu_log is not None:
-            assert N <= self.max_patches, (
-                f"N={N} exceeds max_patches={self.max_patches}. "
-                f"Increase max_temporal_patches in TemporalRiemannianAttentionBias."
-            )
-            mu_sub = self.mu_log[:N, :N]
+            if N <= self.max_patches:
+                mu_sub = self.mu_log[:N, :N]
+            else:
+                mu_sub = torch.zeros(
+                    N, N, device=self.mu_log.device, dtype=self.mu_log.dtype,
+                )
+                mu_sub[:self.max_patches, :self.max_patches] = self.mu_log
             mu_sub = 0.5 * (mu_sub + mu_sub.transpose(-2, -1))
             L = L - mu_sub.unsqueeze(0)                    # broadcast over B*C
 
