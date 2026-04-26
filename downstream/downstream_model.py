@@ -661,6 +661,11 @@ class DownstreamRiemannTransformerPara(Downstream):
         # WITHOUT computing covariance or Padé log-map → real wall-time
         # speedup, especially on MPS (no CPU fallback for linalg.solve).
         self._disable_bias = kwargs.pop("disable_bias", False)
+        # Run 6: temporal Riemannian bias (Σ_temporal on temporal heads).
+        # Must match the value used at pretraining or the checkpoint will
+        # fail to load (temporal_riemannian_bias submodules differ).
+        self._use_temporal_bias = kwargs.pop("use_temporal_bias", False)
+        self._max_temporal_patches = kwargs.pop("max_temporal_patches", 128)
         if aggregation == "class":
             raise ValueError(
                 "DownstreamRiemannTransformerPara does not use a [CLS] token. "
@@ -742,6 +747,9 @@ class DownstreamRiemannTransformerPara(Downstream):
         use_filter_bank = getattr(self, '_use_filter_bank', False)
         fb_num_bands = getattr(self, '_fb_num_bands', 5)
         disable_bias = getattr(self, '_disable_bias', False)
+        # Run 6: temporal Riemannian bias config (must match pretraining)
+        use_temporal_bias = getattr(self, '_use_temporal_bias', False)
+        max_temporal_patches = getattr(self, '_max_temporal_patches', 128)
         return nn.ModuleList([
             AdaptiveRiemannianParallelTransformer(
                 enc_dim, nhead=8, mlp_ratio=4, log_mode='pade',
@@ -754,7 +762,12 @@ class DownstreamRiemannTransformerPara(Downstream):
                 use_branch_gate=use_branch_gate,
                 use_filter_bank=use_filter_bank,
                 fb_num_bands=fb_num_bands,
-                disable_bias=disable_bias,
+                # Match pretraining schedule: spatial bias OFF on last layer,
+                # temporal bias ON for ALL layers (Run 6 final schedule —
+                # bf16 made the per-layer cost negligible so we kept all 8).
+                disable_bias=(disable_bias or (i == depth_e - 1)),
+                use_temporal_bias=use_temporal_bias,
+                max_temporal_patches=max_temporal_patches,
             ) for i in range(depth_e)
         ])
 

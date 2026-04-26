@@ -206,7 +206,9 @@ def build_riemann_transformer_para(num_classes, checkpoint_path, num_channels, d
                 'use_filter_bank', 'fb_num_bands', 'fb_sample_rate',
                 'fb_kernel_size', 'fb_band_edges', 'fb_learnable_cutoffs',
                 # Run 5: patch_size must match pretraining (32 for Hilbert run)
-                'patch_size'):
+                'patch_size',
+                # Run 6: temporal Riemannian bias must match pretraining
+                'use_temporal_bias', 'max_temporal_patches'):
         if key in kwargs:
             extra_kwargs[key] = kwargs[key]
     # When --log_mode baseline is passed, disable the Riemannian bias
@@ -472,15 +474,15 @@ def build_labram(num_classes, checkpoint_path, num_channels, data_length, **kwar
             if "head" not in name:
                 p.requires_grad = False
     elif training_mode == "full":
-        finetune_layers = FIXED_HP["full"].get("finetune_layers", 12)
-        head_mods = [model.head]
-        if model.fc_norm is not None:
-            head_mods.append(model.fc_norm)
-        _partial_unfreeze(
-            model, model.blocks, num_total_blocks=len(model.blocks),
-            finetune_layers=finetune_layers,
-            head_modules=head_mods,
-        )
+        # LaBraM fine-tuning: unfreeze ALL parameters (like STEEGFormer).
+        # The pretrained patch_embed (TemporalConv), pos_embed, time_embed,
+        # and cls_token must be trainable — the pretrained TemporalConv doesn't
+        # produce discriminative features for many downstream tasks, so the
+        # entire model needs to adapt.
+        for p in model.parameters():
+            p.requires_grad = True
+        trainable = sum(1 for p in model.parameters() if p.requires_grad)
+        print(f"  [LaBraM full fine-tune] All {trainable} params trainable")
     elif training_mode == "lora":
         # Freeze everything, inject LoRA, unfreeze head
         for p in model.parameters():
@@ -1277,6 +1279,25 @@ def main():
              "so they can be probed onto a non-FB pretrained checkpoint without "
              "retraining the full encoder.",
     )
+    # ── Run 6: temporal Riemannian bias ──
+    parser.add_argument(
+        "--use_temporal_bias", action="store_true", default=False,
+        help="Enable temporal Riemannian bias on temporal heads (Σ_temporal "
+             "via Padé log-map). Must match the pretraining checkpoint or "
+             "loading will fail (state dict mismatch on temporal_riemannian_bias).",
+    )
+    parser.add_argument(
+        "--max_temporal_patches", type=int, default=128,
+        help="Maximum N for the learnable temporal μ reference. Must match "
+             "the value used at pretraining.",
+    )
+    # ── Value-bias layers (early-layer geometric value mixing) ──
+    parser.add_argument(
+        "--value_bias_layers", type=int, default=0,
+        help="Number of early layers using β·(L@V) value mixing. MUST match "
+             "the value used at pretraining (read it from the checkpoint "
+             "filename: '-vbias4' suffix → 4; no suffix → 0). Default 0.",
+    )
 
     args = parser.parse_args()
 
@@ -1356,6 +1377,7 @@ def main():
         rope_learnable=rope_learnable,
         use_branch_gate=args.use_branch_gate,
         patch_size=args.patch_size,
+        value_bias_layers=args.value_bias_layers,
     )
     # Filter-Bank (Run 4 FB-C1): pass through only if explicitly enabled so
     # builders for non-FB models (e.g. BIOT, LaBraM) don't choke on stray kwargs.
@@ -1368,6 +1390,13 @@ def main():
             fb_band_edges=fb_band_edges,
             fb_learnable_cutoffs=args.fb_learnable_cutoffs,
             fb_linear_probe_trainable=args.fb_linear_probe_trainable,
+        )
+    # Run 6: temporal Riemannian bias — only pass when enabled, same reasoning
+    # as filter-bank (avoid kwargs leaking into non-Riemann builders).
+    if args.use_temporal_bias:
+        builder_kwargs.update(
+            use_temporal_bias=True,
+            max_temporal_patches=args.max_temporal_patches,
         )
     model = builder(**builder_kwargs)
 
